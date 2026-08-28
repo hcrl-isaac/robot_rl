@@ -17,6 +17,7 @@ from robot_rl.utils import (
     eval_mode,
     forward_sliding_mean,
     pad_to_size,
+    pad_to_size_repeat,
     resolve_callable,
     resolve_dtype,
     resolve_obs_groups,
@@ -439,8 +440,9 @@ class FbCpr:
             eval_zs = self.backward_map(norm_eval_obs).view(mini_batch_size, bucket_size, -1)[:, 1:, :]
             rollout_steps = bucket_size - 1
             eval_zs = pad_to_size(eval_zs, env.num_envs, dim=0)
-            # Zero-pad motions to full number of environments (in case batch is truncated)
-            first_motions = {k: pad_to_size(v[:, 0, :], env.num_envs, dim=0) for k, v in eval_motions.items()}
+            # Padded envs are discarded, but still need a valid pose: zeros are an invalid root
+            # quaternion and spawn the robot inside the ground, which NaNs the whole sim.
+            first_motions = {k: pad_to_size_repeat(v[:, 0, :], env.num_envs) for k, v in eval_motions.items()}
             obs, _ = env.reset_to({"articulation": {"robot": first_motions}}, is_relative=True)
             num_joints = first_motions["joint_position"].shape[1]
             actual_qpos = torch.zeros((mini_batch_size, rollout_steps, num_joints), device=self.device)
@@ -685,8 +687,10 @@ class FbCpr:
             cfg["algorithm"]["batch_size"],
             cfg["storage_device"],
         )
+        # A large corpus can exceed VRAM on its own, so it is placed independently of the replay buffer.
+        expert_device = cfg["algorithm"].get("expert_storage_device") or cfg["storage_device"]
         expert_buffer = (
-            TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], cfg["storage_device"])
+            TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], expert_device)
             if not inference
             else None
         )

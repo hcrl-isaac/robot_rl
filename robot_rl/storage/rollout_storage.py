@@ -183,13 +183,20 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
+        num_reward_streams: int = 1,
     ) -> None:
-        """Allocate rollout buffers for a specific training mode and batch shape."""
+        """Allocate rollout buffers for a specific training mode and batch shape.
+
+        ``num_reward_streams`` > 1 stores a reward, value and return per stream (one critic head each); the
+        advantage the policy loss reads stays a single column combined by the algorithm.
+        """
         self.training_type = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
+        self.num_reward_streams = num_reward_streams
+        streams = num_reward_streams
 
         # Core
         self.observations = TensorDict(
@@ -200,7 +207,7 @@ class RolloutStorage:
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )
-        self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.rewards = torch.zeros(num_transitions_per_env, num_envs, streams, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
@@ -209,10 +216,10 @@ class RolloutStorage:
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         # for reinforcement learning
         elif training_type in ["meta_rl", "rl"]:
-            self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.values = torch.zeros(num_transitions_per_env, num_envs, streams, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.distribution_params: tuple[torch.Tensor, ...] | None = None  # Lazily initialized on first transition
-            self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.returns = torch.zeros(num_transitions_per_env, num_envs, streams, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
             if training_type == "meta_rl":
@@ -238,7 +245,7 @@ class RolloutStorage:
         # Core
         self.observations[self.step].copy_(transition.observations)
         self.actions[self.step].copy_(transition.actions)  # type: ignore
-        self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        self.rewards[self.step].copy_(transition.rewards.view(self.num_envs, -1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # For distillation

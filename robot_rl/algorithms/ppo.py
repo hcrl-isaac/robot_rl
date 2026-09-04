@@ -13,7 +13,14 @@ from tensordict import TensorDict
 from typing import Any
 
 from robot_rl.env import VecEnv
-from robot_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
+from robot_rl.extensions import (
+    RandomNetworkDistillation,
+    StyleDiscriminators,
+    Symmetry,
+    resolve_rnd_config,
+    resolve_style_config,
+    resolve_symmetry_config,
+)
 from robot_rl.models import EncoderInferencePolicy, MLPModel, SharedMemoryInferencePolicy
 from robot_rl.storage import RolloutStorage
 from robot_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
@@ -64,6 +71,8 @@ class PPO:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        # Style discriminator parameters (per-expert reward streams)
+        style_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         # Meta-RL parameters
@@ -85,6 +94,12 @@ class PPO:
 
         # RND extension
         self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg) if rnd_cfg else None
+
+        # Style discriminators: every expert adds a reward stream with its own value head
+        if style_cfg and self.is_multi_gpu:
+            raise NotImplementedError("Style discriminators are trained per rank; multi-GPU is not supported yet.")
+        self.style = StyleDiscriminators(device=self.device, **style_cfg) if style_cfg else None
+        self.num_reward_streams = 1 + (self.style.num_experts if self.style is not None else 0)
 
         # Symmetry extension
         if symmetry_cfg is not None and (actor.is_recurrent or critic.is_recurrent or memory is not None):
@@ -217,6 +232,8 @@ class PPO:
         self.critic.update_normalization(obs)
         if self.rnd:
             self.rnd.update_normalization(obs)
+        if self.style is not None:
+            self.style.update_normalization(obs)
 
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
@@ -240,6 +257,11 @@ class PPO:
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
+
+        # Style rewards are separate streams next to the task reward, not added to it
+        if self.style is not None:
+            style_rewards = self.style.compute_rewards(obs)
+            self.transition.rewards = torch.cat([self.transition.rewards.view(-1, 1), style_rewards], dim=-1)
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
@@ -294,8 +316,15 @@ class PPO:
             st.returns[step] = advantage + st.values[step]
         # Compute the advantages
         st.advantages = st.returns - st.values
+        if self.num_reward_streams > 1:
+            # standardize every stream on its own, then combine: no hand-tuned reward scales across experts
+            adv = st.advantages
+            adv = (adv - adv.mean(dim=(0, 1), keepdim=True)) / (adv.std(dim=(0, 1), keepdim=True) + 1e-8)
+            weights = torch.ones(self.num_reward_streams, device=adv.device)
+            weights[1:] = self.style.stream_weights.to(adv.device) * self.style.weight  # type: ignore[union-attr]
+            st.advantages = (adv * weights).sum(dim=-1, keepdim=True)
         # Normalize the advantages if per minibatch normalization is not used
-        if not self.normalize_advantage_per_mini_batch:
+        elif not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
@@ -528,6 +557,14 @@ class PPO:
         if mean_encoder_l2_loss is not None:
             loss_dict["encoder_l2"] = mean_encoder_l2_loss
 
+        # Train the style discriminators on this rollout's policy states before the storage is cleared
+        if self.style is not None:
+            policy_states = self.style.get_style_state(self.storage.observations.flatten(0, 1)).to(self.device)
+            loss_dict.update(self.style.update(policy_states))
+            for k, name in enumerate(self.style.names):
+                loss_dict[f"Style/{name}_reward"] = self.storage.rewards[..., 1 + k].mean().item()
+            loss_dict["Style/weight"] = self.style.weight
+
         # Clear the storage
         self.storage.clear()
 
@@ -543,6 +580,8 @@ class PPO:
             self.encoder.train()
         if self.rnd:
             self.rnd.train()
+        if self.style is not None:
+            self.style.train()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -554,6 +593,8 @@ class PPO:
             self.encoder.eval()
         if self.rnd:
             self.rnd.eval()
+        if self.style is not None:
+            self.style.eval()
 
     def eval(
         self, env: VecEnv, max_steps: int = 200, stochastic: bool = False, action_repeat: int = 1
@@ -636,6 +677,9 @@ class PPO:
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
+        if self.style is not None:
+            saved_dict["style_state_dict"] = self.style.state_dict()
+            saved_dict["style_optimizer_state_dict"] = self.style.optimizer.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -670,6 +714,10 @@ class PPO:
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        if self.style is not None and "style_state_dict" in loaded_dict:
+            self.style.load_state_dict(loaded_dict["style_state_dict"], strict=strict)
+            if load_cfg.get("optimizer") and "style_optimizer_state_dict" in loaded_dict:
+                self.style.optimizer.load_state_dict(loaded_dict["style_optimizer_state_dict"])
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> nn.Module:
@@ -720,10 +768,17 @@ class PPO:
             default_sets.append("encoder")
         if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
+        style_cfg: dict | None = cfg["algorithm"].get("style_cfg")
+        if style_cfg is not None:
+            default_sets.append("style")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
 
         # Resolve RND config if used
         cfg["algorithm"] = resolve_rnd_config(cfg["algorithm"], obs, cfg["obs_groups"], env)
+
+        # Resolve the style discriminator config if used; one value head per reward stream
+        cfg["algorithm"] = resolve_style_config(cfg["algorithm"], obs, cfg["obs_groups"])
+        num_reward_streams = 1 + (len(style_cfg["experts"]) if style_cfg is not None else 0)
 
         # Resolve symmetry config if used
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
@@ -759,9 +814,9 @@ class PPO:
         print(f"Actor Model: {actor}")
         if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
             cfg["critic"]["cnns"] = actor.cnns  # type: ignore
-        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_head_kwargs, **cfg["critic"]).to(
-            device
-        )
+        critic: MLPModel = critic_class(
+            obs, cfg["obs_groups"], "critic", num_reward_streams, **critic_head_kwargs, **cfg["critic"]
+        ).to(device)
         print(f"Critic Model: {critic}")
 
         # Initialize the storage. Use "meta_rl" when meta-RL is configured so the trajectory generator splits
@@ -771,7 +826,13 @@ class PPO:
         if storage_device is None:
             storage_device = device
         storage = RolloutStorage(
-            training_type, env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], storage_device
+            training_type,
+            env.num_envs,
+            cfg["num_steps_per_env"],
+            obs,
+            [env.num_actions],
+            storage_device,
+            num_reward_streams=num_reward_streams,
         )
 
         # Initialize the algorithm

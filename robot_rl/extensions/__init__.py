@@ -6,11 +6,14 @@
 """Extensions for the learning algorithms."""
 
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
+from .style import StyleDiscriminators, resolve_style_config
 from .symmetry import Symmetry, resolve_symmetry_config
 
 __all__ = [
     "RandomNetworkDistillation",
+    "StyleDiscriminators",
     "Symmetry",
     "resolve_rnd_config",
+    "resolve_style_config",
     "resolve_symmetry_config",
 ]

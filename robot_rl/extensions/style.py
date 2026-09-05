@@ -41,6 +41,7 @@ class StyleDiscriminators(nn.Module):
         weight_schedule: dict | None = None,
         gate_threshold: float | None = None,
         reward_clip: float = 5.0,
+        load_experts: bool = True,
         device: str = "cpu",
     ) -> None:
         """Initialize the discriminators and load the expert datasets.
@@ -63,6 +64,7 @@ class StyleDiscriminators(nn.Module):
             gate_threshold: When set, a transition gets zero style reward unless at least one normalized
                 discriminator score exceeds it (interface states no expert claims are not penalized).
             reward_clip: Symmetric clip on the normalized style rewards.
+            load_experts: Load the expert datasets (False for inference-only use; ``update`` then fails).
             device: Device.
         """
         super().__init__()
@@ -100,7 +102,7 @@ class StyleDiscriminators(nn.Module):
         self.discriminators = nn.ModuleList([
             MLP(num_states, 1, hidden_dims, activation=activation).to(device) for _ in experts
         ])
-        self.expert_states = [self._load_expert(e["data_path"]) for e in experts]
+        self.expert_states = [self._load_expert(e["data_path"]) for e in experts] if load_experts else []
         self.optimizer = torch.optim.Adam(self.discriminators.parameters(), lr=learning_rate)
 
     @property

@@ -57,6 +57,7 @@ class PPO:
         max_grad_norm: float = 1.0,
         optimizer: str = "adam",
         use_clipped_value_loss: bool = True,
+        actor_warmup_iters: int = 0,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
@@ -166,6 +167,10 @@ class PPO:
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
+        # updates during which only the critic (and style critics) train: lets a warm-started actor keep its
+        # behaviour while fresh value heads stop feeding it garbage advantages
+        self.actor_warmup_iters = actor_warmup_iters
+        self.num_updates_done = 0
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.adaptive_lr_once_per_iteration = adaptive_lr_once_per_iteration
@@ -451,7 +456,10 @@ class PPO:
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+            if self.num_updates_done < self.actor_warmup_iters:
+                loss = self.value_loss_coef * value_loss
+            else:
+                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
             # RND loss
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
@@ -525,6 +533,7 @@ class PPO:
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.learning_rate
 
+        self.num_updates_done += 1
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates

@@ -73,6 +73,7 @@ class StyleDiscriminators(nn.Module):
         self.device = device
         self.names = [str(e["name"]) for e in experts]
         self.stream_weights = torch.tensor([float(e.get("weight", 1.0)) for e in experts], device=device)
+        self.gate_groups = [e.get("gate_group") for e in experts]
         self.initial_weight = weight
         self.weight = weight
         self.gradient_penalty_coef = gradient_penalty_coef
@@ -146,6 +147,10 @@ class StyleDiscriminators(nn.Module):
                     norm.update(scores[:, k : k + 1])  # type: ignore[operator]
                 columns.append(norm(scores[:, k : k + 1]))
             rewards = torch.cat(columns, dim=-1).clamp(-self.reward_clip, self.reward_clip)
+            for k, group in enumerate(self.gate_groups):
+                # an expert that describes a transient regime (e.g. free flight) must not pay outside it
+                if group is not None:
+                    rewards[:, k : k + 1] = rewards[:, k : k + 1] * obs[group].reshape(-1, 1)
             if self.gate_threshold is not None:
                 # no discriminator claims the transition: it is an interface state, not a style violation
                 rewards = rewards * (rewards.max(dim=-1, keepdim=True).values > self.gate_threshold).float()

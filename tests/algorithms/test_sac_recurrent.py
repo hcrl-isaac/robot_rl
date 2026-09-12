@@ -29,6 +29,8 @@ class _DummyImageVecEnv:
                 "policy": torch.randn(self.num_envs, OBS_DIM),
                 "image": torch.rand(self.num_envs, *IMG),
                 "critic": torch.randn(self.num_envs, OBS_DIM),
+                "target": torch.randn(self.num_envs, 3),
+                "pixel": torch.cat([torch.rand(self.num_envs, 2), torch.ones(self.num_envs, 1)], dim=1),
             },
             batch_size=self.num_envs,
         )
@@ -44,7 +46,7 @@ class _DummyImageVecEnv:
         return next_obs, rewards, dones, extras
 
 
-def _make_cfg(obs_normalization: bool = True) -> dict:
+def _make_cfg(obs_normalization: bool = True, aux_obs_group: str | None = None) -> dict:
     return {
         "num_steps_per_env": 4,
         "obs_groups": {"actor": ["policy", "image"], "critic": ["critic"]},
@@ -84,15 +86,19 @@ def _make_cfg(obs_normalization: bool = True) -> dict:
             "n_steps": 1,
             "seq_len": 4,
             "burn_in": 2,
+            "aux_obs_group": aux_obs_group,
             "rnd_cfg": None,
             "symmetry_cfg": None,
         },
     }
 
 
-def _build(done_prob: float = 0.1, obs_normalization: bool = True) -> tuple[SAC, _DummyImageVecEnv]:
+def _build(
+    done_prob: float = 0.1, obs_normalization: bool = True, aux_obs_group: str | None = None
+) -> tuple[SAC, _DummyImageVecEnv]:
     env = _DummyImageVecEnv(done_prob=done_prob)
-    alg = SAC.construct_algorithm(env.get_observations(), env, _make_cfg(obs_normalization), device="cpu")
+    cfg = _make_cfg(obs_normalization, aux_obs_group)
+    alg = SAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu")
     return alg, env
 
 
@@ -147,17 +153,52 @@ class TestRecurrentSAC:
         torch.manual_seed(0)
         alg, env = _build()
         _collect(alg, env, 12)
-        losses = alg.update()
+        losses, diag = alg.update()
         for key in ("critic_1", "critic_2", "actor", "alpha"):
             assert torch.isfinite(torch.tensor(losses[key])), key
         assert losses["critic_1"] > 0
+        for key in (
+            "Recurrent/state_staleness",
+            "Recurrent/init_carryover",
+            "Recurrent/episode_starts_per_window",
+            "Recurrent/burn_in_crosses_episode",
+            "Recurrent/zero_init_frac",
+            "Recurrent/sample_age",
+            "Recurrent/hidden_abs_rollout",
+            "Critic/q_data",
+            "Critic/td_abs",
+            "Critic/q_pi_gap",
+            "Critic/grad_norm",
+            "Actor/logp",
+            "Actor/grad_norm_rnn",
+        ):
+            assert key in diag and torch.isfinite(torch.tensor(diag[key])), key
+        assert 0.0 <= diag["Recurrent/burn_in_crosses_episode"] <= 1.0
+        assert 0.0 <= diag["Recurrent/zero_init_frac"] <= 1.0
+        assert 0.0 < diag["Recurrent/sample_age"] <= 1.0
+        assert diag["Recurrent/state_staleness"] >= 0.0
+        assert diag["Actor/grad_norm"] > 0.0 and diag["Actor/grad_norm_rnn"] > 0.0
+
+    def test_staleness_is_zero_before_any_weight_change(self) -> None:
+        """With unchanged weights the re-derived burn-in state equals the stored one, so staleness reads ~0."""
+        torch.manual_seed(0)
+        alg, env = _build(obs_normalization=False)
+        _collect(alg, env, 12)
+        batch = alg.replay_buffer.sample_sequences(alg.seq_len, alg.burn_in, alg.device)
+        seen: dict[str, float] = {}
+        with torch.no_grad():
+            _, h0 = alg.actor.encode_sequence(
+                batch.observations[: batch.burn_in], batch.init_hidden, batch.resets[: batch.burn_in]
+            )
+            alg._recurrent_state_diagnostics(batch, h0, lambda k, v: seen.__setitem__(k, float(v)))
+        assert seen["Recurrent/state_staleness"] < 1e-4
 
     def test_update_before_window_exists_is_a_noop(self) -> None:
         """With fewer rows than burn_in + seq_len, no update is attempted and nothing crashes."""
         alg, env = _build()
         _collect(alg, env, 2)
         step_before = alg.update_step
-        losses = alg.update()
+        losses, _ = alg.update()
         assert alg.update_step == step_before
         assert losses["critic_1"] == 0.0
 
@@ -172,3 +213,78 @@ class TestRecurrentSAC:
             window = TensorDict.stack(obs_seq, dim=0)
             latent, _ = alg.actor.encode_sequence(window, None)
         assert torch.allclose(latent, torch.stack(stepwise), atol=1e-6)
+
+    def test_window_resets_match_fresh_episodes(self) -> None:
+        """A window with a reset at step k encodes steps k.. exactly as a fresh rollout from zeros would."""
+        torch.manual_seed(0)
+        alg, env = _build()
+        obs_seq = [env.get_observations() for _ in range(6)]
+        window = TensorDict.stack(obs_seq, dim=0)
+        resets = torch.zeros(6, NUM_ENVS)
+        resets[3] = 1.0
+        with torch.no_grad():
+            latent, _ = alg.actor.encode_sequence(window, None, resets)
+            fresh, _ = alg.actor.encode_sequence(TensorDict.stack(obs_seq[3:], dim=0), None)
+        assert torch.allclose(latent[3:], fresh, atol=1e-6)
+        assert not torch.allclose(latent[:3], fresh[:3], atol=1e-3)
+
+    def test_encode_step_from_per_step_states_matches_sequence(self) -> None:
+        """Stepping obs[t+1] from the state after obs[t] reproduces the sequence latent at t+1."""
+        torch.manual_seed(0)
+        alg, env = _build()
+        obs_seq = [env.get_observations() for _ in range(5)]
+        window = TensorDict.stack(obs_seq, dim=0)
+        resets = torch.zeros(5, NUM_ENVS)
+        resets[2] = 1.0
+        with torch.no_grad():
+            latent, _, states = alg.actor.encode_sequence_with_states(window, None, resets)
+            for t in range(4):
+                if resets[t + 1].any():
+                    continue
+                stepped = alg.actor.encode_step(obs_seq[t + 1], states[t])
+                assert torch.allclose(stepped, latent[t + 1], atol=1e-6)
+
+    def test_head_sees_features_and_memory(self) -> None:
+        """The head input is the current feature vector followed by the recurrent state."""
+        alg, env = _build()
+        obs = env.get_observations()
+        alg.actor.reset()
+        with torch.no_grad():
+            latent = alg.actor.get_latent(obs)
+            feats = alg.actor._features(obs)
+        assert latent.shape[-1] == feats.shape[-1] + 16
+        assert torch.allclose(latent[:, : feats.shape[-1]], feats)
+
+    def test_critic_bootstrap_state_matches_rollout(self) -> None:
+        """Stepping the stored pre-step state through obs_t gives the state stored before obs_t+1 (no done)."""
+        torch.manual_seed(0)
+        alg, env = _build(done_prob=0.0, obs_normalization=False)
+        _collect(alg, env, 4)
+        buf = alg.replay_buffer
+        n = env.num_envs
+        batch = buf.sample_mini_batch()
+        rows = buf._indices.clone()
+        with torch.no_grad():
+            h_next = alg.actor.step_state(batch.observations, batch.hidden)
+        for i, row in enumerate(rows.tolist()):
+            if row + n >= len(buf):
+                continue
+            assert torch.allclose(h_next[:, i], buf.hidden[row + n, 0], atol=1e-6)
+
+    def test_aux_head_trains_on_privileged_target(self) -> None:
+        """With an aux group the actor grows a head sized to it and the update reports its loss."""
+        torch.manual_seed(0)
+        alg, env = _build(aux_obs_group="target")
+        assert alg.actor.aux_head is not None and alg.actor.aux_head.out_features == 3
+        _collect(alg, env, 12)
+        _, diag = alg.update()
+        assert "Actor/aux_loss" in diag and diag["Actor/aux_loss"] > 0
+        assert torch.isfinite(torch.tensor(diag["Actor/aux_abs_err"]))
+
+    def test_no_aux_head_by_default(self) -> None:
+        """Without an aux group the actor has no aux head and the update reports no aux loss."""
+        alg, env = _build()
+        assert alg.actor.aux_head is None
+        _collect(alg, env, 12)
+        _, diag = alg.update()
+        assert "Actor/aux_loss" not in diag

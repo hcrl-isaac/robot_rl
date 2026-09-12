@@ -68,6 +68,7 @@ class ReplayBuffer:
             context: torch.Tensor,
             next_terminated: torch.Tensor | None = None,
             effective_n_steps: torch.Tensor | None = None,
+            hidden: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict = observations
@@ -93,13 +94,16 @@ class ReplayBuffer:
 
             self.effective_n_steps: torch.Tensor | None = effective_n_steps
             """Per-sample number of steps actually aggregated (<= n_steps; 1-step or capped at an episode end)."""
+            self.hidden = hidden
+            """Stored recurrent state before each step, ``(layers, N, hidden)``; ``None`` if the buffer stores none."""
 
     class SequenceBatch:
         """A time-major batch of contiguous per-env windows, for recurrent updates.
 
-        Tensors are ``(L, B, ...)`` and ``masks`` is ``(L, B)``, matching the RNN module's batch mode.
-        The leading ``burn_in`` steps are meant to be replayed WITHOUT gradients to re-derive the
-        hidden state; only the steps after them carry a loss.
+        Tensors are ``(L, B, ...)``. A window may span several episodes: ``resets`` marks the steps that
+        open a new one, where the recurrent state must be zeroed before the step is consumed. The
+        leading ``burn_in`` steps are meant to be replayed WITHOUT gradients to re-derive the hidden
+        state; only the steps after them carry a loss.
         """
 
         def __init__(
@@ -111,9 +115,11 @@ class ReplayBuffer:
             gammas: torch.Tensor,
             context: torch.Tensor,
             next_terminated: torch.Tensor,
-            masks: torch.Tensor,
+            resets: torch.Tensor,
             init_hidden: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
             burn_in: int,
+            burn_hidden: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
+            ages: torch.Tensor | None = None,
         ) -> None:
             """Initialize a sequence batch over contiguous rollout windows."""
             self.observations: TensorDict = observations
@@ -123,12 +129,16 @@ class ReplayBuffer:
             self.gammas: torch.Tensor = gammas
             self.context: torch.Tensor = context
             self.next_terminated: torch.Tensor = next_terminated
-            self.masks: torch.Tensor = masks
-            """``(L, B)`` 1 while the window is still in the episode it started in, 0 after."""
+            self.resets: torch.Tensor = resets
+            """``(L, B)`` 1 at steps that begin a new episode (the previous step was a done); row 0 is 0."""
             self.init_hidden = init_hidden
             """Stored recurrent state at the window's first step; ``None`` if the buffer stores none."""
             self.burn_in: int = burn_in
             """Leading steps to replay without gradients before computing any loss."""
+            self.burn_hidden = burn_hidden
+            """Stored state before step ``burn_in``: what the rollout actor held where the loss segment starts."""
+            self.ages = ages
+            """``(B,)`` window age as a fraction of the buffer's per-env capacity (0 = just written)."""
 
     def __init__(
         self,
@@ -281,6 +291,7 @@ class ReplayBuffer:
             self.gammas[self._indices].to(device),
             self.context[self._indices].to(device),
             self.next_terminated[self._indices].to(device),
+            hidden=self._gather_hidden(self._indices, device) if self.hidden is not None else None,
         )
 
     def _sample_nstep(self, device: str | None = None) -> Batch | None:
@@ -350,8 +361,8 @@ class ReplayBuffer:
 
         A stored index is ``row * num_envs + env``, so env ``e``'s consecutive steps are ``num_envs``
         apart -- the same walk :meth:`_sample_nstep` uses. Windows that would cross the circular write
-        head are excluded, and steps at or after the window's first episode end are masked out, so a
-        sequence never spans two episodes and no mid-window hidden reset is needed.
+        head are excluded. Every step is a valid transition (the buffer keeps terminal steps with their
+        true next observation); episode boundaries inside a window are reported as ``resets``.
 
         Args:
             seq_len: Steps that carry a loss.
@@ -395,16 +406,16 @@ class ReplayBuffer:
             """Gathered [B*L, ...] -> time-major [L, B, ...]."""
             return flat.reshape(batch_size, total_len, *flat.shape[1:]).transpose(0, 1).contiguous()
 
-        # 1 up to and including the first episode end, 0 after, so the window stays in one episode
+        # a step opens a new episode when the previous stored step was a done; the window's first step
+        # starts from its stored state, which is already zero if it begins an episode
         dones = self.dones[step_flat].reshape(batch_size, total_len).float()
-        dones_shifted = torch.cat([torch.zeros_like(dones[:, :1]), dones[:, :-1]], dim=1)
-        masks = torch.cumprod(1.0 - dones_shifted, dim=1).transpose(0, 1).contiguous()  # [L, B]
+        resets = torch.cat([torch.zeros_like(dones[:, :1]), dones[:, :-1]], dim=1).transpose(0, 1).contiguous()
 
-        init_hidden: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None
+        init_hidden = burn_hidden = None
         if self.hidden is not None:
-            first_flat = step_rows[:, 0] * self.num_envs + envs
-            h = self.hidden[first_flat].permute(1, 2, 0, 3).contiguous()  # (slots, layers, B, hidden)
-            init_hidden = (h[0].to(device), h[1].to(device)) if self.hidden_is_lstm else h[0].to(device)
+            init_hidden = self._gather_hidden(step_rows[:, 0] * self.num_envs + envs, device)
+            burn_hidden = self._gather_hidden(step_rows[:, min(burn_in, max_offset)] * self.num_envs + envs, device)
+        ages = ((write_row - start_rows) % cap_rows).float() / cap_rows
 
         obs = self.observations[step_flat].reshape(batch_size, total_len).transpose(0, 1).to(device)
         next_obs = self.next_observations[step_flat].reshape(batch_size, total_len).transpose(0, 1).to(device)
@@ -416,7 +427,16 @@ class ReplayBuffer:
             _tm(self.gammas[step_flat]).to(device),
             _tm(self.context[step_flat]).to(device),
             _tm(self.next_terminated[step_flat]).to(device),
-            masks.to(device),
+            resets.to(device),
             init_hidden,
             burn_in,
+            burn_hidden,
+            ages.to(device),
         )
+
+    def _gather_hidden(
+        self, flat_idx: torch.Tensor, device: str | None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Gather the stored recurrent state at ``flat_idx`` as ``(layers, B, hidden)``; ``(h, c)`` for LSTMs."""
+        h = self.hidden[flat_idx].permute(1, 2, 0, 3).contiguous()  # type: ignore[index]  # (slots, layers, B, H)
+        return (h[0].to(device), h[1].to(device)) if self.hidden_is_lstm else h[0].to(device)

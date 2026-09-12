@@ -69,16 +69,53 @@ class RNN(nn.Module):
         return out
 
     def forward_sequence(
-        self, input: torch.Tensor, hidden_state: HiddenState = None
+        self, input: torch.Tensor, hidden_state: HiddenState = None, resets: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
         """Run a time-major ``(L, B, F)`` sequence from an explicit state; returns ``(L, B, H)`` and the final state.
 
         Unlike batch mode this neither unpads nor touches ``self.hidden_state``, so a caller can chain a
-        no-grad burn-in segment into a training segment.
+        no-grad burn-in segment into a training segment. ``resets`` ``(L, B)`` zeroes the state before
+        the marked steps, so one window can span several episodes.
         """
         if isinstance(hidden_state, list):
             hidden_state = tuple(hidden_state)
-        return self.rnn(input, hidden_state)
+        if resets is None:
+            return self.rnn(input, hidden_state)
+        out, state, _ = self._step_sequence(input, hidden_state, resets)
+        return out, state
+
+    def forward_sequence_with_states(
+        self, input: torch.Tensor, hidden_state: HiddenState = None, resets: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, HiddenState, HiddenState]:
+        """Like :meth:`forward_sequence`, also returning the full state after every step, ``(L, layers, B, H)``."""
+        if isinstance(hidden_state, list):
+            hidden_state = tuple(hidden_state)
+        return self._step_sequence(input, hidden_state, resets)
+
+    def _step_sequence(
+        self, input: torch.Tensor, hidden_state: HiddenState, resets: torch.Tensor | None
+    ) -> tuple[torch.Tensor, HiddenState, HiddenState]:
+        """Step the RNN one input row at a time, zeroing the state where ``resets`` is set."""
+        seq_len, batch, _ = input.shape
+        if hidden_state is None:
+            shape = (self.rnn.num_layers, batch, self.rnn.hidden_size)
+            zeros = torch.zeros(shape, device=input.device, dtype=input.dtype)
+            hidden_state = (zeros, zeros.clone()) if self.is_lstm else zeros
+        outs, states = [], []
+        state = hidden_state
+        for t in range(seq_len):
+            if resets is not None:
+                keep = (1.0 - resets[t]).view(1, batch, 1)
+                state = tuple(x * keep for x in state) if self.is_lstm else state * keep  # type: ignore[operator]
+            out, state = self.rnn(input[t : t + 1], state)
+            outs.append(out)
+            states.append(state)
+        stacked = (
+            (torch.stack([s[0] for s in states]), torch.stack([s[1] for s in states]))
+            if self.is_lstm
+            else torch.stack(states)  # type: ignore[arg-type]
+        )
+        return torch.cat(outs), state, stacked
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         """Reset hidden states for all or done environments."""

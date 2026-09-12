@@ -54,7 +54,7 @@ def test_sequences_are_single_env_and_time_ordered() -> None:
     batch = buffer.sample_sequences(seq_len=4, burn_in=2, num_windows=64)
     assert batch is not None
     assert batch.actions.shape == (6, 64, 2)
-    assert batch.masks.shape == (6, 64)
+    assert batch.resets.shape == (6, 64)
     assert batch.burn_in == 2
 
     env_ids = batch.observations["policy"][..., 0]
@@ -73,8 +73,19 @@ def test_init_hidden_matches_window_start() -> None:
     assert torch.allclose(batch.init_hidden[0, :, 0], steps[0])
 
 
-def test_mask_zeroes_after_episode_end() -> None:
-    """Steps after the window's first episode end are masked out."""
+def test_burn_hidden_and_age_match_window() -> None:
+    """``burn_hidden`` is the state stored at step ``burn_in`` and ``ages`` count rows back from the write head."""
+    buffer = _make_buffer()
+    _fill(buffer, 18)
+    batch = buffer.sample_sequences(seq_len=4, burn_in=2)
+    assert batch is not None and batch.burn_hidden is not None and batch.ages is not None
+    steps = batch.observations["policy"][..., 1]
+    assert torch.allclose(batch.burn_hidden[0, :, 0], steps[2])
+    assert torch.allclose(batch.ages * CAPACITY_PER_ENV, 18 - steps[0])
+
+
+def test_resets_mark_episode_starts() -> None:
+    """A step is a reset iff the previous step in the window was a done; the first step never is."""
     done_at = {5, 12}
     buffer = _make_buffer()
     _fill(buffer, 18, done_at=done_at)
@@ -82,10 +93,9 @@ def test_mask_zeroes_after_episode_end() -> None:
     assert batch is not None
     steps = batch.observations["policy"][..., 1]
     for col in range(steps.shape[1]):
-        ended = False
         for row, step in enumerate(steps[:, col].tolist()):
-            assert batch.masks[row, col] == (0.0 if ended else 1.0)
-            ended = ended or step in done_at
+            expected = 0.0 if row == 0 else (1.0 if (step - 1) in done_at else 0.0)
+            assert batch.resets[row, col] == expected
 
 
 def test_wrapped_buffer_never_spans_the_write_head() -> None:
@@ -116,3 +126,13 @@ def test_default_window_count_matches_mini_batch() -> None:
     batch = buffer.sample_sequences(seq_len=4, burn_in=2)
     assert batch is not None
     assert batch.actions.shape[1] == 64 // 6
+
+
+def test_mini_batch_carries_stored_hidden() -> None:
+    """Independent samples come with the state stored before each step, shaped ``(layers, N, hidden)``."""
+    buffer = _make_buffer(batch_size=16)
+    _fill(buffer, 6)
+    batch = buffer.sample_mini_batch()
+    assert batch.hidden is not None and batch.hidden.shape == (LAYERS, 16, HIDDEN)
+    steps = batch.observations["policy"][:, 1]
+    assert torch.allclose(batch.hidden[0, :, 0], steps)

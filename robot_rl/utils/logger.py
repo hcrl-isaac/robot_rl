@@ -69,6 +69,20 @@ class Logger:
         # Note: We only log from the process with rank 0 (main process)
         self.disable_logs = is_distributed and gpu_global_rank != 0
 
+    def _sim_time_per_iter(self) -> float:
+        """Return the simulated seconds one iteration adds, summed over all envs and ranks.
+
+        Returns:
+            Seconds of simulated experience per iteration, comparable across decision rates; 0.0 when the
+            env cfg exposes no timestep.
+        """
+        try:
+            dt = self.env_cfg.sim.dt * self.env_cfg.decimation  # type: ignore[union-attr]
+        except AttributeError:
+            return 0.0
+        steps = self.cfg.get("num_steps_per_env", 1) or 1
+        return float(dt * steps * self.num_envs * self.gpu_world_size)
+
     def init_logging_writer(self) -> None:
         """Initialize the logging writer and save the code state.
 
@@ -119,6 +133,7 @@ class Logger:
                 # The W&B writer logs environment steps as a custom metric, so inject the env count
                 if isinstance(writer_class, type) and issubclass(writer_class, WandbLogWriter):
                     logger_cfg.setdefault("num_envs", self.num_envs)
+                    logger_cfg.setdefault("sim_time_per_iter", self._sim_time_per_iter())
                     # pass through any cfg-level wandb_tags
                     tags = list(logger_cfg.get("tags") or []) + list(self.cfg.get("wandb_tags") or [])
                     logger_cfg["tags"] = sorted(set(tags))

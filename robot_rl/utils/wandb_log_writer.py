@@ -30,6 +30,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         run_name: str | None = None,
         group: str | None = None,
         num_envs: int = 1,
+        sim_time_per_iter: float = 0.0,
         shared: bool = False,
         log_videos_async: bool = False,
         tags: list[str] | None = None,
@@ -49,6 +50,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
 
         self.shared = shared
         self.num_envs = num_envs
+        self.sim_time_per_iter = sim_time_per_iter
 
         settings = wandb.Settings(start_method="thread")
         tags = list(tags or [])
@@ -73,6 +75,9 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         # Define custom metrics
         self.run.define_metric("*", step_metric="local_step")  # global step (custom defined for async video logging)
         self.run.define_metric("*", step_metric="env_step")  # env step (step * num_envs)
+        if sim_time_per_iter > 0.0:
+            # simulated seconds summed over envs: the only x axis comparable across decision rates
+            self.run.define_metric("*", step_metric="sim_time_s")
 
         # Publish the W&B run identity so out-of-process logger can attach to this exact run
         if self.shared:
@@ -105,10 +110,10 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         super().add_scalar(tag, scalar_value, global_step=global_step, walltime=walltime, new_style=new_style)
         # Pin _step to the training iteration (also in shared mode) so a resumed run continues at the
         # checkpoint's iteration instead of restarting _step at 0; secondary writers keep their own sequence.
-        self.run.log(
-            {tag: scalar_value, "local_step": global_step, "env_step": global_step * self.num_envs},
-            step=global_step,
-        )
+        entry = {tag: scalar_value, "local_step": global_step, "env_step": global_step * self.num_envs}
+        if self.sim_time_per_iter > 0.0:
+            entry["sim_time_s"] = global_step * self.sim_time_per_iter
+        self.run.log(entry, step=global_step)
 
     def store_config(self, env_cfg: dict | object, train_cfg: dict) -> None:
         """Upload environment and training configuration to W&B."""

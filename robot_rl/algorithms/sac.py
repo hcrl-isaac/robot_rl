@@ -380,7 +380,7 @@ class SAC:
                     ref_latent, _ = ref.encode_sequence(train_obs, h0_ref, train_resets)
                     ref.distribution.update(ref.mlp(ref_latent.reshape(flat, -1)))  # type: ignore[attr-defined]
                     ref_mean = ref.distribution.mean  # type: ignore[attr-defined]
-                # summed over action dims (TD3+BC scale): a per-dim mean was 256x too weak against the Q term
+                # summed over action dims, matching the TD3+BC scale against the Q term
                 ref_bc = (self.actor.distribution.mean - ref_mean).pow(2).sum(-1).mean()  # type: ignore[attr-defined]
             with torch.no_grad():
                 _acc("Actor/logp", logp.mean())

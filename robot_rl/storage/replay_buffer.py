@@ -205,9 +205,8 @@ class ReplayBuffer:
         self.dones = torch.zeros(self.capacity, 1, device=self.device).byte()  # episode ends (n-step boundaries)
         self.gammas = torch.zeros(self.capacity, 1, device=self.device)
 
-        # Recurrent state as it was BEFORE each stored step, so a sampled window can be replayed from
-        # its own start. Off-policy the stored state goes stale as the network trains, which is what
-        # the burn-in prefix in :meth:`sample_sequences` exists to re-derive.
+        # recurrent state as it was BEFORE each stored step, so a sampled window can be replayed from
+        # its own start (stale under training; sample_sequences burns in)
         self.hidden_dim = hidden_dim
         self.hidden_layers = hidden_layers
         self.hidden_is_lstm = hidden_is_lstm

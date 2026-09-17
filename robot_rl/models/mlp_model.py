@@ -324,12 +324,24 @@ class _TorchMLPModel(nn.Module):
         else:
             self.deterministic_output = nn.Identity()
         self.last_activation = copy.deepcopy(model.last_activation) or nn.Identity()
+        # Empty buffer marks a policy whose ``(mean, std)`` cannot be exported; ``forward_dist`` rejects it.
+        std = model.distribution.export_std() if model.distribution is not None else None
+        self.register_buffer("_std", torch.empty(0) if std is None else std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run deterministic inference on pre-concatenated observations."""
         x = self.obs_normalizer(x)
         out = self.mlp(x)
         return self.last_activation(self.deterministic_output(out))
+
+    @torch.jit.export
+    def forward_dist(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the Gaussian policy's ``(mean, std)`` for pre-concatenated observations."""
+        if self._std.numel() == 0:
+            raise RuntimeError("forward_dist is only supported for a plain GaussianDistribution policy.")
+        x = self.obs_normalizer(x)
+        mean = self.deterministic_output(self.mlp(x))
+        return mean, self._std.expand_as(mean)
 
     @torch.jit.export
     def reset(self) -> None:

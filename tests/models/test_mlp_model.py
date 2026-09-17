@@ -173,6 +173,50 @@ class TestMLPModelExport:
 
         assert torch.allclose(original_output, jit_output, atol=1e-5)
 
+    @pytest.mark.parametrize(
+        ("std_type", "std_range"),
+        [("scalar", (1e-6, 1e6)), ("log", (1e-6, 1e6)), ("scalar", (1e-6, 0.5)), ("log", (1e-6, 0.5))],
+    )
+    def test_jit_forward_dist_matches_eager(self, std_type: str, std_range: tuple[float, float]) -> None:
+        """A scripted, saved and reloaded ``forward_dist`` should return the eager ``(mean, std)``."""
+        actor, obs = _make_mlp_model(
+            stochastic=True,
+            distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": std_type},
+        )
+        actor.distribution.std_range = list(std_range)
+        actor.distribution.log_std_range = [float(torch.log(torch.tensor(v))) for v in std_range]
+        actor.eval()
+
+        actor(obs, stochastic_output=True)
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            torch.jit.save(torch.jit.script(actor.as_jit()), f.name)
+            jit_model = torch.jit.load(f.name)
+        obs_concat = torch.cat([obs[g] for g in actor.obs_groups], dim=-1)
+        mean, std = jit_model.forward_dist(obs_concat)
+
+        assert torch.allclose(mean, actor.output_mean, atol=1e-5)
+        assert torch.allclose(std, actor.output_std, atol=1e-5)
+        assert std.max() <= std_range[1]
+
+    @pytest.mark.parametrize(
+        "distribution_cfg",
+        [
+            {"class_name": "HeteroscedasticGaussianDistribution", "init_std": 1.0},
+            {"class_name": "BetaDistribution"},
+        ],
+    )
+    def test_jit_forward_dist_rejects_non_gaussian(self, distribution_cfg: dict[str, object]) -> None:
+        """``forward_dist`` is a plain-Gaussian contract; any other policy raises."""
+        actor, obs = _make_mlp_model(stochastic=True, distribution_cfg=distribution_cfg)
+        actor.eval()
+
+        jit_model = torch.jit.script(actor.as_jit())
+        obs_concat = torch.cat([obs[g] for g in actor.obs_groups], dim=-1)
+
+        assert jit_model(obs_concat).shape == (NUM_ENVS, NUM_ACTIONS)
+        with pytest.raises(torch.jit.Error, match="plain GaussianDistribution"):
+            jit_model.forward_dist(obs_concat)
+
     @pytest.mark.filterwarnings("ignore:.*legacy TorchScript.*:DeprecationWarning")
     @pytest.mark.filterwarnings("ignore:.*will be removed.*:DeprecationWarning")
     def test_onnx_export_model(self) -> None:

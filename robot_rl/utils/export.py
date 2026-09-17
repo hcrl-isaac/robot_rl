@@ -14,6 +14,8 @@ import torch.nn as nn
 
 from robot_rl.utils.utils import resolve_callable
 
+DEFAULT_ONNX_OPSET = 18
+
 
 def _load_bn(nsd: dict[str, torch.Tensor], keys: list[str]) -> nn.BatchNorm1d:
     """Rebuild ONE BatchNorm1d covering the concatenation of the given obs groups.
@@ -187,8 +189,21 @@ def save_jit(module: nn.Module, path: str, filename: str) -> str:
     return save_path
 
 
-def save_onnx(module: nn.Module, path: str, filename: str, verbose: bool = False) -> str:
-    """Save an ONNX export; the module must provide dummy inputs and input/output names."""
+def save_onnx(
+    module: nn.Module, path: str, filename: str, verbose: bool = False, opset: int = DEFAULT_ONNX_OPSET
+) -> str:
+    """Save an ONNX export; the module must provide dummy inputs and input/output names.
+
+    Args:
+        module: Export-ready module (``as_onnx()`` output) with ``get_dummy_inputs``/``input_names``/``output_names``.
+        path: Directory to write into (created if missing).
+        filename: File name within ``path``.
+        verbose: Forward to ``torch.onnx.export``.
+        opset: ONNX opset to target; raise it for modules that need a newer operator.
+
+    Returns:
+        The saved file path.
+    """
     os.makedirs(path, exist_ok=True)
     save_path = os.path.join(path, filename)
     torch.onnx.export(
@@ -196,7 +211,7 @@ def save_onnx(module: nn.Module, path: str, filename: str, verbose: bool = False
         module.get_dummy_inputs(),
         save_path,
         export_params=True,
-        opset_version=18,
+        opset_version=opset,
         verbose=verbose,
         input_names=module.input_names,
         output_names=module.output_names,

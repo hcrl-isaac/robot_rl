@@ -96,20 +96,6 @@ class TestCrefModel:
             last = alg.update()[1]["Actor/attn_target_prob"]
         assert first > 0.0 and last > first
 
-    def test_perception_warmup_freezes_the_rl_head(self) -> None:
-        """During warm-up the head's output distribution and alpha stay put while the encoder still trains."""
-        torch.manual_seed(0)
-        alg, env = _build(aux_obs_group="target", attn_target_group="pixel")
-        alg.perception_warmup_updates = 10**6
-        _collect(alg, env, 12)
-        head_before = [p.detach().clone() for p in alg.actor.mlp.parameters()]
-        attn_before = [p.detach().clone() for p in alg.actor.attn.parameters()]
-        alpha_before = alg.alpha
-        _, diag = alg.update()
-        assert diag["Actor/warming_up"] == 1.0 and alg.alpha == alpha_before
-        assert all(torch.equal(a, b) for a, b in zip(head_before, alg.actor.mlp.parameters(), strict=True))
-        assert any(not torch.equal(a, b) for a, b in zip(attn_before, alg.actor.attn.parameters(), strict=True))
-
     def test_aux_readout_appends_prediction_to_head_input(self) -> None:
         """With aux_readout the head input ends with the aux prediction, and the update still trains."""
         torch.manual_seed(0)

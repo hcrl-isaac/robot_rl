@@ -573,6 +573,7 @@ class VonMisesFisherDistribution(Distribution):
         learn_std: bool = True,
         kappa_range: tuple[float, float] = (1e-2, 1e5),
         cf_extra_terms: int = 64,
+        mean_bias: float = 0.0,
     ) -> None:
         """Initialize the von Mises-Fisher distribution module.
 
@@ -582,10 +583,14 @@ class VonMisesFisherDistribution(Distribution):
             learn_std: Whether the concentration is a learnable parameter. If False, it is fixed at its initial value.
             kappa_range: ``(min, max)`` clamp applied to the concentration for numerical stability.
             cf_extra_terms: Extra terms used to seed the backward Bessel-ratio recurrence (higher = more accurate).
+            mean_bias: Constant added along ``e1`` to the unit-normalized MLP output before renormalization, so an
+                untrained policy's mean starts ``atan(1 / mean_bias)`` from ``e1`` (a "no change" axis for
+                relative actions).
         """
         super().__init__(output_dim)
         if output_dim % 2 != 0:
             raise ValueError(f"VonMisesFisherDistribution requires an even output_dim, got {output_dim}.")
+        self.mean_bias = mean_bias
 
         # Concentration is a single scalar, stored in log-space for positivity and a well-conditioned parameterization.
         init_kappa = 1.0 / max(init_std, 1e-6) ** 2
@@ -629,9 +634,17 @@ class VonMisesFisherDistribution(Distribution):
         log_norm = nu * torch.log(kappa) - half * math.log(2.0 * math.pi) - log_i_nu
         return log_norm.squeeze(), a_ratio.squeeze()
 
+    def _biased(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        """Add ``mean_bias`` along ``e1`` to the unit-normalized output, so the bias is scale-free."""
+        if self.mean_bias == 0.0:
+            return mlp_output
+        unit = torch.nn.functional.normalize(mlp_output, dim=-1)
+        bias = torch.zeros_like(unit[..., :1]) + self.mean_bias
+        return torch.cat([unit[..., :1] + bias, unit[..., 1:]], dim=-1)
+
     def update(self, mlp_output: torch.Tensor) -> None:
-        """Update the distribution: mean direction = normalized MLP output, concentration = kappa param."""
-        self._mu = torch.nn.functional.normalize(mlp_output, dim=-1)
+        """Update the distribution: mean direction = normalized (biased) MLP output, concentration = kappa param."""
+        self._mu = torch.nn.functional.normalize(self._biased(mlp_output), dim=-1)
         self._kappa = torch.exp(self.log_kappa).clamp(self.kappa_range[0], self.kappa_range[1])
         self._log_norm, self._a_ratio = self._bessel_terms(self._kappa)
 
@@ -712,7 +725,7 @@ class VonMisesFisherDistribution(Distribution):
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Return the unit mean direction (the deterministic action is the mode of the vMF)."""
-        return torch.nn.functional.normalize(mlp_output, dim=-1)
+        return torch.nn.functional.normalize(self._biased(mlp_output), dim=-1)
 
     def as_deterministic_output_module(self) -> nn.Module:
         """Return an export-friendly module that normalizes the MLP output to the unit mean direction."""

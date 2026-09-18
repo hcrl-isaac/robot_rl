@@ -13,7 +13,6 @@ from .fuse_model import FuseModel, ResidualFuseModel
 from .identity_model import IdentityModel
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
-from .tangent_step_model import TangentStepModel
 from .tcn_model import TCNModel
 from .txl_model import TXLModel
 
@@ -29,5 +28,4 @@ __all__ = [
     "ResidualFuseModel",
     "TCNModel",
     "TXLModel",
-    "TangentStepModel",
 ]

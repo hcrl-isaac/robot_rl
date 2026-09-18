@@ -71,6 +71,8 @@ class Distillation:
         # simply alias ``self.student`` / ``self.teacher``.
         self._raw_student = self.student
         self._raw_teacher = self.teacher
+        # a parameter-free teacher computes its target in the env, so there is no checkpoint to load
+        self.teacher_loaded = not any(p.numel() for p in self._raw_teacher.parameters())
 
         # Create the optimizer
         self.optimizer = resolve_optimizer(optimizer)(self.student.parameters(), lr=learning_rate)  # type: ignore

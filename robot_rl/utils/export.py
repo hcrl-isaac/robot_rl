@@ -94,33 +94,50 @@ def bake_normalizer(model: nn.Module, normalizer: nn.Module) -> nn.Module:
     return model
 
 
+def _build_mlp(cfg: dict, sd: dict, cfg_key: str, obs_set: str, output_dim: int) -> nn.Module:
+    """Rebuild one MLP-family model from its state dict, sized from the checkpoint's own first layer.
+
+    Args:
+        cfg: The run's train cfg, holding the model cfg under ``cfg_key`` and its ``obs_groups``.
+        sd: The model's state dict, including its baked observation normalizer.
+        cfg_key: Model cfg key (``actor``, ``critic``, ``student``).
+        obs_set: Observation-set name selecting this model's groups.
+        output_dim: Width of the model's output layer.
+
+    Returns:
+        The rebuilt model in eval mode.
+    """
+    model_cfg = dict(cfg[cfg_key])
+    model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
+    dist_cfg = model_cfg.get("distribution_cfg")
+    if dist_cfg is not None:
+        dist_cfg.setdefault("class_name", "GaussianDistribution")
+    first_idx = min(int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k)))
+    obs_dim = sd[f"mlp.{first_idx}.weight"].shape[1]
+    groups = cfg["obs_groups"][obs_set]
+    # only the concatenated dim matters for layer sizes; put it all on the first group
+    obs = {g: torch.zeros(1, obs_dim if i == 0 else 0) for i, g in enumerate(groups)}
+    model = model_class(obs, {obs_set: groups}, obs_set, output_dim, **model_cfg)
+    model.load_state_dict(sd, strict=True)
+    return model.eval()
+
+
 def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.Module]:
     if "memory_state_dict" in ckpt:
         raise NotImplementedError("Export of recurrent (memory-bearing) policies is not supported.")
     cfg = copy.deepcopy(train_cfg)
-    models: dict[str, nn.Module] = {}
-
-    def build(name: str, sd_key: str, output_dim: int, default_class: str = "MLPModel") -> nn.Module:
-        sd = ckpt[sd_key]
-        model_cfg = dict(cfg[name if name != "policy" else "actor"])
-        model_class = resolve_callable(model_cfg.pop("class_name", default_class))
-        dist_cfg = model_cfg.get("distribution_cfg")
-        if dist_cfg is not None:
-            dist_cfg.setdefault("class_name", "GaussianDistribution")
-        first_idx = min(int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k)))
-        obs_dim = sd[f"mlp.{first_idx}.weight"].shape[1]
-        obs_set = "actor" if name == "policy" else "critic"
-        groups = cfg["obs_groups"][obs_set]
-        # only the concatenated dim matters for layer sizes; put it all on the first group
-        obs = {g: torch.zeros(1, obs_dim if i == 0 else 0) for i, g in enumerate(groups)}
-        model = model_class(obs, {obs_set: groups}, obs_set, output_dim, **model_cfg)
-        model.load_state_dict(sd, strict=True)
-        return model.eval()
-
-    models["policy"] = build("policy", "actor_state_dict", _num_actions(ckpt["actor_state_dict"]))
+    actor = ckpt["actor_state_dict"]
+    models = {"policy": _build_mlp(cfg, actor, "actor", "actor", _num_actions(actor))}
     if all_models:
-        models["critic"] = build("critic", "critic_state_dict", 1)
+        models["critic"] = _build_mlp(cfg, ckpt["critic_state_dict"], "critic", "critic", 1)
     return models
+
+
+def _rebuild_distillation(train_cfg: dict, ckpt: dict) -> dict[str, nn.Module]:
+    """Rebuild a distillation student; the teacher is the training signal, not an export target."""
+    cfg = copy.deepcopy(train_cfg)
+    student = ckpt["student_state_dict"]
+    return {"policy": _build_mlp(cfg, student, "student", "student", _num_actions(student))}
 
 
 # FB-CPR models: name -> (cfg key, obs set, default class, output spec, other-input spec)
@@ -173,6 +190,8 @@ def rebuild_models(train_cfg: dict, ckpt: dict, all_models: bool = False) -> dic
     """Rebuild the trained models from a checkpoint, normalizers baked in; keyed by export name."""
     if "backward_map_state_dict" in ckpt:
         return _rebuild_fbcpr(train_cfg, ckpt, all_models)
+    if "student_state_dict" in ckpt:
+        return _rebuild_distillation(train_cfg, ckpt)
     return _rebuild_ppo(train_cfg, ckpt, all_models)
 
 

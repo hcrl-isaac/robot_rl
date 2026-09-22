@@ -95,6 +95,7 @@ class Logger:
                     "project_name": self.cfg.get("wandb_project"),
                     "run_name": self.cfg.get("wandb_run_name"),
                     "group": self.cfg.get("wandb_group"),
+                    "entity": self.cfg.get("wandb_entity"),
                     "shared": self.cfg.get("shared", False),
                     "log_videos_async": self.cfg.get("log_videos_async", False),
                 }

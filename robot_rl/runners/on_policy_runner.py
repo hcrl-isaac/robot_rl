@@ -280,10 +280,11 @@ class OnPolicyRunner(CheckpointHooks):
             raise ValueError(
                 f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
             )
-        # Validate multi-GPU configuration
-        if self.gpu_local_rank >= self.gpu_world_size:
+        # Validate multi-GPU configuration: the local rank names a device, so a group may sit on any
+        # subset of a node's cards (rank_offset.sh) as long as each one exists
+        if self.gpu_local_rank >= torch.cuda.device_count():
             raise ValueError(
-                f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+                f"Local rank '{self.gpu_local_rank}' names no device on this node ({torch.cuda.device_count()} visible)."
             )
         if self.gpu_global_rank >= self.gpu_world_size:
             raise ValueError(

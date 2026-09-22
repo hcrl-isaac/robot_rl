@@ -33,6 +33,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         shared: bool = False,
         log_videos_async: bool = False,
         tags: list[str] | None = None,
+        entity: str | None = None,
     ) -> None:
         """Initialize a W&B run for logging."""
         if wandb is None:
@@ -42,10 +43,8 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         # Get the run name
         run_name = run_name or os.path.split(log_dir)[-1]
 
-        try:
-            entity = os.environ["WANDB_USERNAME"]
-        except KeyError:
-            entity = None
+        # an explicit entity (a task's own team) wins over the per-user default
+        entity = entity or os.environ.get("WANDB_USERNAME") or None
 
         self.shared = shared
         self.num_envs = num_envs

@@ -368,7 +368,7 @@ class OffPolicyRunner(CheckpointHooks):
         # subset of a node's cards (rank_offset.sh) as long as each one exists
         if self.gpu_local_rank >= torch.cuda.device_count():
             raise ValueError(
-                f"Local rank '{self.gpu_local_rank}' names no device on this node ({torch.cuda.device_count()} visible)."
+                f"Local rank '{self.gpu_local_rank}' names no device here ({torch.cuda.device_count()} visible)."
             )
         if self.gpu_global_rank >= self.gpu_world_size:
             raise ValueError(

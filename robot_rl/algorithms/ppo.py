@@ -110,16 +110,14 @@ class PPO:
                 "When `meta_rl_cfg.memory` is set, actor and critic must be plain MLP heads."
             )
         self.memory: nn.Module | None = memory.to(self.device) if memory is not None else None
-        # Shared observation encoder (optional): trained by the joint PPO loss through the critic (and, unless
-        # ``encoder_cfg.detach_actor_gradients``, the actor) forward passes.
+        # Shared observation encoder (optional), trained by the joint PPO loss
         if encoder is not None and memory is not None:
             raise ValueError("A shared encoder cannot be combined with a shared memory module.")
         if encoder is not None and (actor.is_recurrent or critic.is_recurrent):
             raise ValueError("A shared encoder requires plain MLP actor/critic models.")
         self.encoder: nn.Module | None = encoder.to(self.device) if encoder is not None else None
         self.encoder_detach_actor = bool((encoder_cfg or {}).get("detach_actor_gradients", False))
-        # L2 penalty on the encoder latent, added to the joint PPO loss. 0.0 (the default) leaves the loss
-        # byte-identical to a run without it.
+        # L2 penalty on the encoder latent, added to the joint PPO loss
         self.encoder_l2_coef = float((encoder_cfg or {}).get("l2_coef", 0.0))
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
@@ -161,11 +159,7 @@ class PPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
     def _encoder_args(self, obs: TensorDict, detach: bool = False) -> tuple[torch.Tensor, ...]:
-        """Return the encoder latent as an extra model input tuple; empty when no encoder is configured.
-
-        Returning a tuple keeps every call site a plain ``*args`` splat, so runs without an encoder pass
-        exactly the arguments they did before.
-        """
+        """Return the encoder latent as an extra model input tuple; empty when no encoder is configured."""
         if self.encoder is None:
             return ()
         latent = self.encoder(obs)
@@ -437,9 +431,7 @@ class PPO:
                 if self.symmetry.use_mirror_loss:
                     loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
 
-            # Encoder L2 regularizer on the latent. Uses the grad-carrying ``enc_args`` (not the possibly
-            # detached ``actor_enc_args``), so the penalty still reaches the encoder under
-            # ``detach_actor_gradients``. An encoder implies no shared memory, so the else-branch above ran.
+            # grad-carrying ``enc_args``, not ``actor_enc_args``, so the penalty survives ``detach_actor_gradients``
             if self.encoder is not None and self.encoder_l2_coef > 0.0:
                 encoder_l2_loss = enc_args[0].pow(2).mean()
                 loss = loss + self.encoder_l2_coef * encoder_l2_loss
@@ -665,9 +657,7 @@ class PPO:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("memory") and self.memory is not None and "memory_state_dict" in loaded_dict:
             self._raw_memory.load_state_dict(loaded_dict["memory_state_dict"], strict=strict)
-        # Deliberately NOT gated on a load_cfg key: the encoder is part of the actor's input pipeline, not a
-        # resume-only model like the critic/optimizer. Callers pass partial load_cfgs for inference (e.g.
-        # ``{"actor": True}`` in play.py); gating this would silently run a randomly-initialized encoder.
+        # not gated on load_cfg: the encoder is part of the actor's input, so inference-only loads need it too
         if self._raw_encoder is not None and "encoder_state_dict" in loaded_dict:
             self._raw_encoder.load_state_dict(loaded_dict["encoder_state_dict"], strict=strict)
         if load_cfg.get("optimizer") and "optimizer_state_dict" in loaded_dict:
@@ -716,11 +706,10 @@ class PPO:
         # Optional shared memory config
         meta_rl_cfg = cfg["algorithm"].get("meta_rl_cfg")
         shared_memory_cfg: dict | None = meta_rl_cfg.get("memory") if isinstance(meta_rl_cfg, dict) else None
-        # Optional shared observation encoder config. Read with ``.get`` (NOT ``.pop``): it must also reach
-        # ``__init__`` through the ``**cfg["algorithm"]`` splat below.
+        # ``.get``, not ``.pop``: ``__init__`` also receives it through the ``**cfg["algorithm"]`` splat below
         encoder_cfg: dict | None = cfg["algorithm"].get("encoder_cfg")
 
-        # Resolve observation groups ("encoder" resolves only on encoder runs, so plain runs are untouched)
+        # Resolve observation groups
         default_sets = ["actor", "critic"]
         if encoder_cfg is not None:
             default_sets.append("encoder")
@@ -747,8 +736,7 @@ class PPO:
             critic_head_kwargs["input_dim_override"] = memory.latent_dim  # type: ignore[attr-defined]
             critic_head_kwargs["append_obs_groups"] = True
 
-        # Build the optional shared encoder; its latent is an extra input to both heads (other_input_dims),
-        # concatenated after each head's own normalized observations.
+        # Build the optional shared encoder; its latent is appended to both heads' inputs
         encoder: nn.Module | None = None
         if encoder_cfg is not None:
             encoder_model_cfg = dict(encoder_cfg["model"])

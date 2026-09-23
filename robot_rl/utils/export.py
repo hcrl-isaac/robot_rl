@@ -107,9 +107,7 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
     cfg = copy.deepcopy(train_cfg)
     models: dict[str, nn.Module] = {}
 
-    # Optional shared observation encoder. On an encoder run each head's first layer is
-    # ``obs_dim + latent_dim`` wide, so the latent MUST be subtracted before sizing the head's fake obs --
-    # otherwise the rebuilt head silently expects a latent that no exported graph supplies.
+    # an encoder head's first layer is ``obs_dim + latent_dim`` wide; subtract the latent to size its obs
     encoder_cfg = cfg.get("algorithm", {}).get("encoder_cfg")
     latent_dim = int(encoder_cfg["output_dim"]) if encoder_cfg is not None else 0
 
@@ -146,8 +144,7 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
     if all_models:
         models["critic"] = build("critic", "critic_state_dict", 1)
     if encoder is not None:
-        # Fold the encoder into each head's export: the artifact then takes ONE concatenated
-        # ``[head_obs ; encoder_obs]`` input, matching every other export in this package.
+        # fold the encoder in, so the export takes one ``[head_obs ; encoder_obs]`` input
         models = {name: EncoderInferencePolicy(encoder, model) for name, model in models.items()}
     return models
 

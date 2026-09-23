@@ -160,8 +160,7 @@ class OnPolicyRunner:
         # Persist cumulative env-steps so a resume reconstructs the curriculum clock at the same
         # sample budget regardless of this run's env/GPU count (see load()).
         saved_dict["env_step"] = int(self.env.unwrapped.common_step_counter) * self.env.num_envs * self.gpu_world_size
-        # Mean terrain level of a curriculum terrain, so a resume or an eval sim starts where training is
-        # instead of at the flat row.
+        # so a resume or an eval sim starts at the trained terrain level, not the flat row
         terrain = getattr(getattr(self.env.unwrapped, "scene", None), "terrain", None)
         if getattr(terrain, "terrain_levels", None) is not None:
             saved_dict["terrain_level"] = float(terrain.terrain_levels.float().mean())

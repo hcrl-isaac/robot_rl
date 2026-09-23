@@ -76,8 +76,8 @@ class EncoderInferencePolicy(nn.Module):
             encoder: The shared observation encoder.
             actor: The actor model taking the encoder latent as an extra input.
             zero_latent: Feed the actor a zero latent instead of the encoder output (blind-degradation eval).
-            fuse_latent: CONCATENATE the latent onto the first extra input rather than passing it as its own
-                (FB-CPR: the actor takes one fused ``[z; c]`` input, so appending would be an arity error).
+            fuse_latent: Concatenate the latent onto the first extra input rather than passing it as its own
+                (for actors taking one fused ``[z; c]`` input).
         """
         super().__init__()
         self.encoder = encoder
@@ -111,7 +111,7 @@ class EncoderInferencePolicy(nn.Module):
         if self.zero_latent:
             latent = torch.zeros_like(latent)
         if self.fuse_latent:
-            # one fused input: [z; c]; zero_latent above already zeroes exactly the c slice
+            # one fused input: [z; c]
             return self.actor(obs, torch.cat([args[0], latent], dim=-1), *args[1:], **kwargs)
         return self.actor(obs, latent, *args, **kwargs)
 
@@ -131,9 +131,9 @@ class EncoderInferencePolicy(nn.Module):
 def _encoder_export_parts(encoder: MLPModel, actor: MLPModel) -> tuple[nn.Module, ...]:
     """Deep-copy the inference-relevant submodules of an encoder-actor pair for export.
 
-    Returns ``(enc_normalizer, enc_mlp, enc_last_activation, obs_normalizer, mlp, deterministic_output,
-    last_activation)``. Mirrors what :class:`~robot_rl.models.mlp_model._TorchMLPModel` extracts, once per
-    model, so both export wrappers below stay in sync with the eager forward.
+    Returns:
+        ``(enc_normalizer, enc_mlp, enc_last_activation, obs_normalizer, mlp, deterministic_output,
+        last_activation)``.
     """
     enc_last_activation = copy.deepcopy(encoder.last_activation) or nn.Identity()
     if actor.distribution is not None:
@@ -152,15 +152,7 @@ def _encoder_export_parts(encoder: MLPModel, actor: MLPModel) -> tuple[nn.Module
 
 
 class _TorchEncoderPolicy(nn.Module):
-    """Exportable encoder+actor policy for JIT, taking ONE concatenated input ``[actor_obs ; encoder_obs]``.
-
-    The actor of an encoder run carries ``other_input_dims=(latent_dim,)``, so exporting it alone via
-    ``MLPModel.as_jit()`` is WRONG: :class:`_TorchMLPModel` pushes its entire input through an
-    ``obs_normalizer`` sized for observations only, and nothing supplies the latent. This wrapper folds the
-    encoder into the exported graph instead, splitting its input at ``actor.obs_dim`` and rebuilding the
-    ``[normalized_obs ; latent]`` vector the actor's MLP was trained on. Keeping it a single tensor matches
-    every other export in this package, so the artifact stays loadable wherever a plain policy is expected.
-    """
+    """Exportable encoder+actor policy for JIT, taking one concatenated input ``[actor_obs ; encoder_obs]``."""
 
     def __init__(self, encoder: MLPModel, actor: MLPModel) -> None:
         """Create a TorchScript-friendly copy of an encoder and the actor consuming its latent."""

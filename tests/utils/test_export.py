@@ -103,11 +103,7 @@ def test_rebuild_without_encoder_matches_the_actor() -> None:
 
 
 def test_rebuild_with_encoder_matches_the_encoder_policy() -> None:
-    """On an encoder run the rebuild must subtract the latent width and restore the encoder.
-
-    Without that, the first-layer width (obs_dim + latent_dim) is mistaken for the observation width and
-    the rebuilt actor silently expects a latent nothing supplies.
-    """
+    """On an encoder run the rebuild subtracts the latent width and restores the encoder."""
     ppo, obs = _build_ppo_with_encoder()
     ppo.eval_mode()
 

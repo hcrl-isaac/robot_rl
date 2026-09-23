@@ -118,7 +118,8 @@ class TrajectoryBuffer(ExpertBuffer):
         """Replace every motion's sampling weight (buffer order) and normalize them to sum to one."""
         if priorities.shape != self.priorities.shape:
             raise ValueError(f"expected {tuple(self.priorities.shape)} priorities, got {tuple(priorities.shape)}")
-        self.priorities = priorities.to(self.device, torch.float32) / priorities.sum()
+        priorities = priorities.to(self.device, torch.float32)
+        self.priorities = priorities / priorities.sum()
 
     def state_dict(self) -> dict:
         """Return the per-motion sampling priorities for checkpointing."""

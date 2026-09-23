@@ -5,6 +5,7 @@
 
 """Neural models for the learning algorithm."""
 
+from .backward_model import BackwardModel
 from .cnn_model import CNNModel
 from .cnn_rnn_model import CNNRNNModel
 from .cref_model import CrefModel
@@ -17,6 +18,7 @@ from .tcn_model import TCNModel
 from .txl_model import TXLModel
 
 __all__ = [
+    "BackwardModel",
     "CNNModel",
     "CNNRNNModel",
     "CrefModel",

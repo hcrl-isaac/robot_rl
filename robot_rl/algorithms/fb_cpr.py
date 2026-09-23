@@ -17,6 +17,7 @@ from robot_rl.utils import (
     eval_mode,
     forward_sliding_mean,
     pad_to_size,
+    pad_to_size_repeat,
     resolve_callable,
     resolve_dtype,
     resolve_obs_groups,
@@ -450,8 +451,10 @@ class FbCpr:
             # z at rollout step t encodes the next desired state (frame t+1), matching how the actor is
             # trained on (obs_t, z=encode(next_obs)) pairs.
             eval_zs = self.backward_map(norm_eval_obs).view(batch, buffer.bucket_size, -1)[:, 1:, :]
-            eval_zs = pad_to_size(eval_zs, env.num_envs, dim=0)
-            first = {k: pad_to_size(v[:, 0, :], env.num_envs, dim=0) for k, v in ref.items()}
+            # spare envs replay the batch's first motion: a zero root quaternion is not a legal pose and
+            # leaves NaN physics behind in an env that goes on training
+            eval_zs = pad_to_size_repeat(eval_zs, env.num_envs, dim=0)
+            first = {k: pad_to_size_repeat(v[:, 0, :], env.num_envs, dim=0) for k, v in ref.items()}
             obs, _ = env.reset_to({"articulation": {"robot": first}}, is_relative=True)
             qpos = torch.zeros((batch, rollout_steps, first["joint_position"].shape[1]), device=self.device)
             root = torch.zeros((batch, rollout_steps, 3), device=self.device)

@@ -7,8 +7,9 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
+
+import pytest
 
 from robot_rl.storage.trajectory_buffer import TrajectoryBuffer
 

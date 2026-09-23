@@ -308,7 +308,8 @@ class FbCpr:
             raise ValueError("Expected episode lengths to be uniform.")
         step = int(cur_episode_length[0].item())
         # Update from z buffer
-        if z is None:
+        # the z buffer is empty until the first update, e.g. when an eval resets rollouts during the seed phase
+        if z is None or (step % self.steps_per_z_update == 0 and len(self.z_buffer) == 0):
             z = self._sample_random_z(num_envs)
         elif step % self.steps_per_z_update == 0:
             z = self.z_buffer.sample(num_envs, device=self.device)

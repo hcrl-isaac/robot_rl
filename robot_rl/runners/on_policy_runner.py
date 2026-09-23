@@ -15,6 +15,7 @@ from robot_rl.algorithms import PPO
 from robot_rl.env import VecEnv
 from robot_rl.models import MLPModel
 from robot_rl.utils import check_nan, demote_old_checkpoint, resolve_callable
+from robot_rl.utils.export import save_onnx
 from robot_rl.utils.logger import Logger
 
 
@@ -231,21 +232,7 @@ class OnPolicyRunner:
         onnx_model.to("cpu")
         onnx_model.eval()
 
-        if not os.path.exists(path):
-            os.makedirs(path, exist_ok=True)
-        save_path = os.path.join(path, filename)
-
-        # Trace and save the model
-        torch.onnx.export(
-            onnx_model,
-            onnx_model.get_dummy_inputs(),  # type: ignore
-            save_path,
-            export_params=True,
-            opset_version=18,
-            verbose=verbose,
-            input_names=onnx_model.input_names,  # type: ignore
-            output_names=onnx_model.output_names,  # type: ignore
-        )
+        save_onnx(onnx_model, path, filename, verbose=verbose)
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         """Register a repository path whose git status should be logged."""

@@ -3,20 +3,65 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Tests for the env-free checkpoint rebuild used by policy export."""
+"""Tests for policy export: the ONNX helper and the env-free checkpoint rebuild."""
 
 from __future__ import annotations
 
 import torch
+from pathlib import Path
+from torch import nn
+from typing import ClassVar
+
+import onnx
+import pytest
 
 from robot_rl.models import EncoderInferencePolicy
-from robot_rl.utils.export import rebuild_models
+from robot_rl.utils.export import rebuild_models, save_onnx
 from tests.algorithms.test_ppo import (
     LATENT_DIM,
     NUM_ENVS,
     _build_ppo,
     _build_ppo_with_encoder,
 )
+
+
+class _Doubler(nn.Module):
+    """Minimal module satisfying the export protocol (dummy inputs + input/output names)."""
+
+    input_names: ClassVar[list[str]] = ["x"]
+    output_names: ClassVar[list[str]] = ["y"]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Double the input."""
+        return x * 2.0
+
+    def get_dummy_inputs(self) -> tuple[torch.Tensor]:
+        """Tracing inputs for the export."""
+        return (torch.zeros(1, 3),)
+
+
+def _default_domain_opsets(path: str) -> list[int]:
+    """Opset versions the saved model declares for the default ONNX domain."""
+    model = onnx.load(path)
+    return [i.version for i in model.opset_import if i.domain in ("", "ai.onnx")]
+
+
+class TestSaveOnnx:
+    """Tests for ``save_onnx``."""
+
+    @pytest.mark.parametrize("opset", [18, 20])
+    def test_writes_the_requested_opset(self, tmp_path: Path, opset: int) -> None:
+        """A module needing a newer operator can raise the opset the export targets."""
+        path = save_onnx(_Doubler(), str(tmp_path), "doubler.onnx", opset=opset)
+
+        assert _default_domain_opsets(path) == [opset]
+
+    def test_defaults_to_opset_18(self, tmp_path: Path) -> None:
+        """Callers that do not care keep the historical default."""
+        path = save_onnx(_Doubler(), str(tmp_path), "doubler.onnx")
+
+        assert _default_domain_opsets(path) == [18]
+
 
 _ACTOR_CFG = {
     "class_name": "MLPModel",
@@ -29,7 +74,7 @@ _ENCODER_MODEL_CFG = {"class_name": "MLPModel", "hidden_dims": [16, 8], "activat
 
 
 def _train_cfg(with_encoder: bool) -> dict:
-    """The subset of a saved ``agent.yaml`` that the rebuild reads."""
+    """Build the subset of a saved ``agent.yaml`` that the rebuild reads."""
     cfg: dict = {
         "actor": dict(_ACTOR_CFG),
         "critic": dict(_CRITIC_CFG),

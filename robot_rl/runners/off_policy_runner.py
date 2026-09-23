@@ -61,6 +61,7 @@ class OffPolicyRunner:
         )
 
         self.current_learning_iteration = 0
+        self._resumed = False
 
     def learn(self, num_learning_iterations: int, **kwargs: Any) -> None:
         """Run the learning loop: per iteration, collect env steps, then run agent updates, then log/save."""
@@ -72,6 +73,15 @@ class OffPolicyRunner:
         # Resolve the update cadence and initial observations. The seed phase (warm up before policy
         # updates begin) is a shared runner-level knob for both the URL and non-URL branches.
         seed_until = start_it + self.cfg["num_seed_steps_per_env"]
+        warmup = self.cfg.get("resume_warmup_steps_per_env", 0) if self._resumed else 0
+        if warmup:
+            # a checkpoint carries no replay buffer: refill it with the loaded policy before updating, on
+            # top of the requested learning iterations; random seeding is for an untrained policy
+            seed_until = start_it + warmup
+            total_it += warmup
+            if hasattr(self.alg, "num_seed_steps_per_env"):
+                self.alg.num_seed_steps_per_env = -1
+            print(f"[INFO] resume warm-up: {warmup} iterations of collection before updates resume")
 
         def update_gate(it: int) -> bool:
             return it > seed_until
@@ -290,6 +300,7 @@ class OffPolicyRunner:
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
+            self._resumed = True
             # Restore the curriculum clock from the cumulative env-step count / this run's effective
             # env count, so a resume with a different env/GPU count doesn't jump the curriculum fraction.
             effective_envs = self.env.num_envs * self.gpu_world_size

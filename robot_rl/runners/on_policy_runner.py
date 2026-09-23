@@ -14,12 +14,13 @@ from datetime import timedelta
 from robot_rl.algorithms import PPO
 from robot_rl.env import VecEnv
 from robot_rl.models import MLPModel
+from robot_rl.runners.checkpoint_hooks import CheckpointHooks
 from robot_rl.utils import check_nan, demote_old_checkpoint, resolve_callable
 from robot_rl.utils.export import save_onnx
 from robot_rl.utils.logger import Logger
 
 
-class OnPolicyRunner:
+class OnPolicyRunner(CheckpointHooks):
     """On-policy runner for reinforcement learning algorithms."""
 
     alg: PPO
@@ -130,21 +131,30 @@ class OnPolicyRunner:
             )
 
             # Save model
-            if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
-                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
-                demoted = demote_old_checkpoint(
-                    self.alg,
-                    self.logger.log_dir,
-                    it,
-                    self.cfg.get("keep_full_checkpoints"),
-                    self.cfg["save_interval"],
-                )
-                if demoted is not None:  # re-upload so the logger's live-sync replaces the full remote copy
-                    self.logger.save_model(os.path.join(self.logger.log_dir, f"model_{demoted}.pt"), demoted)
+            if it % self.cfg["save_interval"] == 0:
+                path = os.path.join(self.logger.log_dir or "", f"model_{it}.pt")
+                if self.logger.writer is not None:
+                    self.save(path)
+                    demoted = demote_old_checkpoint(
+                        self.alg,
+                        self.logger.log_dir,
+                        it,
+                        self.cfg.get("keep_full_checkpoints"),
+                        self.cfg["save_interval"],
+                    )
+                    if demoted is not None:  # re-upload so the logger's live-sync replaces the full remote copy
+                        self.logger.save_model(os.path.join(self.logger.log_dir, f"model_{demoted}.pt"), demoted)
+                if self._after_checkpoint(path, it):
+                    with torch.inference_mode():
+                        obs = self._reset_after_eval()
 
         # Save the final model after training and stop the logging writer
+        final = os.path.join(self.logger.log_dir or "", f"model_{self.current_learning_iteration}.pt")
         if self.logger.writer is not None:
-            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
+            self.save(final)
+        if self.current_learning_iteration % self.cfg["save_interval"] != 0:
+            self._after_checkpoint(final, self.current_learning_iteration)
+        if self.logger.writer is not None:
             self.logger.stop_logging_writer()
 
     def save(self, path: str, infos: dict | None = None) -> None:

@@ -89,6 +89,8 @@ class PPO:
         # Symmetry extension
         if symmetry_cfg is not None and (actor.is_recurrent or critic.is_recurrent or memory is not None):
             raise ValueError("Symmetry augmentation is not supported for recurrent policies (including shared memory).")
+        if symmetry_cfg is not None and encoder is not None:
+            raise ValueError("Symmetry augmentation is not supported with a shared observation encoder.")
         self.symmetry = Symmetry(**symmetry_cfg) if symmetry_cfg else None
 
         # Meta RL components
@@ -658,8 +660,11 @@ class PPO:
         if load_cfg.get("memory") and self.memory is not None and "memory_state_dict" in loaded_dict:
             self._raw_memory.load_state_dict(loaded_dict["memory_state_dict"], strict=strict)
         # not gated on load_cfg: the encoder is part of the actor's input, so inference-only loads need it too
-        if self._raw_encoder is not None and "encoder_state_dict" in loaded_dict:
-            self._raw_encoder.load_state_dict(loaded_dict["encoder_state_dict"], strict=strict)
+        if self._raw_encoder is not None:
+            if "encoder_state_dict" in loaded_dict:
+                self._raw_encoder.load_state_dict(loaded_dict["encoder_state_dict"], strict=strict)
+            elif strict:
+                raise KeyError("Checkpoint has no encoder_state_dict for this encoder policy.")
         if load_cfg.get("optimizer") and "optimizer_state_dict" in loaded_dict:
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         if load_cfg.get("rnd") and self.rnd:

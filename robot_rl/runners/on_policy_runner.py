@@ -196,13 +196,17 @@ class OnPolicyRunner:
                 self.env.unwrapped.common_step_counter = round(env_step / effective_envs)  # type: ignore
             else:
                 self.env.unwrapped.common_step_counter = self.current_learning_iteration * self.cfg["num_steps_per_env"]  # type: ignore
-            self._restore_terrain_level(loaded_dict.get("terrain_level"))
+            if self.cfg.get("restore_terrain_level", False):
+                self._restore_terrain_level(loaded_dict.get("terrain_level"))
         return loaded_dict["infos"]
 
     def _restore_terrain_level(self, level: float | None) -> None:
         """Put every env of a curriculum terrain on the checkpoint's mean level (rounded, clamped to the rows)."""
         terrain = getattr(getattr(self.env.unwrapped, "scene", None), "terrain", None)
         if level is None or getattr(terrain, "terrain_levels", None) is None or terrain.terrain_origins is None:
+            return
+        generator = getattr(terrain.cfg, "terrain_generator", None)
+        if generator is None or not generator.curriculum:
             return
         terrain.terrain_levels[:] = min(round(level), terrain.terrain_origins.shape[0] - 1)
         terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]

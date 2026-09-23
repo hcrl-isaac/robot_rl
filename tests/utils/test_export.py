@@ -128,3 +128,21 @@ def test_rebuilt_encoder_policy_exports_to_jit() -> None:
         actual = scripted(torch.cat([obs["policy"], obs["scan"]], dim=-1))
     assert actual.shape[0] == NUM_ENVS
     torch.testing.assert_close(expected, actual)
+
+
+def test_rebuilt_encoder_policy_exports_to_onnx(tmp_path: Path) -> None:
+    """The ONNX export of an encoder policy matches eager inference on the concatenated input."""
+    import onnxruntime as ort
+
+    ppo, obs = _build_ppo_with_encoder()
+    ppo.eval_mode()
+
+    policy = rebuild_models(_train_cfg(with_encoder=True), ppo.save())["policy"]
+    path = save_onnx(policy.as_onnx(), str(tmp_path), "policy.onnx")
+    # the export traces a batch of one, like every ONNX export here
+    x = torch.cat([obs["policy"], obs["scan"]], dim=-1)[:1]
+    with torch.inference_mode():
+        expected = policy(obs[:1], stochastic_output=False)
+    session = ort.InferenceSession(path)
+    (actual,) = session.run(None, {session.get_inputs()[0].name: x.numpy()})
+    torch.testing.assert_close(torch.from_numpy(actual), expected, rtol=1e-4, atol=1e-5)

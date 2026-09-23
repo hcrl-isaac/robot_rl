@@ -78,3 +78,23 @@ def test_frozen_and_round_trips(backward_path: str, tmp_path: pathlib.Path) -> N
     other = BackwardModel(obs, {"teacher": ["teacher"]}, "teacher", LATENT_DIM, backward_path=other_path)
     other.load_state_dict(model.state_dict())
     torch.testing.assert_close(other(obs), model(obs))
+
+
+def test_old_empty_teacher_checkpoint_loads(backward_path: str) -> None:
+    """A checkpoint saved with a weightless teacher loads its student under a B teacher, which keeps its own B."""
+    from robot_rl.algorithms.distillation import Distillation
+    from robot_rl.models import MLPModel
+    from robot_rl.storage import RolloutStorage
+
+    obs = TensorDict(
+        {"policy": torch.randn(NUM_ENVS, 3), "teacher": torch.randn(NUM_ENVS, 2 * FEATURE_DIM)}, batch_size=[NUM_ENVS]
+    )
+    groups = {"student": ["policy"], "teacher": ["teacher"]}
+    student = MLPModel(obs, groups, "student", LATENT_DIM, hidden_dims=[8])
+    teacher = BackwardModel(obs, groups, "teacher", LATENT_DIM, backward_path=backward_path)
+    alg = Distillation(student, teacher, RolloutStorage("distillation", NUM_ENVS, 4, obs, [LATENT_DIM]))
+    assert alg.teacher_loaded
+    before = teacher(obs)
+    checkpoint = {"student_state_dict": student.state_dict(), "teacher_state_dict": {}}
+    alg.load(checkpoint, {"student": True, "teacher": True}, strict=True)
+    torch.testing.assert_close(alg.teacher(obs), before)

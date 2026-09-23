@@ -43,7 +43,8 @@ class CheckpointHooks:
             Whether a callback stepped the training env, so the caller must reset it.
         """
         callbacks = getattr(self, "_checkpoint_callbacks", [])
-        if not callbacks:
+        # only the main rank registers callbacks, so every rank must still join the broadcast
+        if not callbacks and not self.is_distributed:  # type: ignore[attr-defined]
             return False
         outputs: dict[str, Any] = {}
         if self.logger.writer is not None:  # type: ignore[attr-defined]

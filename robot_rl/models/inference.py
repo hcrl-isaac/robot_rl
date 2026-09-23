@@ -150,14 +150,28 @@ class _TorchEncoderPolicy(nn.Module):
             self.deterministic_output,
             self.last_activation,
         ) = _encoder_export_parts(encoder, actor)
+        # empty buffer marks a policy whose ``(mean, std)`` cannot be exported; ``forward_dist`` rejects it
+        std = actor.distribution.export_std() if actor.distribution is not None else None
+        self.register_buffer("_std", torch.empty(0) if std is None else std)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run deterministic inference on the concatenated ``[actor_obs ; encoder_obs]`` input."""
+    def _mean(self, x: torch.Tensor) -> torch.Tensor:
         obs = x[..., : self.obs_dim]
         scan = x[..., self.obs_dim :]
         latent = self.enc_last_activation(self.enc_mlp(self.enc_normalizer(scan)))
         fused = torch.cat([self.obs_normalizer(obs), latent], dim=-1)
-        return self.last_activation(self.deterministic_output(self.mlp(fused)))
+        return self.deterministic_output(self.mlp(fused))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run deterministic inference on the concatenated ``[actor_obs ; encoder_obs]`` input."""
+        return self.last_activation(self._mean(x))
+
+    @torch.jit.export
+    def forward_dist(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the Gaussian policy's ``(mean, std)`` for the concatenated ``[actor_obs ; encoder_obs]`` input."""
+        if self._std.numel() == 0:
+            raise RuntimeError("forward_dist is only supported for a plain GaussianDistribution policy.")
+        mean = self._mean(x)
+        return mean, self._std.expand_as(mean)
 
     @torch.jit.export
     def reset(self) -> None:

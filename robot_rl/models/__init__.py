@@ -10,6 +10,7 @@ from .cnn_rnn_model import CNNRNNModel
 from .cref_model import CrefModel
 from .fuse_model import FuseModel, ResidualFuseModel
 from .identity_model import IdentityModel
+from .inference import EncoderInferencePolicy, SharedMemoryInferencePolicy
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
 from .tcn_model import TCNModel
@@ -19,11 +20,13 @@ __all__ = [
     "CNNModel",
     "CNNRNNModel",
     "CrefModel",
+    "EncoderInferencePolicy",
     "FuseModel",
     "IdentityModel",
     "MLPModel",
     "RNNModel",
     "ResidualFuseModel",
+    "SharedMemoryInferencePolicy",
     "TCNModel",
     "TXLModel",
 ]

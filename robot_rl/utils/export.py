@@ -168,7 +168,8 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
 
     def build(name: str) -> nn.Module:
         cfg_key, obs_set, default_class, out_spec, other_spec = _FBCPR_MODELS[name]
-        model_cfg = dict(cfg[cfg_key])
+        # the actor sits at the top of the runner cfg, the FB maps and critics under ``algorithm``
+        model_cfg = dict(cfg[cfg_key] if cfg_key in cfg else cfg["algorithm"][cfg_key])
         model_class = resolve_callable(model_cfg.pop("class_name", default_class))
         dist_cfg = model_cfg.get("distribution_cfg")
         if dist_cfg is not None:

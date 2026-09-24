@@ -30,6 +30,9 @@ class MLPModel(nn.Module):
     is_recurrent: bool = False
     """Whether the model contains a recurrent module."""
 
+    loads_own_weights: bool = False
+    """Whether the model's weights come from its own configuration rather than from a checkpoint."""
+
     def __init__(
         self,
         obs: TensorDict,

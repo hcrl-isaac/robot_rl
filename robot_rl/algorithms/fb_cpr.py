@@ -469,7 +469,16 @@ class FbCpr:
             up = torch.zeros((batch, rollout_steps, 3), device=self.device)
             root_start = buffer.get_expert_state(obs)["root_pose"][:batch, :3].to(self.device)
             steps = rollout_steps
+            # a recorder may show the clip being tracked on a ghost twin
+            publish_ref = getattr(getattr(env, "unwrapped", env), "write_reference_pose", None)
+            if publish_ref is not None:
+                ref_root = pad_to_size_repeat(torch.cat([ref["root_pose"], ref["root_velocity"]], dim=-1), env.num_envs)
+                ref_joint_pos = pad_to_size_repeat(ref["joint_position"], env.num_envs)
+                ref_joint_vel = pad_to_size_repeat(ref["joint_velocity"], env.num_envs)
             for t in range(rollout_steps):
+                if publish_ref is not None:
+                    # frame t+1 is what z targets this step: the pose the robot is asked to reach
+                    publish_ref(ref_root[:, t + 1], ref_joint_pos[:, t + 1], ref_joint_vel[:, t + 1])
                 actions = pad_to_size(self.actor(self.obs_normalizer(obs), eval_zs[:, t, :]), env.num_envs, dim=0)
                 obs, _, _, _ = env.step(actions.to(env.device))
                 state = buffer.get_expert_state(obs)

@@ -26,7 +26,7 @@ from robot_rl.utils import (
 
 
 def _up_axis(quat_wxyz: torch.Tensor) -> torch.Tensor:
-    """The world z axis in the body frame for (w, x, y, z) quaternions: roll and pitch, blind to heading."""
+    """Express the world z axis in the body frame of (w, x, y, z) quaternions: roll and pitch, blind to heading."""
     w, x, y, z = quat_wxyz.unbind(-1)
     return torch.stack((2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)), dim=-1)
 
@@ -436,7 +436,7 @@ class FbCpr:
         Returns:
             ``emd`` and ``joint_error`` of shape ``(num_motions,)``; per-step ``root_error`` (root displacement
             error from the clip's start [m]) and ``tilt_error`` (angle between the root's and the reference's
-            gravity directions in their own frames [rad], blind to heading), each of shape ``(num_motions, bucket_size - 1)``.
+            gravity directions in their own frames [rad], blind to heading), each ``(num_motions, bucket_size - 1)``.
         """
         print("[INFO] Evaluating motions...")
         self.eval_mode()

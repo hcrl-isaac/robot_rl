@@ -149,6 +149,31 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
     return models
 
 
+def _rebuild_distillation(train_cfg: dict, ckpt: dict) -> dict[str, nn.Module]:
+    """Rebuild a distillation student; the teacher is the training signal, not an export target.
+
+    Args:
+        train_cfg: The run's train cfg, holding the ``student`` model cfg and its obs groups.
+        ckpt: The checkpoint, holding ``student_state_dict`` with its baked observation normalizer.
+
+    Returns:
+        The student under the ``policy`` export name.
+    """
+    cfg = copy.deepcopy(train_cfg)
+    sd = ckpt["student_state_dict"]
+    model_cfg = dict(cfg["student"])
+    model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
+    dist_cfg = model_cfg.get("distribution_cfg")
+    if dist_cfg is not None:
+        dist_cfg.setdefault("class_name", "GaussianDistribution")
+    groups = cfg["obs_groups"]["student"]
+    # only the concatenated dim matters for layer sizes; put it all on the first group
+    obs = {g: torch.zeros(1, _first_mlp_input_dim(sd) if i == 0 else 0) for i, g in enumerate(groups)}
+    model = model_class(obs, {"student": groups}, "student", _num_actions(sd), **model_cfg)
+    model.load_state_dict(sd, strict=True)
+    return {"policy": model.eval()}
+
+
 # FB-CPR models: name -> (cfg key, obs set, default class, output spec, other-input spec)
 _FBCPR_MODELS = {
     "policy": ("actor", "actor", "ResidualFuseModel", "num_actions", ("z_dim",)),
@@ -199,6 +224,8 @@ def rebuild_models(train_cfg: dict, ckpt: dict, all_models: bool = False) -> dic
     """Rebuild the trained models from a checkpoint, normalizers baked in; keyed by export name."""
     if "backward_map_state_dict" in ckpt:
         return _rebuild_fbcpr(train_cfg, ckpt, all_models)
+    if "student_state_dict" in ckpt:
+        return _rebuild_distillation(train_cfg, ckpt)
     return _rebuild_ppo(train_cfg, ckpt, all_models)
 
 

@@ -160,3 +160,38 @@ def test_rebuilt_encoder_policy_exports_to_onnx(tmp_path: Path) -> None:
     session = ort.InferenceSession(path)
     (actual,) = session.run(None, {session.get_inputs()[0].name: x.numpy()})
     torch.testing.assert_close(torch.from_numpy(actual), expected, rtol=1e-4, atol=1e-5)
+
+
+def test_rebuild_distillation_matches_the_student() -> None:
+    """A distillation checkpoint exports its student; the teacher was the training signal, not a target."""
+    from robot_rl.algorithms.distillation import Distillation
+    from robot_rl.models import MLPModel
+    from robot_rl.storage import RolloutStorage
+    from tests.conftest import make_obs
+
+    num_envs, obs_dim, num_actions = 4, 8, 4
+    obs = make_obs(num_envs, obs_dim)
+    obs_groups = {"student": ["policy"], "teacher": ["policy"]}
+    student_cfg = {
+        "class_name": "MLPModel",
+        "hidden_dims": [32, 32],
+        "distribution_cfg": dict(_ACTOR_CFG["distribution_cfg"]),
+    }
+    student = MLPModel(
+        obs,
+        obs_groups,
+        "student",
+        num_actions,
+        hidden_dims=[32, 32],
+        distribution_cfg=dict(_ACTOR_CFG["distribution_cfg"]),
+    )
+    teacher = MLPModel(obs, obs_groups, "teacher", num_actions, hidden_dims=[32, 32])
+    alg = Distillation(student, teacher, RolloutStorage("distillation", num_envs, 4, obs, [num_actions]))
+    alg.eval_mode()
+
+    train_cfg = {"student": student_cfg, "obs_groups": obs_groups, "algorithm": {}}
+    policy = rebuild_models(train_cfg, alg.save())["policy"]
+    with torch.inference_mode():
+        expected = alg.student(obs, stochastic_output=False)
+        actual = policy(obs, stochastic_output=False)
+    torch.testing.assert_close(expected, actual)

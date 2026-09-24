@@ -148,8 +148,9 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
         dist_cfg = model_cfg.get("distribution_cfg")
         if dist_cfg is not None:
             dist_cfg.setdefault("class_name", "TruncatedGaussianDistribution")
-            dist_cfg.setdefault("low", -cfg["clip_actions"])
-            dist_cfg.setdefault("high", cfg["clip_actions"])
+            # training sets a truncated Gaussian's bounds from clip_actions over whatever the cfg dumped
+            if dist_cfg["class_name"] == "TruncatedGaussianDistribution":
+                dist_cfg["low"], dist_cfg["high"] = -cfg["clip_actions"], cfg["clip_actions"]
         out_dim = dims[out_spec] if isinstance(out_spec, str) else out_spec
         other_dims = tuple(dims[k] for k in other_spec)
         bn = _load_bn(nsd, cfg["obs_groups"][obs_set])

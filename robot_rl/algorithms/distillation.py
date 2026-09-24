@@ -27,7 +27,7 @@ class Distillation:
     """The teacher model."""
 
     teacher_loaded: bool = False
-    """Indicates whether the teacher model parameters have been loaded."""
+    """Whether the teacher is ready to supervise: its weights are loaded or come from its own configuration."""
 
     def __init__(
         self,
@@ -71,8 +71,7 @@ class Distillation:
         # simply alias ``self.student`` / ``self.teacher``.
         self._raw_student = self.student
         self._raw_teacher = self.teacher
-        # a parameter-free teacher computes its target in the env, so there is no checkpoint to load
-        self.teacher_loaded = not any(p.numel() for p in self._raw_teacher.parameters())
+        self.teacher_loaded = teacher.loads_own_weights
 
         # Create the optimizer
         self.optimizer = resolve_optimizer(optimizer)(self.student.parameters(), lr=learning_rate)  # type: ignore
@@ -226,10 +225,12 @@ class Distillation:
         if load_cfg.get("student"):
             self._raw_student.load_state_dict(loaded_dict["student_state_dict"], strict=strict)
         if load_cfg.get("teacher"):
-            self._raw_teacher.load_state_dict(
-                loaded_dict.get("teacher_state_dict") or loaded_dict["actor_state_dict"], strict=strict
-            )
-            self.teacher_loaded = True
+            teacher_state = loaded_dict.get("teacher_state_dict") or loaded_dict.get("actor_state_dict")
+            if teacher_state:
+                self._raw_teacher.load_state_dict(teacher_state, strict=strict)
+                self.teacher_loaded = True
+            elif not self.teacher_loaded:
+                raise ValueError("The checkpoint has no teacher weights, but the teacher model needs them.")
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         return load_cfg.get("iteration", False)

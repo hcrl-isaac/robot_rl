@@ -12,6 +12,7 @@ import re
 import torch
 import torch.nn as nn
 
+from robot_rl.models.inference import EncoderInferencePolicy
 from robot_rl.utils.utils import resolve_callable
 
 DEFAULT_ONNX_OPSET = 18
@@ -94,50 +95,83 @@ def bake_normalizer(model: nn.Module, normalizer: nn.Module) -> nn.Module:
     return model
 
 
-def _build_mlp(cfg: dict, sd: dict, cfg_key: str, obs_set: str, output_dim: int) -> nn.Module:
-    """Rebuild one MLP-family model from its state dict, sized from the checkpoint's own first layer.
-
-    Args:
-        cfg: The run's train cfg, holding the model cfg under ``cfg_key`` and its ``obs_groups``.
-        sd: The model's state dict, including its baked observation normalizer.
-        cfg_key: Model cfg key (``actor``, ``critic``, ``student``).
-        obs_set: Observation-set name selecting this model's groups.
-        output_dim: Width of the model's output layer.
-
-    Returns:
-        The rebuilt model in eval mode.
-    """
-    model_cfg = dict(cfg[cfg_key])
-    model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
-    dist_cfg = model_cfg.get("distribution_cfg")
-    if dist_cfg is not None:
-        dist_cfg.setdefault("class_name", "GaussianDistribution")
+def _first_mlp_input_dim(sd: dict[str, torch.Tensor]) -> int:
+    """Width of a model's first MLP layer, i.e. everything its trunk consumes."""
     first_idx = min(int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k)))
-    obs_dim = sd[f"mlp.{first_idx}.weight"].shape[1]
-    groups = cfg["obs_groups"][obs_set]
-    # only the concatenated dim matters for layer sizes; put it all on the first group
-    obs = {g: torch.zeros(1, obs_dim if i == 0 else 0) for i, g in enumerate(groups)}
-    model = model_class(obs, {obs_set: groups}, obs_set, output_dim, **model_cfg)
-    model.load_state_dict(sd, strict=True)
-    return model.eval()
+    return sd[f"mlp.{first_idx}.weight"].shape[1]
 
 
 def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.Module]:
     if "memory_state_dict" in ckpt:
         raise NotImplementedError("Export of recurrent (memory-bearing) policies is not supported.")
     cfg = copy.deepcopy(train_cfg)
-    actor = ckpt["actor_state_dict"]
-    models = {"policy": _build_mlp(cfg, actor, "actor", "actor", _num_actions(actor))}
+    models: dict[str, nn.Module] = {}
+
+    # an encoder head's first layer is ``obs_dim + latent_dim`` wide; subtract the latent to size its obs
+    encoder_cfg = cfg.get("algorithm", {}).get("encoder_cfg")
+    latent_dim = int(encoder_cfg["output_dim"]) if encoder_cfg is not None else 0
+
+    def build_from_groups(
+        model_cfg: dict, sd: dict[str, torch.Tensor], obs_set: str, output_dim: int, other_dims: tuple[int, ...]
+    ) -> nn.Module:
+        model_cfg = dict(model_cfg)
+        model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
+        dist_cfg = model_cfg.get("distribution_cfg")
+        if dist_cfg is not None:
+            dist_cfg.setdefault("class_name", "GaussianDistribution")
+        obs_dim = _first_mlp_input_dim(sd) - sum(other_dims)
+        groups = cfg["obs_groups"][obs_set]
+        # only the concatenated dim matters for layer sizes; put it all on the first group
+        obs = {g: torch.zeros(1, obs_dim if i == 0 else 0) for i, g in enumerate(groups)}
+        model = model_class(obs, {obs_set: groups}, obs_set, output_dim, other_input_dims=other_dims, **model_cfg)
+        model.load_state_dict(sd, strict=True)
+        return model.eval()
+
+    def build(name: str, sd_key: str, output_dim: int) -> nn.Module:
+        obs_set = "actor" if name == "policy" else "critic"
+        other_dims = (latent_dim,) if latent_dim else ()
+        return build_from_groups(
+            cfg[name if name != "policy" else "actor"], ckpt[sd_key], obs_set, output_dim, other_dims
+        )
+
+    encoder: nn.Module | None = None
+    if encoder_cfg is not None:
+        if "encoder_state_dict" not in ckpt:
+            raise ValueError("The train cfg configures an encoder but the checkpoint has no 'encoder_state_dict'.")
+        encoder = build_from_groups(encoder_cfg["model"], ckpt["encoder_state_dict"], "encoder", latent_dim, ())
+
+    models["policy"] = build("policy", "actor_state_dict", _num_actions(ckpt["actor_state_dict"]))
     if all_models:
-        models["critic"] = _build_mlp(cfg, ckpt["critic_state_dict"], "critic", "critic", 1)
+        models["critic"] = build("critic", "critic_state_dict", 1)
+    if encoder is not None:
+        # fold the encoder in, so the export takes one ``[head_obs ; encoder_obs]`` input
+        models = {name: EncoderInferencePolicy(encoder, model) for name, model in models.items()}
     return models
 
 
 def _rebuild_distillation(train_cfg: dict, ckpt: dict) -> dict[str, nn.Module]:
-    """Rebuild a distillation student; the teacher is the training signal, not an export target."""
+    """Rebuild a distillation student; the teacher is the training signal, not an export target.
+
+    Args:
+        train_cfg: The run's train cfg, holding the ``student`` model cfg and its obs groups.
+        ckpt: The checkpoint, holding ``student_state_dict`` with its baked observation normalizer.
+
+    Returns:
+        The student under the ``policy`` export name.
+    """
     cfg = copy.deepcopy(train_cfg)
-    student = ckpt["student_state_dict"]
-    return {"policy": _build_mlp(cfg, student, "student", "student", _num_actions(student))}
+    sd = ckpt["student_state_dict"]
+    model_cfg = dict(cfg["student"])
+    model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
+    dist_cfg = model_cfg.get("distribution_cfg")
+    if dist_cfg is not None:
+        dist_cfg.setdefault("class_name", "GaussianDistribution")
+    groups = cfg["obs_groups"]["student"]
+    # only the concatenated dim matters for layer sizes; put it all on the first group
+    obs = {g: torch.zeros(1, _first_mlp_input_dim(sd) if i == 0 else 0) for i, g in enumerate(groups)}
+    model = model_class(obs, {"student": groups}, "student", _num_actions(sd), **model_cfg)
+    model.load_state_dict(sd, strict=True)
+    return {"policy": model.eval()}
 
 
 # FB-CPR models: name -> (cfg key, obs set, default class, output spec, other-input spec)

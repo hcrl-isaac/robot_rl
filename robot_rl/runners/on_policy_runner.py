@@ -14,12 +14,13 @@ from datetime import timedelta
 from robot_rl.algorithms import PPO
 from robot_rl.env import VecEnv
 from robot_rl.models import MLPModel
+from robot_rl.runners.checkpoint_hooks import CheckpointHooks
 from robot_rl.utils import check_nan, demote_old_checkpoint, resolve_callable
 from robot_rl.utils.export import save_onnx
 from robot_rl.utils.logger import Logger
 
 
-class OnPolicyRunner:
+class OnPolicyRunner(CheckpointHooks):
     """On-policy runner for reinforcement learning algorithms."""
 
     alg: PPO
@@ -130,21 +131,30 @@ class OnPolicyRunner:
             )
 
             # Save model
-            if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
-                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
-                demoted = demote_old_checkpoint(
-                    self.alg,
-                    self.logger.log_dir,
-                    it,
-                    self.cfg.get("keep_full_checkpoints"),
-                    self.cfg["save_interval"],
-                )
-                if demoted is not None:  # re-upload so the logger's live-sync replaces the full remote copy
-                    self.logger.save_model(os.path.join(self.logger.log_dir, f"model_{demoted}.pt"), demoted)
+            if it % self.cfg["save_interval"] == 0:
+                path = os.path.join(self.logger.log_dir or "", f"model_{it}.pt")
+                if self.logger.writer is not None:
+                    self.save(path)
+                    demoted = demote_old_checkpoint(
+                        self.alg,
+                        self.logger.log_dir,
+                        it,
+                        self.cfg.get("keep_full_checkpoints"),
+                        self.cfg["save_interval"],
+                    )
+                    if demoted is not None:  # re-upload so the logger's live-sync replaces the full remote copy
+                        self.logger.save_model(os.path.join(self.logger.log_dir, f"model_{demoted}.pt"), demoted)
+                if self._after_checkpoint(path, it):
+                    with torch.inference_mode():
+                        obs = self._reset_after_eval()
 
         # Save the final model after training and stop the logging writer
+        final = os.path.join(self.logger.log_dir or "", f"model_{self.current_learning_iteration}.pt")
         if self.logger.writer is not None:
-            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
+            self.save(final)
+        if self.current_learning_iteration % self.cfg["save_interval"] != 0:
+            self._after_checkpoint(final, self.current_learning_iteration)
+        if self.logger.writer is not None:
             self.logger.stop_logging_writer()
 
     def save(self, path: str, infos: dict | None = None) -> None:
@@ -160,6 +170,10 @@ class OnPolicyRunner:
         # Persist cumulative env-steps so a resume reconstructs the curriculum clock at the same
         # sample budget regardless of this run's env/GPU count (see load()).
         saved_dict["env_step"] = int(self.env.unwrapped.common_step_counter) * self.env.num_envs * self.gpu_world_size
+        # so a resume or an eval sim starts at the trained terrain level, not the flat row
+        terrain = getattr(getattr(self.env.unwrapped, "scene", None), "terrain", None)
+        if getattr(terrain, "terrain_levels", None) is not None:
+            saved_dict["terrain_level"] = float(terrain.terrain_levels.float().mean())
         saved_dict["infos"] = infos
         tmp_path = path + ".tmp"
         torch.save(saved_dict, tmp_path)
@@ -192,7 +206,20 @@ class OnPolicyRunner:
                 self.env.unwrapped.common_step_counter = round(env_step / effective_envs)  # type: ignore
             else:
                 self.env.unwrapped.common_step_counter = self.current_learning_iteration * self.cfg["num_steps_per_env"]  # type: ignore
+            if self.cfg.get("restore_terrain_level", False):
+                self._restore_terrain_level(loaded_dict.get("terrain_level"))
         return loaded_dict["infos"]
+
+    def _restore_terrain_level(self, level: float | None) -> None:
+        """Put every env of a curriculum terrain on the checkpoint's mean level (rounded, clamped to the rows)."""
+        terrain = getattr(getattr(self.env.unwrapped, "scene", None), "terrain", None)
+        if level is None or getattr(terrain, "terrain_levels", None) is None or terrain.terrain_origins is None:
+            return
+        generator = getattr(terrain.cfg, "terrain_generator", None)
+        if generator is None or not generator.curriculum:
+            return
+        terrain.terrain_levels[:] = min(round(level), terrain.terrain_origins.shape[0] - 1)
+        terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]
 
     def get_inference_policy(self, device: str | None = None) -> MLPModel:
         """Return the policy on the requested device for inference."""

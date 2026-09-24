@@ -12,6 +12,7 @@ import re
 import torch
 import torch.nn as nn
 
+from robot_rl.models.inference import EncoderInferencePolicy
 from robot_rl.utils.utils import resolve_callable
 
 DEFAULT_ONNX_OPSET = 18
@@ -94,32 +95,57 @@ def bake_normalizer(model: nn.Module, normalizer: nn.Module) -> nn.Module:
     return model
 
 
+def _first_mlp_input_dim(sd: dict[str, torch.Tensor]) -> int:
+    """Width of a model's first MLP layer, i.e. everything its trunk consumes."""
+    first_idx = min(int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k)))
+    return sd[f"mlp.{first_idx}.weight"].shape[1]
+
+
 def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.Module]:
     if "memory_state_dict" in ckpt:
         raise NotImplementedError("Export of recurrent (memory-bearing) policies is not supported.")
     cfg = copy.deepcopy(train_cfg)
     models: dict[str, nn.Module] = {}
 
-    def build(name: str, sd_key: str, output_dim: int, default_class: str = "MLPModel") -> nn.Module:
-        sd = ckpt[sd_key]
-        model_cfg = dict(cfg[name if name != "policy" else "actor"])
-        model_class = resolve_callable(model_cfg.pop("class_name", default_class))
+    # an encoder head's first layer is ``obs_dim + latent_dim`` wide; subtract the latent to size its obs
+    encoder_cfg = cfg.get("algorithm", {}).get("encoder_cfg")
+    latent_dim = int(encoder_cfg["output_dim"]) if encoder_cfg is not None else 0
+
+    def build_from_groups(
+        model_cfg: dict, sd: dict[str, torch.Tensor], obs_set: str, output_dim: int, other_dims: tuple[int, ...]
+    ) -> nn.Module:
+        model_cfg = dict(model_cfg)
+        model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
         dist_cfg = model_cfg.get("distribution_cfg")
         if dist_cfg is not None:
             dist_cfg.setdefault("class_name", "GaussianDistribution")
-        first_idx = min(int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k)))
-        obs_dim = sd[f"mlp.{first_idx}.weight"].shape[1]
-        obs_set = "actor" if name == "policy" else "critic"
+        obs_dim = _first_mlp_input_dim(sd) - sum(other_dims)
         groups = cfg["obs_groups"][obs_set]
         # only the concatenated dim matters for layer sizes; put it all on the first group
         obs = {g: torch.zeros(1, obs_dim if i == 0 else 0) for i, g in enumerate(groups)}
-        model = model_class(obs, {obs_set: groups}, obs_set, output_dim, **model_cfg)
+        model = model_class(obs, {obs_set: groups}, obs_set, output_dim, other_input_dims=other_dims, **model_cfg)
         model.load_state_dict(sd, strict=True)
         return model.eval()
+
+    def build(name: str, sd_key: str, output_dim: int) -> nn.Module:
+        obs_set = "actor" if name == "policy" else "critic"
+        other_dims = (latent_dim,) if latent_dim else ()
+        return build_from_groups(
+            cfg[name if name != "policy" else "actor"], ckpt[sd_key], obs_set, output_dim, other_dims
+        )
+
+    encoder: nn.Module | None = None
+    if encoder_cfg is not None:
+        if "encoder_state_dict" not in ckpt:
+            raise ValueError("The train cfg configures an encoder but the checkpoint has no 'encoder_state_dict'.")
+        encoder = build_from_groups(encoder_cfg["model"], ckpt["encoder_state_dict"], "encoder", latent_dim, ())
 
     models["policy"] = build("policy", "actor_state_dict", _num_actions(ckpt["actor_state_dict"]))
     if all_models:
         models["critic"] = build("critic", "critic_state_dict", 1)
+    if encoder is not None:
+        # fold the encoder in, so the export takes one ``[head_obs ; encoder_obs]`` input
+        models = {name: EncoderInferencePolicy(encoder, model) for name, model in models.items()}
     return models
 
 

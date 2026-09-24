@@ -109,14 +109,17 @@ class TrajectoryBuffer(ExpertBuffer):
             eval_idxs = self._eval_order[idx : idx + mini_batch_size]
             yield self.motions[eval_idxs].to(device)
 
-    def update_priorities(self, priorities: torch.Tensor, indices: torch.Tensor | slice) -> None:
-        """Update a slice of priorities. Assumes :meth:`get_batch_motions` has already been called."""
-        actual_indices = self._eval_order[indices]
-        self.priorities[actual_indices] = priorities.to(self.device)
+    @property
+    def eval_order(self) -> torch.Tensor:
+        """Buffer index of each motion in the order the last :meth:`get_batch_motions` yielded them."""
+        return self._eval_order
 
-    def normalize_priorities(self) -> None:
-        """Normalize all priorities by dividing by their sum."""
-        self.priorities /= self.priorities.sum()
+    def set_priorities(self, priorities: torch.Tensor) -> None:
+        """Replace every motion's sampling weight (buffer order) and normalize them to sum to one."""
+        if priorities.shape != self.priorities.shape:
+            raise ValueError(f"expected {tuple(self.priorities.shape)} priorities, got {tuple(priorities.shape)}")
+        priorities = priorities.to(self.device, torch.float32)
+        self.priorities = priorities / priorities.sum()
 
     def state_dict(self) -> dict:
         """Return the per-motion sampling priorities for checkpointing."""

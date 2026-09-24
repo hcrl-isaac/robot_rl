@@ -168,13 +168,15 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
 
     def build(name: str) -> nn.Module:
         cfg_key, obs_set, default_class, out_spec, other_spec = _FBCPR_MODELS[name]
-        model_cfg = dict(cfg[cfg_key])
+        # the actor sits at the top of the runner cfg, the FB maps and critics under ``algorithm``
+        model_cfg = dict(cfg[cfg_key] if cfg_key in cfg else cfg["algorithm"][cfg_key])
         model_class = resolve_callable(model_cfg.pop("class_name", default_class))
         dist_cfg = model_cfg.get("distribution_cfg")
         if dist_cfg is not None:
             dist_cfg.setdefault("class_name", "TruncatedGaussianDistribution")
-            dist_cfg.setdefault("low", -cfg["clip_actions"])
-            dist_cfg.setdefault("high", cfg["clip_actions"])
+            # training sets a truncated Gaussian's bounds from clip_actions over whatever the cfg dumped
+            if dist_cfg["class_name"] == "TruncatedGaussianDistribution":
+                dist_cfg["low"], dist_cfg["high"] = -cfg["clip_actions"], cfg["clip_actions"]
         out_dim = dims[out_spec] if isinstance(out_spec, str) else out_spec
         other_dims = tuple(dims[k] for k in other_spec)
         bn = _load_bn(nsd, cfg["obs_groups"][obs_set])

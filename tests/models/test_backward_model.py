@@ -81,7 +81,7 @@ def test_frozen_and_round_trips(backward_path: str, tmp_path: pathlib.Path) -> N
 
 
 def test_old_empty_teacher_checkpoint_loads(backward_path: str) -> None:
-    """A checkpoint saved with a weightless teacher loads its student under a B teacher, which keeps its own B."""
+    """A checkpoint with an empty teacher state loads its student under a B teacher, which keeps its own B."""
     from robot_rl.algorithms.distillation import Distillation
     from robot_rl.models import MLPModel
     from robot_rl.storage import RolloutStorage

@@ -27,7 +27,7 @@ class Distillation:
     """The teacher model."""
 
     teacher_loaded: bool = False
-    """Whether the teacher is ready to supervise: its weights are loaded, self-loaded, or it has none."""
+    """Whether the teacher is ready to supervise: its weights are loaded or come from its own configuration."""
 
     def __init__(
         self,
@@ -71,7 +71,7 @@ class Distillation:
         # simply alias ``self.student`` / ``self.teacher``.
         self._raw_student = self.student
         self._raw_teacher = self.teacher
-        self.teacher_loaded = teacher.loads_own_weights or not teacher.state_dict()
+        self.teacher_loaded = teacher.loads_own_weights
 
         # Create the optimizer
         self.optimizer = resolve_optimizer(optimizer)(self.student.parameters(), lr=learning_rate)  # type: ignore

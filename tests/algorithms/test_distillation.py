@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import torch
 from tensordict import TensorDict
-from typing import Any
 
 import pytest
 
 from robot_rl.algorithms.distillation import Distillation
-from robot_rl.models import IdentityModel, MLPModel
+from robot_rl.models import MLPModel
 from robot_rl.storage import RolloutStorage
 from tests.conftest import make_obs
 
@@ -118,43 +117,27 @@ class TestDistillationLoss:
 
 
 class TestTeacherReadiness:
-    """A teacher is ready when it has no weights, loads its own, or gets them from a checkpoint."""
+    """A teacher is ready when it loads its own weights or gets them from a checkpoint."""
 
     @staticmethod
-    def _alg(teacher_cls: type, **teacher_kwargs: Any) -> Distillation:
+    def _alg() -> Distillation:
         obs = make_obs(NUM_ENVS, OBS_DIM)
         obs_groups = {"student": ["policy"], "teacher": ["policy"]}
         student = MLPModel(obs, obs_groups, "student", NUM_ACTIONS, hidden_dims=[32, 32])
-        teacher = teacher_cls(
-            obs, obs_groups, "teacher", OBS_DIM if teacher_cls is IdentityModel else NUM_ACTIONS, **teacher_kwargs
-        )
+        teacher = MLPModel(obs, obs_groups, "teacher", NUM_ACTIONS, hidden_dims=[32])
         storage = RolloutStorage("distillation", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
         return Distillation(student, teacher, storage)
 
-    def test_weightless_teacher_is_ready(self) -> None:
-        """A teacher with no weights supervises without a checkpoint."""
-        assert self._alg(IdentityModel).teacher_loaded
-
     def test_weighted_teacher_needs_a_checkpoint(self) -> None:
         """A teacher with weights is not ready until loaded, and an empty teacher checkpoint is refused."""
-        alg = self._alg(MLPModel, hidden_dims=[32])
+        alg = self._alg()
         assert not alg.teacher_loaded
         with pytest.raises(ValueError, match="no teacher weights"):
             alg.load({"student_state_dict": alg.student.state_dict(), "teacher_state_dict": {}}, None, strict=True)
 
-    def test_empty_teacher_checkpoint_loads_for_weightless_teacher(self) -> None:
-        """A distilled checkpoint with an empty teacher loads when the teacher needs no weights."""
-        alg = self._alg(IdentityModel)
-        alg.load(
-            {"student_state_dict": alg.student.state_dict(), "teacher_state_dict": {}},
-            {"student": True, "teacher": True},
-            strict=True,
-        )
-        assert alg.teacher_loaded
-
     def test_rl_actor_loads_as_teacher(self) -> None:
         """An RL checkpoint's actor becomes the teacher."""
-        alg = self._alg(MLPModel, hidden_dims=[32])
+        alg = self._alg()
         source = MLPModel(make_obs(NUM_ENVS, OBS_DIM), {"actor": ["policy"]}, "actor", NUM_ACTIONS, hidden_dims=[32])
         alg.load({"actor_state_dict": source.state_dict()}, None, strict=True)
         assert alg.teacher_loaded

@@ -25,6 +25,12 @@ from robot_rl.utils import (
 )
 
 
+def _up_axis(quat_wxyz: torch.Tensor) -> torch.Tensor:
+    """The world z axis in the body frame for (w, x, y, z) quaternions: roll and pitch, blind to heading."""
+    w, x, y, z = quat_wxyz.unbind(-1)
+    return torch.stack((2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)), dim=-1)
+
+
 class FbCpr:
     """Forward-Backward representations with Conditional Policy Regularization (FB-CPR) algorithm.
 
@@ -428,8 +434,9 @@ class FbCpr:
             max_steps: Stop after this many ``env.step`` calls; unscored motions keep NaN.
 
         Returns:
-            ``emd`` and ``joint_error`` of shape ``(num_motions,)``, and ``root_error`` of shape
-            ``(num_motions, bucket_size - 1)``: per-step root displacement error [m] from the clip's start.
+            ``emd`` and ``joint_error`` of shape ``(num_motions,)``; per-step ``root_error`` (root displacement
+            error from the clip's start [m]) and ``tilt_error`` (angle between the root's and the reference's
+            gravity directions in their own frames [rad], blind to heading), each of shape ``(num_motions, bucket_size - 1)``.
         """
         print("[INFO] Evaluating motions...")
         self.eval_mode()
@@ -440,6 +447,7 @@ class FbCpr:
         emd = torch.full((buffer.num_motions,), float("nan"), device=self.device)
         joint_error = torch.full_like(emd, float("nan"))
         root_error = torch.full((buffer.num_motions, rollout_steps), float("nan"), device=self.device)
+        tilt_error = torch.full_like(root_error, float("nan"))
         start = 0
         steps_done = 0
         for eval_obs in buffer.get_batch_motions(env.num_envs, device=self.device):
@@ -458,6 +466,7 @@ class FbCpr:
             obs, _ = env.reset_to({"articulation": {"robot": first}}, is_relative=True)
             qpos = torch.zeros((batch, rollout_steps, first["joint_position"].shape[1]), device=self.device)
             root = torch.zeros((batch, rollout_steps, 3), device=self.device)
+            up = torch.zeros((batch, rollout_steps, 3), device=self.device)
             root_start = buffer.get_expert_state(obs)["root_pose"][:batch, :3].to(self.device)
             steps = rollout_steps
             for t in range(rollout_steps):
@@ -466,6 +475,7 @@ class FbCpr:
                 state = buffer.get_expert_state(obs)
                 qpos[:, t] = state["joint_position"][:batch].to(self.device)
                 root[:, t] = state["root_pose"][:batch, :3].to(self.device)
+                up[:, t] = _up_axis(state["root_pose"][:batch, 3:7].to(self.device))
                 steps_done += 1
                 if max_steps is not None and steps_done >= max_steps:
                     steps = t + 1
@@ -476,6 +486,9 @@ class FbCpr:
             act_disp = root[:, :steps] - root_start[:, None]
             ref_disp = ref_root[:, 1:] - ref_root[:, :1]
             root_error[ids, :steps] = (act_disp - ref_disp).norm(dim=-1)
+            ref_up = _up_axis(ref["root_pose"][:, 1 : steps + 1, 3:7])
+            cos = (up[:, :steps] * ref_up).sum(dim=-1).clamp(-1.0, 1.0)
+            tilt_error[ids, :steps] = torch.acos(cos)
             joint_error[ids] = (qpos[:, :steps] - ref_qpos).norm(dim=-1).mean(dim=-1)
             emd[ids] = torch.stack([compute_emd(qpos[i, :steps], ref_qpos[i]) for i in range(batch)])
             if max_steps is not None and steps_done >= max_steps:
@@ -484,7 +497,7 @@ class FbCpr:
         self.train_mode()
         env.train_mode()
         print("[INFO] Finished evaluating motions.")
-        return {"emd": emd, "joint_error": joint_error, "root_error": root_error}
+        return {"emd": emd, "joint_error": joint_error, "root_error": root_error, "tilt_error": tilt_error}
 
     @staticmethod
     def motion_priorities(emd: torch.Tensor) -> torch.Tensor:

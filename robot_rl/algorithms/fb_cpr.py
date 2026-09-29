@@ -723,8 +723,10 @@ class FbCpr:
             cfg["algorithm"]["batch_size"],
             cfg["storage_device"],
         )
+        # A large corpus can exceed VRAM on its own, so it is placed independently of the replay buffer.
+        expert_device = cfg["algorithm"].get("expert_storage_device") or cfg["storage_device"]
         expert_buffer = (
-            TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], cfg["storage_device"])
+            TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], expert_device)
             if not inference
             else None
         )

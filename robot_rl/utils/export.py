@@ -47,6 +47,10 @@ def _group_dims(nsd: dict[str, torch.Tensor]) -> dict[str, int]:
 
 def _num_actions(actor_sd: dict[str, torch.Tensor]) -> int:
     """Infer the action dimension from the distribution's per-action parameter vector."""
+    if "distribution.log_kappa" in actor_sd:
+        # a vMF's spread is one scalar; its action is the MLP's output direction itself
+        last_idx = max(int(m.group(1)) for k in actor_sd if (m := re.match(r"mlp\.(\d+)\.weight", k)))
+        return actor_sd[f"mlp.{last_idx}.weight"].shape[0]
     for k, v in actor_sd.items():
         if "distribution" in k and isinstance(v, torch.Tensor) and v.ndim == 1:
             return v.shape[0]
@@ -149,12 +153,15 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
     return models
 
 
-def _rebuild_distillation(train_cfg: dict, ckpt: dict) -> dict[str, nn.Module]:
+def _rebuild_distillation(
+    train_cfg: dict, ckpt: dict, obs_shapes: dict[str, tuple[int, ...]] | None = None
+) -> dict[str, nn.Module]:
     """Rebuild a distillation student; the teacher is the training signal, not an export target.
 
     Args:
         train_cfg: The run's train cfg, holding the ``student`` model cfg and its obs groups.
         ckpt: The checkpoint, holding ``student_state_dict`` with its baked observation normalizer.
+        obs_shapes: ``(channels, height, width)`` of each image group, which a checkpoint does not record.
 
     Returns:
         The student under the ``policy`` export name.
@@ -167,8 +174,19 @@ def _rebuild_distillation(train_cfg: dict, ckpt: dict) -> dict[str, nn.Module]:
     if dist_cfg is not None:
         dist_cfg.setdefault("class_name", "GaussianDistribution")
     groups = cfg["obs_groups"]["student"]
-    # only the concatenated dim matters for layer sizes; put it all on the first group
-    obs = {g: torch.zeros(1, _first_mlp_input_dim(sd) if i == 0 else 0) for i, g in enumerate(groups)}
+    images = {g: tuple(obs_shapes[g]) for g in groups if obs_shapes and g in obs_shapes}
+    if "cnn_cfg" in model_cfg and not images:
+        raise ValueError(f"{model_class.__name__} encodes images: give each image group's (C, H, W) in obs_shapes")
+    if images:
+        if "obs_normalizer._mean" not in sd:
+            raise ValueError("an image student needs its 1D observation normalizer to size its 1D input")
+        obs_dim = sd["obs_normalizer._mean"].shape[-1]
+    else:
+        obs_dim = _first_mlp_input_dim(sd)
+    flat = [g for g in groups if g not in images]
+    # only the concatenated 1D dim matters for layer sizes; put it all on the first 1D group
+    obs = {g: torch.zeros(1, obs_dim if g == flat[0] else 0) for g in flat}
+    obs |= {g: torch.zeros(1, *shape) for g, shape in images.items()}
     model = model_class(obs, {"student": groups}, "student", _num_actions(sd), **model_cfg)
     model.load_state_dict(sd, strict=True)
     return {"policy": model.eval()}
@@ -220,12 +238,21 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
     return {name: build(name) for name in names}
 
 
-def rebuild_models(train_cfg: dict, ckpt: dict, all_models: bool = False) -> dict[str, nn.Module]:
-    """Rebuild the trained models from a checkpoint, normalizers baked in; keyed by export name."""
+def rebuild_models(
+    train_cfg: dict, ckpt: dict, all_models: bool = False, obs_shapes: dict[str, tuple[int, ...]] | None = None
+) -> dict[str, nn.Module]:
+    """Rebuild the trained models from a checkpoint, normalizers baked in; keyed by export name.
+
+    Args:
+        train_cfg: The run's train cfg.
+        ckpt: The loaded checkpoint.
+        all_models: Also rebuild the models that are not the policy, where the algorithm has them.
+        obs_shapes: ``(channels, height, width)`` of each image observation group, for image models.
+    """
     if "backward_map_state_dict" in ckpt:
         return _rebuild_fbcpr(train_cfg, ckpt, all_models)
     if "student_state_dict" in ckpt:
-        return _rebuild_distillation(train_cfg, ckpt)
+        return _rebuild_distillation(train_cfg, ckpt, obs_shapes)
     return _rebuild_ppo(train_cfg, ckpt, all_models)
 
 

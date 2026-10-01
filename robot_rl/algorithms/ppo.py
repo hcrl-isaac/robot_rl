@@ -15,6 +15,7 @@ from typing import Any
 from robot_rl.env import VecEnv
 from robot_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from robot_rl.models import EncoderInferencePolicy, MLPModel, SharedMemoryInferencePolicy
+from robot_rl.modules import GaussianDistribution
 from robot_rl.storage import RolloutStorage
 from robot_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -60,6 +61,8 @@ class PPO:
         # Optional shared observation encoder (its latent is an extra input to actor and critic)
         encoder: nn.Module | None = None,
         encoder_cfg: dict | None = None,
+        # CCRL joint-residual regularization (see the loss block in `update`)
+        residual_reg: dict | None = None,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -82,6 +85,9 @@ class PPO:
         else:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
+
+        # CCRL joint-residual regularization. None (default) leaves the PPO objective untouched.
+        self.residual_reg = residual_reg
 
         # RND extension
         self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg) if rnd_cfg else None
@@ -124,6 +130,15 @@ class PPO:
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
         # simply alias ``self.actor`` / ``self.critic`` / ``self.memory`` / ``self.encoder``.
+        # A fresh residual starts as pure noise that can only jitter the frozen skills' action; at the policy-wide
+        # init std it made the blend weight collapse within ~1k iterations, after which the residual got no
+        # gradient. ``init_std`` starts its dims quieter. A resumed checkpoint overwrites this with its learned std.
+        if self.residual_reg is not None and self.residual_reg.get("init_std") is not None:
+            a0, a1 = self.residual_reg["action_slice"]
+            for module in self.actor.modules():
+                if isinstance(module, GaussianDistribution):
+                    module.set_std_(float(self.residual_reg["init_std"]), slice(a0, a1))
+
         self._raw_actor = self.actor
         self._raw_critic = self.critic
         self._raw_memory = self.memory
@@ -318,6 +333,8 @@ class PPO:
         mean_symmetry_loss = 0 if self.symmetry else None
         # Encoder L2 loss
         mean_encoder_l2_loss = 0 if (self.encoder is not None and self.encoder_l2_coef > 0.0) else None
+        # CCRL residual regularization loss
+        mean_residual_loss = 0 if self.residual_reg is not None else None
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent or self.memory is not None:
@@ -428,6 +445,33 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
+            # CCRL RESIDUAL REGULARIZERS (Kumar et al., "Cascaded Compositional Residual Learning",
+            # IEEE RA-L 2023, Eq. 5-7). A compositional policy with a trainable residual will, left
+            # unconstrained, let the residual dominate and drown out the frozen skill library -- the
+            # paper's own MCP+Residual ablation drops from 0.98 to 0.12 success on Open Door (Hard)
+            # for exactly this reason, and the motion quality it produces does not transfer.
+            #
+            #   L_rm = E[|residual action|]   keep the perturbation small
+            #   L_rw = E[residual weight]     keep the blend anchored on the primitives
+            #
+            # Both are per-sample expectations. Taking |.| of a batch mean instead lets residuals of opposite
+            # sign in different envs cancel, so a large residual costs nothing. The weight is the residual's
+            # SOFTMAX share of the blend (the last logit of `weight_slice`), not its raw logit: a logit of 0
+            # still hands the residual a 1/K share, so penalizing |logit| anchors it there instead of at 0.
+            #
+            # Read off the ACTOR'S CURRENT MEAN rather than the stored batch actions: the paper's
+            # expectation is over the policy being optimized, and the stored actions are samples from
+            # the older policy that produced the rollout.
+            residual_loss = None
+            if self.residual_reg is not None:
+                mean = self.actor.output_mean[:original_batch_size]
+                a0, a1 = self.residual_reg["action_slice"]
+                w0, w1 = self.residual_reg["weight_slice"]
+                l_rm = mean[:, a0:a1].abs().mean()
+                l_rw = torch.softmax(mean[:, w0:w1], dim=-1)[:, -1].mean()
+                residual_loss = self.residual_reg["magnitude_coef"] * l_rm + self.residual_reg["weight_coef"] * l_rw
+                loss = loss + residual_loss
+
             # RND loss
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
 
@@ -464,6 +508,10 @@ class PPO:
             if self.encoder is not None:
                 nn.utils.clip_grad_norm_(self.encoder.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            # keep bounded std parameters inside their range, where the gradient still reaches them
+            for module in self.actor.modules():
+                if isinstance(module, GaussianDistribution):
+                    module.project_std_()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
@@ -483,6 +531,9 @@ class PPO:
             # Encoder L2 loss
             if mean_encoder_l2_loss is not None:
                 mean_encoder_l2_loss += encoder_l2_loss.item()
+            # CCRL residual regularization loss
+            if mean_residual_loss is not None:
+                mean_residual_loss += residual_loss.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -513,6 +564,8 @@ class PPO:
             mean_symmetry_loss /= num_updates
         if mean_encoder_l2_loss is not None:
             mean_encoder_l2_loss /= num_updates
+        if mean_residual_loss is not None:
+            mean_residual_loss /= num_updates
 
         # Construct the loss dictionary
         # Slash-prefixed keys are logged under that scalar group as-is (Train/...); bare keys go under Loss/.
@@ -533,6 +586,8 @@ class PPO:
             loss_dict["symmetry"] = mean_symmetry_loss
         if mean_encoder_l2_loss is not None:
             loss_dict["encoder_l2"] = mean_encoder_l2_loss
+        if mean_residual_loss is not None:
+            loss_dict["residual_reg"] = mean_residual_loss
 
         # Clear the storage
         self.storage.clear()

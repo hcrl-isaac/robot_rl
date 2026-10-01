@@ -19,6 +19,33 @@ from robot_rl.modules.distribution import (
 class TestGaussianDistribution:
     """Tests for ``GaussianDistribution``."""
 
+    def test_set_std_on_a_slice(self) -> None:
+        """``set_std_`` sets the std of the given dims only, in scalar or log parameterization."""
+        for std_type in ("scalar", "log"):
+            dist = GaussianDistribution(output_dim=4, init_std=1.0, std_type=std_type)
+            dist.set_std_(0.25, slice(1, 3))
+            dist.update(torch.zeros(1, 4))
+            assert torch.allclose(dist.std, torch.tensor([[1.0, 0.25, 0.25, 1.0]]))
+
+    def test_project_std_restores_gradient_past_bound(self) -> None:
+        """A std parameter pushed past ``std_range`` gets no gradient through the clamp until it is projected back."""
+        for std_type, name in (("scalar", "std_param"), ("log", "log_std_param")):
+            dist = GaussianDistribution(output_dim=2, init_std=1.0, std_range=(0.05, 1.0), std_type=std_type)
+            param = getattr(dist, name)
+            with torch.no_grad():
+                param.add_(0.01)  # e.g. the entropy bonus stepped it just past the cap
+
+            dist.update(torch.zeros(1, 2))
+            dist.std.sum().backward()
+            assert torch.all(param.grad == 0.0)
+
+            param.grad = None
+            dist.project_std_()
+            dist.update(torch.zeros(1, 2))
+            dist.std.sum().backward()
+            assert torch.allclose(dist.std, torch.ones(1, 2))
+            assert torch.all(param.grad != 0.0)
+
     def test_log_prob_standard_normal(self) -> None:
         """log_prob at the mean of N(0,1) should equal -0.5*log(2*pi) per dimension, summed."""
         dim = 4

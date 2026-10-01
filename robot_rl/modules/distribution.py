@@ -205,6 +205,27 @@ class GaussianDistribution(Distribution):
             std = torch.exp(log_std)
         self._distribution = Normal(mean, std)
 
+    def set_std_(self, value: float, dims: slice) -> None:
+        """Set the (initial) standard deviation of ``dims`` to ``value``, in this module's own parameterization."""
+        with torch.no_grad():
+            if getattr(self, "std_param", None) is not None:
+                self.std_param[dims] = value
+            if getattr(self, "log_std_param", None) is not None:
+                self.log_std_param[dims] = float(np.log(value))
+
+    def project_std_(self) -> None:
+        """Clamp the std parameter itself into ``std_range``; call after every optimizer step.
+
+        :meth:`update` clamps the std it uses, but a clamp passes no gradient outside its range: a parameter pushed
+        past a bound (e.g. by the entropy bonus) never receives a gradient again and stays frozen at that bound.
+        Projecting the parameter back keeps it where the gradient reaches it.
+        """
+        with torch.no_grad():
+            if getattr(self, "std_param", None) is not None:
+                self.std_param.clamp_(self.std_range[0], self.std_range[1])
+            if getattr(self, "log_std_param", None) is not None:
+                self.log_std_param.clamp_(self.log_std_range[0], self.log_std_range[1])
+
     def sample(self, **kwargs: Any) -> torch.Tensor:
         """Sample from the Gaussian distribution."""
         return self._distribution.sample()  # type: ignore

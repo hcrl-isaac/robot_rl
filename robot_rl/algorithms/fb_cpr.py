@@ -10,6 +10,7 @@ from typing import Any
 from robot_rl.env import URLVecEnv
 from robot_rl.models import FuseModel, MLPModel
 from robot_rl.modules import DictModule, ExponentialMovingAverageNormalization, TargetNetwork
+from robot_rl.modules.distribution import bound_by_clip_actions
 from robot_rl.storage import ReplayBuffer, TrajectoryBuffer, ZBuffer
 from robot_rl.utils import (
     compute_emd,
@@ -23,6 +24,28 @@ from robot_rl.utils import (
     resolve_obs_groups,
     resolve_optimizer,
 )
+
+
+def _up_axis(quat_wxyz: torch.Tensor) -> torch.Tensor:
+    """Express the world z axis in the body frame of (w, x, y, z) quaternions: roll and pitch, blind to heading."""
+    w, x, y, z = quat_wxyz.unbind(-1)
+    return torch.stack((2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)), dim=-1)
+
+
+def _expert_storage_device(cfg: dict, device: str) -> str | None:
+    """Return the device that holds the expert motions.
+
+    Args:
+        cfg: The runner cfg, with ``storage_device`` and ``algorithm.expert_storage_device``.
+        device: The runner's device.
+
+    Returns:
+        ``expert_storage_device``, or ``storage_device`` when it is unset. A bare ``"cuda"`` names the runner's GPU.
+    """
+    expert_device = cfg["algorithm"].get("expert_storage_device") or cfg["storage_device"]
+    if expert_device == "cuda" and torch.device(device).type == "cuda":
+        return str(device)
+    return expert_device
 
 
 class FbCpr:
@@ -428,8 +451,11 @@ class FbCpr:
             max_steps: Stop after this many ``env.step`` calls; unscored motions keep NaN.
 
         Returns:
-            ``emd`` and ``joint_error`` of shape ``(num_motions,)``, and ``root_error`` of shape
-            ``(num_motions, bucket_size - 1)``: per-step root displacement error [m] from the clip's start.
+            emd: Per-motion EMD, shape ``(num_motions,)``.
+            joint_error: Per-motion joint error, shape ``(num_motions,)``.
+            root_error: Per-step root displacement error from the clip's start [m], ``(num_motions, bucket_size - 1)``.
+            tilt_error: Per-step angle between the root's and the reference's gravity directions [rad], blind to
+                heading, ``(num_motions, bucket_size - 1)``.
         """
         print("[INFO] Evaluating motions...")
         self.eval_mode()
@@ -440,6 +466,7 @@ class FbCpr:
         emd = torch.full((buffer.num_motions,), float("nan"), device=self.device)
         joint_error = torch.full_like(emd, float("nan"))
         root_error = torch.full((buffer.num_motions, rollout_steps), float("nan"), device=self.device)
+        tilt_error = torch.full_like(root_error, float("nan"))
         start = 0
         steps_done = 0
         for eval_obs in buffer.get_batch_motions(env.num_envs, device=self.device):
@@ -458,14 +485,26 @@ class FbCpr:
             obs, _ = env.reset_to({"articulation": {"robot": first}}, is_relative=True)
             qpos = torch.zeros((batch, rollout_steps, first["joint_position"].shape[1]), device=self.device)
             root = torch.zeros((batch, rollout_steps, 3), device=self.device)
+            up = torch.zeros((batch, rollout_steps, 3), device=self.device)
             root_start = buffer.get_expert_state(obs)["root_pose"][:batch, :3].to(self.device)
             steps = rollout_steps
+            # a recorder may show the clip being tracked on a ghost twin
+            publish_ref = getattr(getattr(env, "unwrapped", env), "write_reference_pose", None)
+            if publish_ref is not None:
+                ghost_root = torch.cat([ref["root_pose"], ref["root_velocity"]], dim=-1)
+                ghost_root = pad_to_size_repeat(ghost_root, env.num_envs)
+                ref_joint_pos = pad_to_size_repeat(ref["joint_position"], env.num_envs)
+                ref_joint_vel = pad_to_size_repeat(ref["joint_velocity"], env.num_envs)
             for t in range(rollout_steps):
+                if publish_ref is not None:
+                    # frame t+1 is what z targets this step: the pose the robot is asked to reach
+                    publish_ref(ghost_root[:, t + 1], ref_joint_pos[:, t + 1], ref_joint_vel[:, t + 1])
                 actions = pad_to_size(self.actor(self.obs_normalizer(obs), eval_zs[:, t, :]), env.num_envs, dim=0)
                 obs, _, _, _ = env.step(actions.to(env.device))
                 state = buffer.get_expert_state(obs)
                 qpos[:, t] = state["joint_position"][:batch].to(self.device)
                 root[:, t] = state["root_pose"][:batch, :3].to(self.device)
+                up[:, t] = _up_axis(state["root_pose"][:batch, 3:7].to(self.device))
                 steps_done += 1
                 if max_steps is not None and steps_done >= max_steps:
                     steps = t + 1
@@ -476,6 +515,9 @@ class FbCpr:
             act_disp = root[:, :steps] - root_start[:, None]
             ref_disp = ref_root[:, 1:] - ref_root[:, :1]
             root_error[ids, :steps] = (act_disp - ref_disp).norm(dim=-1)
+            ref_up = _up_axis(ref["root_pose"][:, 1 : steps + 1, 3:7])
+            cos = (up[:, :steps] * ref_up).sum(dim=-1).clamp(-1.0, 1.0)
+            tilt_error[ids, :steps] = torch.acos(cos)
             joint_error[ids] = (qpos[:, :steps] - ref_qpos).norm(dim=-1).mean(dim=-1)
             emd[ids] = torch.stack([compute_emd(qpos[i, :steps], ref_qpos[i]) for i in range(batch)])
             if max_steps is not None and steps_done >= max_steps:
@@ -484,7 +526,7 @@ class FbCpr:
         self.train_mode()
         env.train_mode()
         print("[INFO] Finished evaluating motions.")
-        return {"emd": emd, "joint_error": joint_error, "root_error": root_error}
+        return {"emd": emd, "joint_error": joint_error, "root_error": root_error, "tilt_error": tilt_error}
 
     @staticmethod
     def motion_priorities(emd: torch.Tensor) -> torch.Tensor:
@@ -642,12 +684,10 @@ class FbCpr:
         default_sets = ["actor", "critic", "backward", "discriminator", "expert"]
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
 
-        # Match TruncatedGaussianDistribution bounds with clip_action bounds.
+        # a truncated-Gaussian actor is bounded by the action clip, whatever bounds its cfg lists
         actor_dist_cfg = cfg["actor"].get("distribution_cfg")
-        if actor_dist_cfg is not None and actor_dist_cfg.get("class_name") == "TruncatedGaussianDistribution":
-            clip_actions = cfg["clip_actions"]
-            actor_dist_cfg["low"] = -clip_actions
-            actor_dist_cfg["high"] = clip_actions
+        if actor_dist_cfg is not None:
+            bound_by_clip_actions(actor_dist_cfg, cfg["clip_actions"])
 
         # Initialize the policy
         z_dim = cfg["algorithm"]["z_dim"]
@@ -701,8 +741,10 @@ class FbCpr:
             cfg["algorithm"]["batch_size"],
             cfg["storage_device"],
         )
+        # A large corpus can exceed VRAM on its own, so it is placed independently of the replay buffer.
+        expert_device = _expert_storage_device(cfg, device)
         expert_buffer = (
-            TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], cfg["storage_device"])
+            TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], expert_device)
             if not inference
             else None
         )

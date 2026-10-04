@@ -14,9 +14,9 @@ from tensordict import TensorDict
 from robot_rl.algorithms.ppo import PPO
 from robot_rl.extensions.style import StyleDiscriminators, resolve_style_config
 from robot_rl.extensions.symmetry import Symmetry
-from tests.extensions.test_symmetry import _negate_augmentation
 from robot_rl.models import MLPModel
 from robot_rl.storage import RolloutStorage
+from tests.extensions.test_symmetry import _negate_augmentation
 
 NUM_ENVS = 16
 NUM_STEPS = 8

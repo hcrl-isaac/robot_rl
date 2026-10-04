@@ -188,6 +188,12 @@ class RolloutStorage:
         """Allocate rollout buffers for a specific training mode and batch shape.
 
         Args:
+            training_type: Training mode the buffers are laid out for.
+            num_envs: Environments stepped in parallel.
+            num_transitions_per_env: Steps collected per environment before an update.
+            obs: One observation batch, whose groups and shapes the buffers mirror.
+            actions_shape: Shape of a single environment's action.
+            device: Device the buffers live on.
             num_reward_streams: Rewards, values and returns stored per step; above 1 each stream has its own
                 critic head, and the advantage the policy loss reads is their combination.
         """

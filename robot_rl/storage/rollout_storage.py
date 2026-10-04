@@ -187,8 +187,9 @@ class RolloutStorage:
     ) -> None:
         """Allocate rollout buffers for a specific training mode and batch shape.
 
-        ``num_reward_streams`` > 1 stores a reward, value and return per stream (one critic head each); the
-        advantage the policy loss reads stays a single column combined by the algorithm.
+        Args:
+            num_reward_streams: Rewards, values and returns stored per step; above 1 each stream has its own
+                critic head, and the advantage the policy loss reads is their combination.
         """
         self.training_type = training_type
         self.device = device

@@ -13,6 +13,8 @@ from tensordict import TensorDict
 
 from robot_rl.algorithms.ppo import PPO
 from robot_rl.extensions.style import StyleDiscriminators, resolve_style_config
+from robot_rl.extensions.symmetry import Symmetry
+from tests.extensions.test_symmetry import _negate_augmentation
 from robot_rl.models import MLPModel
 from robot_rl.storage import RolloutStorage
 
@@ -234,7 +236,7 @@ class TestGating:
             style.compute_rewards(self._gated_obs(open_rows=4))
         restored = self._gated_style(tmp_path)
         restored.load_state_dict(style.state_dict())
-        assert restored.update_counter == style.update_counter == 5
+        assert restored.reward_steps == style.reward_steps == 5
 
 
 class TestActorWarmup:
@@ -303,3 +305,106 @@ class TestActInference:
         ppo, obs = _build_style_ppo(tmp_path)
         ppo.eval_mode()
         assert not torch.equal(ppo.act_inference(obs, stochastic=True), ppo.act_inference(obs))
+
+
+class TestClosedGateWeight:
+    """Tests that a stream whose gate never opened carries no weight."""
+
+    @staticmethod
+    def _gated_ppo(tmp_path: Path) -> tuple[PPO, TensorDict]:
+        obs = _obs()
+        obs["flight"] = torch.zeros(NUM_ENVS, 1)  # the gate never opens
+        obs_groups = {"actor": ["policy"], "critic": ["policy"], "style": ["style"]}
+        dist = {"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"}
+        actor = MLPModel(
+            obs, obs_groups, "actor", NUM_ACTIONS, hidden_dims=[32], activation="elu", distribution_cfg=dist
+        )
+        critic = MLPModel(obs, obs_groups, "critic", 2, hidden_dims=[32], activation="elu")
+        storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS], num_reward_streams=2)
+        style_cfg = {
+            "num_states": STYLE_DIM,
+            "obs_groups": obs_groups,
+            "experts": [{"name": "a", "data_path": _write_expert(tmp_path / "ga.pt", 2.0), "gate_group": "flight"}],
+            "hidden_dims": [32],
+            "batch_size": 32,
+        }
+        ppo = PPO(actor, critic, storage, num_learning_epochs=1, num_mini_batches=2, style_cfg=style_cfg)
+        return ppo, obs
+
+    def test_closed_gate_stream_is_dropped_despite_time_outs(self, tmp_path: Path) -> None:
+        """A time-out bootstrap lands in every stream, so the weight must come from the gate, not the rewards."""
+        ppo, obs = self._gated_ppo(tmp_path)
+        ppo.train_mode()
+        for step in range(NUM_STEPS):
+            ppo.act(obs)
+            time_outs = torch.zeros(NUM_ENVS, dtype=torch.bool)
+            time_outs[0] = step == 0  # one time-out in the rollout
+            ppo.process_env_step(
+                obs, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS, dtype=torch.uint8), {"time_outs": time_outs}
+            )
+        assert ppo.storage.rewards[..., 1].abs().max() > 0  # the bootstrap did land in the style stream
+        ppo.compute_returns(obs)
+        task_only = ppo.storage.returns[..., :1] - ppo.storage.values[..., :1]
+        task_only = (task_only - task_only.mean()) / (task_only.std() + 1e-8)
+        assert torch.allclose(ppo.storage.advantages, task_only, atol=1e-4)
+
+
+class TestWarmupIsolation:
+    """Tests that nothing else moves while the actor is warming up."""
+
+    @staticmethod
+    def _ppo(tmp_path: Path, warmup: int) -> tuple[PPO, TensorDict]:
+        ppo, obs = _build_style_ppo(tmp_path)
+        ppo.actor_warmup_iters = warmup
+        ppo.schedule = "adaptive"
+        ppo.desired_kl = 0.01
+        ppo.adaptive_lr_once_per_iteration = False
+        return ppo, obs
+
+    @staticmethod
+    def _rollout(ppo: PPO, obs: TensorDict) -> None:
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(
+                _obs(),
+                torch.randn(NUM_ENVS),
+                torch.zeros(NUM_ENVS, dtype=torch.uint8),
+                {"time_outs": torch.zeros(NUM_ENVS, dtype=torch.bool)},
+            )
+        ppo.compute_returns(obs)
+
+    def test_learning_rate_is_not_adapted_during_warmup(self, tmp_path: Path) -> None:
+        """A frozen actor reports no KL, which would otherwise ratchet the rate to its maximum."""
+        ppo, obs = self._ppo(tmp_path, warmup=0)
+        ppo.symmetry = Symmetry(
+            env=None, data_augmentation_func=_negate_augmentation, use_mirror_loss=True, mirror_loss_coeff=1.0
+        )
+        ppo.train_mode()
+        self._rollout(ppo, obs)
+        ppo.update()  # one real update, so Adam carries momentum into the warm-up
+        ppo.actor_warmup_iters = 10
+        ppo.num_updates_done = 0
+        before = ppo.learning_rate
+        self._rollout(ppo, obs)
+        ppo.update()
+        assert ppo.learning_rate == before
+
+    def test_actor_stays_frozen_under_a_loss_that_reaches_it(self, tmp_path: Path) -> None:
+        """The mirror loss reaches the actor during warm-up, and a zeroed grad is still a step under Adam."""
+        ppo, obs = self._ppo(tmp_path, warmup=10)
+        ppo.symmetry = Symmetry(
+            env=None,
+            data_augmentation_func=_negate_augmentation,
+            use_mirror_loss=True,
+            mirror_loss_coeff=1.0,
+        )
+        ppo.train_mode()
+        ppo.actor_warmup_iters = 0  # one real update first, so Adam carries momentum into the warm-up
+        self._rollout(ppo, obs)
+        ppo.update()
+        ppo.actor_warmup_iters = 10
+        ppo.num_updates_done = 0
+        before = [p.clone() for p in ppo.actor.parameters()]
+        self._rollout(ppo, obs)
+        ppo.update()
+        assert all(torch.equal(a, b) for a, b in zip(before, ppo.actor.parameters(), strict=True))

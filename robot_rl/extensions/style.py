@@ -50,7 +50,8 @@ class StyleDiscriminators(nn.Module):
             num_states: Dimension of the style state (the concatenated ``style`` observation groups).
             obs_groups: Observation groups dictionary; ``obs_groups["style"]`` names the groups read.
             experts: One dict per expert with ``name``, ``data_path`` (a ``.pt`` file holding a ``states``
-                tensor of shape ``(M, num_states)``) and ``weight`` (advantage weight of its reward stream).
+                tensor of shape ``(M, num_states)``), ``weight`` (advantage weight of its reward stream) and
+                optionally ``gate_group`` (observation group whose flag limits where the stream pays).
             hidden_dims: Hidden dimensions of every discriminator MLP.
             activation: Activation function.
             state_normalization: Normalize the style state with running statistics from the policy rollouts.
@@ -83,7 +84,7 @@ class StyleDiscriminators(nn.Module):
         self.reward_clip = reward_clip
         self.state_normalization = state_normalization
         self.reward_normalization = reward_normalization
-        self.update_counter = 0
+        self.reward_steps = 0
 
         if weight_schedule is not None:
             self.weight_scheduler_params = weight_schedule
@@ -141,9 +142,9 @@ class StyleDiscriminators(nn.Module):
         A reward is a standardized discriminator score, so it is zero-mean over the states a stream pays on and
         is negative on about half of them; the task stream carries the positive per-step floor.
         """
-        self.update_counter += 1
+        self.reward_steps += 1
         if self.weight_scheduler is not None:
-            self.weight = self.weight_scheduler(step=self.update_counter, **self.weight_scheduler_params)
+            self.weight = self.weight_scheduler(step=self.reward_steps, **self.weight_scheduler_params)
         else:
             self.weight = self.initial_weight
         with torch.no_grad():
@@ -217,13 +218,13 @@ class StyleDiscriminators(nn.Module):
     def state_dict(self, *args: Any, **kwargs: Any) -> dict:
         """Return the module state plus the schedule clock, so a resume continues the weight ramp."""
         state = super().state_dict(*args, **kwargs)
-        state["update_counter"] = self.update_counter
+        state["reward_steps"] = self.reward_steps
         return state
 
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> Any:
         """Restore the module state and the schedule clock."""
         state_dict = dict(state_dict)
-        self.update_counter = int(state_dict.pop("update_counter", 0))
+        self.reward_steps = int(state_dict.pop("reward_steps", 0))
         return super().load_state_dict(state_dict, strict=strict)
 
     @staticmethod

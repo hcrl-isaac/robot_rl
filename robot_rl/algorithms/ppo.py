@@ -193,7 +193,12 @@ class PPO:
         Args:
             obs: Current observations.
             stochastic: Sample from the policy instead of taking its mean, as a rollout does.
+
+        Returns:
+            Actions of shape ``(num_envs, num_actions)``.
         """
+        if self.memory is not None:
+            raise NotImplementedError("act_inference does not carry a shared memory's hidden state.")
         with torch.inference_mode():
             return self.actor(obs, *self._encoder_args(obs, detach=True), stochastic_output=stochastic)
 
@@ -338,9 +343,11 @@ class PPO:
             adv = (adv - adv.mean(dim=(0, 1), keepdim=True)) / (adv.std(dim=(0, 1), keepdim=True) + 1e-8)
             weights = torch.ones(self.num_reward_streams, device=adv.device)
             weights[1:] = self.style.stream_weights.to(adv.device) * self.style.weight  # type: ignore[union-attr]
-            # a stream that paid nothing all rollout (gate never opened) standardizes to unit-variance value
-            # noise, so it would enter the sum at full weight
-            weights[1:] *= (st.rewards[..., 1:].abs().amax(dim=(0, 1)) > 0).float()
+            # a stream whose gate never opened standardizes to unit-variance value noise, so it would enter the
+            # sum at full weight; the rewards cannot say so, since the time-out bootstrap lands in every stream
+            gates = self.style.gate_masks(self.storage.observations.flatten(0, 1))  # type: ignore[union-attr]
+            opened = [True if gate is None else bool(gate.any()) for gate in gates]
+            weights[1:] *= torch.tensor(opened, device=adv.device, dtype=adv.dtype)
             st.advantages = (adv * weights).sum(dim=-1, keepdim=True)
         # Normalize the advantages if per minibatch normalization is not used
         elif not self.normalize_advantage_per_mini_batch:
@@ -440,7 +447,8 @@ class PPO:
 
                 # Per-minibatch adaptive LR
                 if (
-                    self.desired_kl is not None
+                    self.num_updates_done >= self.actor_warmup_iters
+                    and self.desired_kl is not None
                     and self.schedule == "adaptive"
                     and not self.adaptive_lr_once_per_iteration
                 ):
@@ -498,10 +506,10 @@ class PPO:
                 rnd_loss.backward()
 
             if self.num_updates_done < self.actor_warmup_iters:
-                # the value, mirror and encoder-penalty losses all reach the actor: freeze it outright
+                # the value, mirror and encoder-penalty losses all reach the actor: freeze it outright. A zeroed
+                # grad is not a freeze, since Adam still steps it from the momentum a resumed state carries
                 for param in self.actor.parameters():
-                    if param.grad is not None:
-                        param.grad.zero_()
+                    param.grad = None
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:

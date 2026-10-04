@@ -11,6 +11,8 @@ import torch
 from pathlib import Path
 from tensordict import TensorDict
 
+import pytest
+
 from robot_rl.algorithms.ppo import PPO
 from robot_rl.extensions.style import StyleDiscriminators, resolve_style_config
 from robot_rl.extensions.symmetry import Symmetry
@@ -386,6 +388,9 @@ class TestWarmupIsolation:
         ppo.num_updates_done = 0
         before = ppo.learning_rate
         self._rollout(ppo, obs)
+        # a frozen actor reports no KL on its own, so shift the stored distribution the KL is measured against
+        for param in ppo.storage.distribution_params:
+            param += 1.0
         ppo.update()
         assert ppo.learning_rate == before
 
@@ -408,3 +413,70 @@ class TestWarmupIsolation:
         self._rollout(ppo, obs)
         ppo.update()
         assert all(torch.equal(a, b) for a, b in zip(before, ppo.actor.parameters(), strict=True))
+
+
+class TestPaidAtRewardTime:
+    """Tests that the stream weight follows what each stream actually paid on."""
+
+    @staticmethod
+    def _step(ppo: PPO, next_obs: TensorDict) -> None:
+        ppo.process_env_step(
+            next_obs,
+            torch.randn(NUM_ENVS),
+            torch.zeros(NUM_ENVS, dtype=torch.uint8),
+            {"time_outs": torch.zeros(NUM_ENVS, dtype=torch.bool)},
+        )
+
+    @staticmethod
+    def _obs_with_gate(open_gate: bool) -> TensorDict:
+        obs = _obs()
+        obs["flight"] = torch.full((NUM_ENVS, 1), float(open_gate))
+        return obs
+
+    def test_gate_open_only_on_the_acted_obs_pays_nothing(self, tmp_path: Path) -> None:
+        """A gate open only where the action was taken never paid, so the stream carries no weight."""
+        ppo, _ = TestClosedGateWeight._gated_ppo(tmp_path)
+        ppo.train_mode()
+        for step in range(NUM_STEPS):
+            ppo.act(self._obs_with_gate(step == 0))  # open on the first acted-on obs only
+            self._step(ppo, self._obs_with_gate(False))  # never open where the reward is paid
+        ppo.compute_returns(self._obs_with_gate(False))
+        task_only = ppo.storage.returns[..., :1] - ppo.storage.values[..., :1]
+        task_only = (task_only - task_only.mean()) / (task_only.std() + 1e-8)
+        assert torch.allclose(ppo.storage.advantages, task_only, atol=1e-4)
+
+    def test_gate_open_only_on_the_next_obs_is_counted(self, tmp_path: Path) -> None:
+        """A gate open only where the reward is paid did pay, so the stream keeps its weight."""
+        ppo, _ = TestClosedGateWeight._gated_ppo(tmp_path)
+        ppo.train_mode()
+        for step in range(NUM_STEPS):
+            ppo.act(self._obs_with_gate(False))
+            self._step(ppo, self._obs_with_gate(step == NUM_STEPS - 1))  # open on the last next-obs only
+        ppo.compute_returns(self._obs_with_gate(False))
+        task_only = ppo.storage.returns[..., :1] - ppo.storage.values[..., :1]
+        task_only = (task_only - task_only.mean()) / (task_only.std() + 1e-8)
+        assert not torch.allclose(ppo.storage.advantages, task_only, atol=1e-4)
+
+
+class TestSharedMemory:
+    """Tests the inference path's contract for a policy carrying a shared memory."""
+
+    def test_act_inference_raises_for_a_shared_memory_policy(self, tmp_path: Path) -> None:
+        """The hidden state is not carried here, so a memory policy must be refused rather than mis-stepped."""
+        ppo, obs = _build_style_ppo(tmp_path)
+        ppo.memory = object()  # any memory at all
+        with pytest.raises(NotImplementedError):
+            ppo.act_inference(obs)
+
+
+class TestCheckpointCompat:
+    """Tests that a checkpoint written before the counter was renamed still loads."""
+
+    def test_old_counter_key_restores_the_schedule_clock(self, tmp_path: Path) -> None:
+        """A pre-rename checkpoint carries ``update_counter``; the ramp must continue, not restart."""
+        style = TestGating._gated_style(tmp_path)
+        state = style.state_dict()
+        state["update_counter"] = state.pop("reward_steps") + 7
+        restored = TestGating._gated_style(tmp_path)
+        restored.load_state_dict(state)
+        assert restored.reward_steps == 7

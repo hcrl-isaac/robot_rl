@@ -224,7 +224,8 @@ class StyleDiscriminators(nn.Module):
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> Any:
         """Restore the module state and the schedule clock."""
         state_dict = dict(state_dict)
-        self.reward_steps = int(state_dict.pop("reward_steps", 0))
+        # "update_counter" is the key checkpoints written before the rename carry
+        self.reward_steps = int(state_dict.pop("reward_steps", state_dict.pop("update_counter", 0)))
         return super().load_state_dict(state_dict, strict=strict)
 
     @staticmethod

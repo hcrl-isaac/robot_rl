@@ -171,6 +171,9 @@ class PPO:
         # behaviour while fresh value heads stop feeding it garbage advantages
         self.actor_warmup_iters = actor_warmup_iters
         self.num_updates_done = 0
+        # per-stream record of whether a gate ever opened in the current rollout; the rewards cannot say, since
+        # the time-out bootstrap lands in every stream
+        self.style_paid = [False] * (self.num_reward_streams - 1)
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.adaptive_lr_once_per_iteration = adaptive_lr_once_per_iteration
@@ -281,7 +284,11 @@ class PPO:
         # Style rewards are separate streams next to the task reward, not added to it
         if self.style is not None:
             # obs is the next state, which for a done env is the new episode's spawn: it scores nothing here
-            style_rewards = self.style.compute_rewards(obs) * (1.0 - dones.view(-1, 1).float().to(self.device))
+            alive = (1.0 - dones.view(-1, 1).float()).to(self.device)
+            style_rewards = self.style.compute_rewards(obs) * alive
+            for k, gate in enumerate(self.style.gate_masks(obs)):
+                paid = alive.squeeze(-1) if gate is None else (gate & alive.squeeze(-1).bool())
+                self.style_paid[k] |= bool(paid.any())
             self.transition.rewards = torch.cat([self.transition.rewards.view(-1, 1), style_rewards], dim=-1)
 
         # Bootstrapping on time outs
@@ -344,10 +351,8 @@ class PPO:
             weights = torch.ones(self.num_reward_streams, device=adv.device)
             weights[1:] = self.style.stream_weights.to(adv.device) * self.style.weight  # type: ignore[union-attr]
             # a stream whose gate never opened standardizes to unit-variance value noise, so it would enter the
-            # sum at full weight; the rewards cannot say so, since the time-out bootstrap lands in every stream
-            gates = self.style.gate_masks(self.storage.observations.flatten(0, 1))  # type: ignore[union-attr]
-            opened = [True if gate is None else bool(gate.any()) for gate in gates]
-            weights[1:] *= torch.tensor(opened, device=adv.device, dtype=adv.dtype)
+            # sum at full weight
+            weights[1:] *= torch.tensor(self.style_paid, device=adv.device, dtype=adv.dtype)
             st.advantages = (adv * weights).sum(dim=-1, keepdim=True)
         # Normalize the advantages if per minibatch normalization is not used
         elif not self.normalize_advantage_per_mini_batch:
@@ -506,8 +511,8 @@ class PPO:
                 rnd_loss.backward()
 
             if self.num_updates_done < self.actor_warmup_iters:
-                # the value, mirror and encoder-penalty losses all reach the actor: freeze it outright. A zeroed
-                # grad is not a freeze, since Adam still steps it from the momentum a resumed state carries
+                # the value, mirror and encoder-penalty losses all reach the actor; dropping its grads is what
+                # keeps Adam from stepping it on carried momentum
                 for param in self.actor.parameters():
                     param.grad = None
 
@@ -611,6 +616,7 @@ class PPO:
 
         # Clear the storage
         self.storage.clear()
+        self.style_paid = [False] * (self.num_reward_streams - 1)
 
         return loss_dict
 

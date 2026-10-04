@@ -9,6 +9,7 @@ from .backward_model import BackwardModel
 from .cnn_model import CNNModel
 from .cnn_rnn_model import CNNRNNModel
 from .cref_model import CrefModel
+from .cvae_model import CVAEModel
 from .fuse_model import FuseModel, ResidualFuseModel
 from .inference import EncoderInferencePolicy, SharedMemoryInferencePolicy
 from .mlp_model import MLPModel
@@ -20,6 +21,7 @@ __all__ = [
     "BackwardModel",
     "CNNModel",
     "CNNRNNModel",
+    "CVAEModel",
     "CrefModel",
     "EncoderInferencePolicy",
     "FuseModel",

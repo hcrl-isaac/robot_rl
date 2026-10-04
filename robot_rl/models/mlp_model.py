@@ -30,6 +30,12 @@ class MLPModel(nn.Module):
     is_recurrent: bool = False
     """Whether the model contains a recurrent module."""
 
+    loads_own_weights: bool = False
+    """Whether the model's weights come from its own configuration rather than from a checkpoint."""
+
+    head_module: str = "mlp"
+    """Name of the submodule whose last layer produces the model's raw output."""
+
     def __init__(
         self,
         obs: TensorDict,
@@ -309,6 +315,24 @@ class MLPModel(nn.Module):
         """Return the latent dimensionality consumed by the MLP head."""
         base_dim = self._input_dim_override if self._input_dim_override is not None else 0
         return base_dim + self.obs_dim + self.other_input_dim
+
+    @classmethod
+    def head_output_width(cls, state_dict: dict[str, torch.Tensor]) -> int:
+        """Return the width of the head's last layer, read from a saved state dict.
+
+        Args:
+            state_dict: The model's state dict.
+
+        Raises:
+            ValueError: If the state dict holds no biased layer under :attr:`head_module`.
+        """
+        biases = [v for k, v in state_dict.items() if k.startswith(f"{cls.head_module}.") and k.endswith(".bias")]
+        if not biases:
+            raise ValueError(
+                f"Cannot infer the output width: {cls.__name__} has no '{cls.head_module}.*.bias' weights."
+            )
+        # a Linear bias is (out,) and a ParallelLinear bias (num_parallel, 1, out)
+        return biases[-1].shape[-1]
 
 
 class _TorchMLPModel(nn.Module):

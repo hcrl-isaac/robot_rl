@@ -35,7 +35,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install -e .
-          pip install pytest
+          pip install pytest onnxruntime
 
       - name: Run tests
         run: pytest tests/ -v --tb=short

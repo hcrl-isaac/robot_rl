@@ -96,7 +96,7 @@ class Logger:
                     "run_name": self.cfg.get("wandb_run_name"),
                     "group": self.cfg.get("wandb_group"),
                     "shared": self.cfg.get("shared", False),
-                    "log_videos_async": self.cfg.get("log_videos_async", False),
+                    "log_evals_async": self.cfg.get("log_evals_async", self.cfg.get("log_videos_async", False)),
                 }
             elif self.logger_type == "neptune" and isinstance(logger_cfg, str):
                 warnings.warn(

@@ -14,48 +14,9 @@ from typing import Any
 
 from robot_rl.env import VecEnv
 from robot_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
-from robot_rl.models import MLPModel
+from robot_rl.models import EncoderInferencePolicy, MLPModel, SharedMemoryInferencePolicy
 from robot_rl.storage import RolloutStorage
 from robot_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
-
-
-class _SharedMemoryInferencePolicy(nn.Module):
-    """Adapter that chains a shared memory module into actor inference."""
-
-    is_recurrent: bool = True
-
-    def __init__(self, memory: nn.Module, actor: MLPModel) -> None:
-        super().__init__()
-        self.memory = memory
-        self.actor = actor
-
-    @property
-    def output_mean(self) -> torch.Tensor:
-        """Return the mean of the current output distribution."""
-        return self.actor.output_mean
-
-    @property
-    def output_std(self) -> torch.Tensor:
-        """Return the standard deviation of the current output distribution."""
-        return self.actor.output_std
-
-    @property
-    def output_entropy(self) -> torch.Tensor:
-        """Return the entropy of the current output distribution."""
-        return self.actor.output_entropy
-
-    @property
-    def output_distribution_params(self) -> tuple[torch.Tensor, ...]:
-        """Return raw parameters of the current output distribution."""
-        return self.actor.output_distribution_params
-
-    def forward(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        latent = self.memory(obs)
-        return self.actor.forward_from_latent(latent, *args, **kwargs)
-
-    def reset(self, dones: torch.Tensor | None = None) -> None:
-        self.memory.reset(dones)
-        self.actor.reset(dones)
 
 
 class PPO:
@@ -96,6 +57,9 @@ class PPO:
         device: str = "cpu",
         # Optional shared memory module (consumed by both actor and critic as heads)
         memory: nn.Module | None = None,
+        # Optional shared observation encoder (its latent is an extra input to actor and critic)
+        encoder: nn.Module | None = None,
+        encoder_cfg: dict | None = None,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -125,6 +89,8 @@ class PPO:
         # Symmetry extension
         if symmetry_cfg is not None and (actor.is_recurrent or critic.is_recurrent or memory is not None):
             raise ValueError("Symmetry augmentation is not supported for recurrent policies (including shared memory).")
+        if symmetry_cfg is not None and encoder is not None:
+            raise ValueError("Symmetry augmentation is not supported with a shared observation encoder.")
         self.symmetry = Symmetry(**symmetry_cfg) if symmetry_cfg else None
 
         # Meta RL components
@@ -146,17 +112,29 @@ class PPO:
                 "When `meta_rl_cfg.memory` is set, actor and critic must be plain MLP heads."
             )
         self.memory: nn.Module | None = memory.to(self.device) if memory is not None else None
+        # Shared observation encoder (optional), trained by the joint PPO loss
+        if encoder is not None and memory is not None:
+            raise ValueError("A shared encoder cannot be combined with a shared memory module.")
+        if encoder is not None and (actor.is_recurrent or critic.is_recurrent):
+            raise ValueError("A shared encoder requires plain MLP actor/critic models.")
+        self.encoder: nn.Module | None = encoder.to(self.device) if encoder is not None else None
+        self.encoder_detach_actor = bool((encoder_cfg or {}).get("detach_actor_gradients", False))
+        # L2 penalty on the encoder latent, added to the joint PPO loss
+        self.encoder_l2_coef = float((encoder_cfg or {}).get("l2_coef", 0.0))
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
-        # simply alias ``self.actor`` / ``self.critic`` / ``self.memory``.
+        # simply alias ``self.actor`` / ``self.critic`` / ``self.memory`` / ``self.encoder``.
         self._raw_actor = self.actor
         self._raw_critic = self.critic
         self._raw_memory = self.memory
+        self._raw_encoder = self.encoder
 
         # Create the optimizer
         params: Any = chain(self.actor.parameters(), self.critic.parameters())
         if self.memory is not None:
             params = chain(params, self.memory.parameters())
+        if self.encoder is not None:
+            params = chain(params, self.encoder.parameters())
         self.optimizer = resolve_optimizer(optimizer)(params, lr=learning_rate)  # type: ignore
 
         # Add storage
@@ -182,6 +160,13 @@ class PPO:
         self.min_learning_rate = min_learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
+    def _encoder_args(self, obs: TensorDict, detach: bool = False) -> tuple[torch.Tensor, ...]:
+        """Return the encoder latent as an extra model input tuple; empty when no encoder is configured."""
+        if self.encoder is None:
+            return ()
+        latent = self.encoder(obs)
+        return (latent.detach(),) if detach else (latent,)
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
         # Pre-step batch info so the RNNModel can lazy-init its hidden states; without it the first
@@ -206,8 +191,9 @@ class PPO:
                 actor_hs = self.actor.get_hidden_state()
                 critic_hs = self.critic.get_hidden_state()
             self.transition.hidden_states = (actor_hs, critic_hs)
-            self.transition.actions = self.actor(obs, stochastic_output=True).detach()
-            self.transition.values = self.critic(obs).detach()
+            enc_args = self._encoder_args(obs, detach=True)
+            self.transition.actions = self.actor(obs, *enc_args, stochastic_output=True).detach()
+            self.transition.values = self.critic(obs, *enc_args).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
         # Record observations before env.step()
@@ -225,6 +211,8 @@ class PPO:
         # Update the normalizers
         if self.memory is not None:
             self.memory.update_normalization(obs)
+        if self.encoder is not None:
+            self.encoder.update_normalization(obs)
         self.actor.update_normalization(obs)
         self.critic.update_normalization(obs)
         if self.rnd:
@@ -286,7 +274,7 @@ class PPO:
             self.memory.reset(hidden_state=memory_hidden_state)
         else:
             critic_hidden_state = self.critic.get_hidden_state()
-            last_values = self.critic(obs).detach()
+            last_values = self.critic(obs, *self._encoder_args(obs, detach=True)).detach()
             # Restore the critic's hidden state so the next rollout is not affected by the forward pass
             self.critic.reset(hidden_state=critic_hidden_state)
         # GAE runs over storage tensors; bring the bootstrap value to the storage device.
@@ -324,6 +312,8 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        # Encoder L2 loss
+        mean_encoder_l2_loss = 0 if (self.encoder is not None and self.encoder_l2_coef > 0.0) else None
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent or self.memory is not None:
@@ -365,14 +355,20 @@ class PPO:
                 critic_latent = latent.detach() if self.detach_critic_memory else latent
                 values = self.critic.forward_from_latent(critic_latent, obs=batch.observations, masks=batch.masks)
             else:
+                # Recompute the encoder latent with gradients; optionally stop the actor loss from training it
+                enc_args = self._encoder_args(batch.observations)
+                actor_enc_args = tuple(a.detach() for a in enc_args) if self.encoder_detach_actor else enc_args
                 self.actor(
                     batch.observations,
+                    *actor_enc_args,
                     masks=batch.masks,
                     hidden_state=batch.hidden_states[0],
                     stochastic_output=True,
                 )
                 actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-                values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+                values = self.critic(
+                    batch.observations, *enc_args, masks=batch.masks, hidden_state=batch.hidden_states[1]
+                )
             # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
             distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
             entropy = self.actor.output_entropy[:original_batch_size]
@@ -437,6 +433,11 @@ class PPO:
                 if self.symmetry.use_mirror_loss:
                     loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
 
+            # grad-carrying ``enc_args``, not ``actor_enc_args``, so the penalty survives ``detach_actor_gradients``
+            if self.encoder is not None and self.encoder_l2_coef > 0.0:
+                encoder_l2_loss = enc_args[0].pow(2).mean()
+                loss = loss + self.encoder_l2_coef * encoder_l2_loss
+
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
@@ -454,6 +455,8 @@ class PPO:
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             if self.memory is not None:
                 nn.utils.clip_grad_norm_(self.memory.parameters(), self.max_grad_norm)
+            if self.encoder is not None:
+                nn.utils.clip_grad_norm_(self.encoder.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd:
@@ -471,6 +474,9 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            # Encoder L2 loss
+            if mean_encoder_l2_loss is not None:
+                mean_encoder_l2_loss += encoder_l2_loss.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -499,6 +505,8 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        if mean_encoder_l2_loss is not None:
+            mean_encoder_l2_loss /= num_updates
 
         # Construct the loss dictionary
         # Slash-prefixed keys are logged under that scalar group as-is (Train/...); bare keys go under Loss/.
@@ -517,6 +525,8 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if mean_encoder_l2_loss is not None:
+            loss_dict["encoder_l2"] = mean_encoder_l2_loss
 
         # Clear the storage
         self.storage.clear()
@@ -529,6 +539,8 @@ class PPO:
         self.critic.train()
         if self.memory is not None:
             self.memory.train()
+        if self.encoder is not None:
+            self.encoder.train()
         if self.rnd:
             self.rnd.train()
 
@@ -538,6 +550,8 @@ class PPO:
         self.critic.eval()
         if self.memory is not None:
             self.memory.eval()
+        if self.encoder is not None:
+            self.encoder.eval()
         if self.rnd:
             self.rnd.eval()
 
@@ -583,7 +597,7 @@ class PPO:
             # query the actor (advancing the recurrent memory, if any) for one high-level decision
             if self.memory is not None:
                 return self.actor.forward_from_latent(self.memory(obs), stochastic_output=stochastic)
-            return self.actor(obs, stochastic_output=stochastic)
+            return self.actor(obs, *self._encoder_args(obs, detach=True), stochastic_output=stochastic)
 
         with torch.inference_mode():
             actions = query_actions()  # initial decision (step 0)
@@ -617,6 +631,8 @@ class PPO:
         }
         if self.memory is not None:
             saved_dict["memory_state_dict"] = self._raw_memory.state_dict()
+        if self._raw_encoder is not None:
+            saved_dict["encoder_state_dict"] = self._raw_encoder.state_dict()
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
@@ -643,6 +659,12 @@ class PPO:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("memory") and self.memory is not None and "memory_state_dict" in loaded_dict:
             self._raw_memory.load_state_dict(loaded_dict["memory_state_dict"], strict=strict)
+        # not gated on load_cfg: the encoder is part of the actor's input, so inference-only loads need it too
+        if self._raw_encoder is not None:
+            if "encoder_state_dict" in loaded_dict:
+                self._raw_encoder.load_state_dict(loaded_dict["encoder_state_dict"], strict=strict)
+            elif strict:
+                raise KeyError("Checkpoint has no encoder_state_dict for this encoder policy.")
         if load_cfg.get("optimizer") and "optimizer_state_dict" in loaded_dict:
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         if load_cfg.get("rnd") and self.rnd:
@@ -654,14 +676,17 @@ class PPO:
         """Get the policy model.
 
         Wraps the actor with the shared memory module when configured, since the actor is then a head over a
-        precomputed latent and cannot consume raw obs.
+        precomputed latent and cannot consume raw obs. Likewise wraps it with the shared encoder, since the
+        actor then expects the encoder latent as an extra input that raw obs alone cannot supply.
         """
         if self.memory is not None:
-            return _SharedMemoryInferencePolicy(self._raw_memory, self._raw_actor)
+            return SharedMemoryInferencePolicy(self._raw_memory, self._raw_actor)  # type: ignore
+        if self._raw_encoder is not None:
+            return EncoderInferencePolicy(self._raw_encoder, self._raw_actor)
         return self._raw_actor
 
     def compile(self, mode: str | None = None) -> None:
-        """Compile actor, critic, and the shared memory module (if any) with ``torch.compile``.
+        """Compile actor, critic, and the shared memory/encoder modules (if any) with ``torch.compile``.
 
         See :func:`~robot_rl.utils.compile_model` for the set of accepted modes.
 
@@ -672,6 +697,8 @@ class PPO:
         self.critic = compile_model(self._raw_critic, mode)  # type: ignore
         if self._raw_memory is not None:
             self.memory = compile_model(self._raw_memory, mode)  # type: ignore
+        if self._raw_encoder is not None:
+            self.encoder = compile_model(self._raw_encoder, mode)  # type: ignore
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPO:
@@ -684,9 +711,13 @@ class PPO:
         # Optional shared memory config
         meta_rl_cfg = cfg["algorithm"].get("meta_rl_cfg")
         shared_memory_cfg: dict | None = meta_rl_cfg.get("memory") if isinstance(meta_rl_cfg, dict) else None
+        # ``.get``, not ``.pop``: ``__init__`` also receives it through the ``**cfg["algorithm"]`` splat below
+        encoder_cfg: dict | None = cfg["algorithm"].get("encoder_cfg")
 
         # Resolve observation groups
         default_sets = ["actor", "critic"]
+        if encoder_cfg is not None:
+            default_sets.append("encoder")
         if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
@@ -709,6 +740,17 @@ class PPO:
             # Critic consumes privileged obs + memory latent
             critic_head_kwargs["input_dim_override"] = memory.latent_dim  # type: ignore[attr-defined]
             critic_head_kwargs["append_obs_groups"] = True
+
+        # Build the optional shared encoder; its latent is appended to both heads' inputs
+        encoder: nn.Module | None = None
+        if encoder_cfg is not None:
+            encoder_model_cfg = dict(encoder_cfg["model"])
+            encoder_class: type[MLPModel] = resolve_callable(encoder_model_cfg.pop("class_name"))  # type: ignore
+            encoder_dim = int(encoder_cfg["output_dim"])
+            encoder = encoder_class(obs, cfg["obs_groups"], "encoder", encoder_dim, **encoder_model_cfg).to(device)
+            print(f"Encoder Model: {encoder}")
+            head_kwargs["other_input_dims"] = (encoder_dim,)
+            critic_head_kwargs["other_input_dims"] = (encoder_dim,)
 
         # Initialize the policy
         actor: MLPModel = actor_class(
@@ -739,6 +781,7 @@ class PPO:
             storage,
             device=device,
             memory=memory,
+            encoder=encoder,
             **cfg["algorithm"],
             multi_gpu_cfg=cfg["multi_gpu"],
         )
@@ -754,6 +797,8 @@ class PPO:
         model_params = [self._raw_actor.state_dict(), self._raw_critic.state_dict()]
         if self.memory is not None:
             model_params.append(self._raw_memory.state_dict())
+        if self._raw_encoder is not None:
+            model_params.append(self._raw_encoder.state_dict())
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
         # Broadcast the model parameters
@@ -764,6 +809,9 @@ class PPO:
         idx = 2
         if self.memory is not None:
             self._raw_memory.load_state_dict(model_params[idx])
+            idx += 1
+        if self._raw_encoder is not None:
+            self._raw_encoder.load_state_dict(model_params[idx])
             idx += 1
         if self.rnd:
             self.rnd.predictor.load_state_dict(model_params[idx])
@@ -777,6 +825,8 @@ class PPO:
         all_params = chain(self.actor.parameters(), self.critic.parameters())
         if self.memory is not None:
             all_params = chain(all_params, self.memory.parameters())
+        if self.encoder is not None:
+            all_params = chain(all_params, self.encoder.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
         all_params = list(all_params)

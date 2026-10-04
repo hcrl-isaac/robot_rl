@@ -10,12 +10,13 @@ from typing import Any
 from robot_rl.algorithms import FbCpr
 from robot_rl.env import URLVecEnv
 from robot_rl.models import MLPModel
+from robot_rl.runners.checkpoint_hooks import CheckpointHooks
 from robot_rl.utils import check_nan, demote_old_checkpoint, resolve_callable
 from robot_rl.utils.export import bake_live_normalizer, save_jit, save_onnx
 from robot_rl.utils.logger import Logger
 
 
-class OffPolicyRunner:
+class OffPolicyRunner(CheckpointHooks):
     """Off-policy runner for reinforcement learning algorithms."""
 
     alg: FbCpr
@@ -61,6 +62,7 @@ class OffPolicyRunner:
         )
 
         self.current_learning_iteration = 0
+        self._resumed = False
 
     def learn(self, num_learning_iterations: int, **kwargs: Any) -> None:
         """Run the learning loop: per iteration, collect env steps, then run agent updates, then log/save."""
@@ -72,6 +74,15 @@ class OffPolicyRunner:
         # Resolve the update cadence and initial observations. The seed phase (warm up before policy
         # updates begin) is a shared runner-level knob for both the URL and non-URL branches.
         seed_until = start_it + self.cfg["num_seed_steps_per_env"]
+        warmup = self.cfg.get("resume_warmup_steps_per_env", 0) if self._resumed else 0
+        if warmup:
+            # a checkpoint carries no replay buffer: refill it with the loaded policy before updating, on
+            # top of the requested learning iterations; random seeding is for an untrained policy
+            seed_until = start_it + warmup
+            total_it += warmup
+            if hasattr(self.alg, "num_seed_steps_per_env"):
+                self.alg.num_seed_steps_per_env = -1
+            print(f"[INFO] resume warm-up: {warmup} iterations of collection before updates resume")
 
         def update_gate(it: int) -> bool:
             return it > seed_until
@@ -109,6 +120,7 @@ class OffPolicyRunner:
                     eval_extras = None
                     if (
                         is_url
+                        and self.builtin_eval
                         and not self.cfg["algorithm"].get("skip_eval", False)
                         and (it - start_it) % self.cfg["algorithm"]["eval_interval"] == 0
                     ):
@@ -192,24 +204,33 @@ class OffPolicyRunner:
                     learn_time = 0.0
 
                 # Save model
-                if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
-                    self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
-                    demoted = demote_old_checkpoint(
-                        self.alg,
-                        self.logger.log_dir,
-                        it,
-                        self.cfg.get("keep_full_checkpoints"),
-                        self.cfg["save_interval"],
-                    )
-                    if demoted is not None:  # re-upload so the logger's live-sync replaces the full remote copy
-                        self.logger.save_model(os.path.join(self.logger.log_dir, f"model_{demoted}.pt"), demoted)
+                if it % self.cfg["save_interval"] == 0:
+                    path = os.path.join(self.logger.log_dir or "", f"model_{it}.pt")
+                    if self.logger.writer is not None:
+                        self.save(path)
+                        demoted = demote_old_checkpoint(
+                            self.alg,
+                            self.logger.log_dir,
+                            it,
+                            self.cfg.get("keep_full_checkpoints"),
+                            self.cfg["save_interval"],
+                        )
+                        if demoted is not None:  # re-upload so the logger's live-sync replaces the full remote copy
+                            self.logger.save_model(os.path.join(self.logger.log_dir, f"model_{demoted}.pt"), demoted)
+                    if self._after_checkpoint(path, it):
+                        with torch.inference_mode():
+                            obs = self._reset_after_eval()
 
                 if prof is not None:
                     prof.step()
 
         # Save the final model after training and stop the logging writer
+        final = os.path.join(self.logger.log_dir or "", f"model_{self.current_learning_iteration}.pt")
         if self.logger.writer is not None:
-            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
+            self.save(final)
+        if self.current_learning_iteration % self.cfg["save_interval"] != 0:
+            self._after_checkpoint(final, self.current_learning_iteration)
+        if self.logger.writer is not None:
             self.logger.stop_logging_writer()
 
     def _get_profile_context(self) -> contextlib.AbstractContextManager[torch.profiler.profile | None]:
@@ -290,6 +311,7 @@ class OffPolicyRunner:
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
+            self._resumed = True
             # Restore the curriculum clock from the cumulative env-step count / this run's effective
             # env count, so a resume with a different env/GPU count doesn't jump the curriculum fraction.
             effective_envs = self.env.num_envs * self.gpu_world_size
@@ -353,10 +375,11 @@ class OffPolicyRunner:
             raise ValueError(
                 f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
             )
-        # Validate multi-GPU configuration
-        if self.gpu_local_rank >= self.gpu_world_size:
+        # Validate multi-GPU configuration: the local rank names a device, so a group may sit on any
+        # subset of a node's cards as long as each one exists
+        if self.gpu_local_rank >= torch.cuda.device_count():
             raise ValueError(
-                f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+                f"Local rank '{self.gpu_local_rank}' names no device here ({torch.cuda.device_count()} visible)."
             )
         if self.gpu_global_rank >= self.gpu_world_size:
             raise ValueError(

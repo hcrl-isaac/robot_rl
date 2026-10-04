@@ -12,6 +12,7 @@ import tempfile
 import torch
 from collections.abc import Sequence
 from tensordict import TensorDict
+from types import SimpleNamespace
 
 from robot_rl.env import VecEnv
 from robot_rl.runners import OnPolicyRunner
@@ -247,6 +248,50 @@ class TestSaveLoad:
 
             for key, param in runner2.alg.actor.state_dict().items():
                 assert torch.equal(saved_state[key], param), f"Normalization stat '{key}' not restored after load"
+
+
+def _attach_terrain(runner: OnPolicyRunner, curriculum: bool = True) -> SimpleNamespace:
+    """Give the runner's env a 4-row x 2-column curriculum terrain with a known level spread."""
+    origins = torch.arange(4 * 2 * 3, dtype=torch.float).reshape(4, 2, 3)
+    terrain = SimpleNamespace(
+        cfg=SimpleNamespace(terrain_generator=SimpleNamespace(curriculum=curriculum)),
+        terrain_origins=origins,
+        terrain_levels=torch.tensor([0, 1, 2, 3]),
+        terrain_types=torch.tensor([0, 1, 0, 1]),
+        env_origins=torch.zeros(NUM_ENVS, 3),
+    )
+    runner.env.unwrapped.scene = SimpleNamespace(terrain=terrain)
+    return terrain
+
+
+class TestTerrainLevelRestore:
+    """Tests for the opt-in restore of the checkpoint's mean terrain level."""
+
+    def _save_and_reload(self, restore: bool, curriculum: bool = True) -> SimpleNamespace:
+        runner = _build_runner()
+        terrain = _attach_terrain(runner, curriculum)
+        runner.cfg["restore_terrain_level"] = restore
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+            assert torch.load(f.name, weights_only=False)["terrain_level"] == 1.5
+            runner.load(f.name)
+        return terrain
+
+    def test_load_keeps_the_level_spread_by_default(self) -> None:
+        """Without the flag a load leaves every env on its own terrain level."""
+        terrain = self._save_and_reload(restore=False)
+        assert terrain.terrain_levels.tolist() == [0, 1, 2, 3]
+
+    def test_flag_moves_every_env_to_the_mean_level(self) -> None:
+        """With the flag every env lands on the rounded mean level, at its own column's origin."""
+        terrain = self._save_and_reload(restore=True)
+        assert terrain.terrain_levels.tolist() == [2, 2, 2, 2]
+        torch.testing.assert_close(terrain.env_origins, terrain.terrain_origins[2, terrain.terrain_types])
+
+    def test_flag_is_ignored_without_a_curriculum(self) -> None:
+        """A terrain without a curriculum keeps its rows even when the flag is set."""
+        terrain = self._save_and_reload(restore=True, curriculum=False)
+        assert terrain.terrain_levels.tolist() == [0, 1, 2, 3]
 
 
 class TestInferencePolicy:

@@ -10,8 +10,10 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
+import pytest
+
 from robot_rl.algorithms.ppo import PPO
-from robot_rl.models import MLPModel
+from robot_rl.models import EncoderInferencePolicy, MLPModel
 from robot_rl.storage import RolloutStorage
 from tests.conftest import make_obs
 
@@ -19,6 +21,10 @@ NUM_ENVS = 4
 NUM_STEPS = 8
 OBS_DIM = 8
 NUM_ACTIONS = 4
+SCAN_DIM = 12
+LATENT_DIM = 5
+
+_ENCODER_OBS_GROUPS = {"actor": ["policy"], "critic": ["policy"], "encoder": ["scan"]}
 
 
 def _make_actor(obs: TensorDict, obs_groups: dict, num_actions: int = 4, **kwargs: object) -> MLPModel:
@@ -63,6 +69,54 @@ def _build_ppo(**overrides: object) -> tuple[PPO, TensorDict]:
     defaults.update(overrides)
     ppo = PPO(actor, critic, storage, **defaults)
     return ppo, obs
+
+
+def _make_encoder_obs(num_envs: int = NUM_ENVS) -> TensorDict:
+    """Observations with a separate flat 'scan' group for the encoder to consume."""
+    obs = make_obs(num_envs, OBS_DIM)
+    obs["scan"] = torch.randn(num_envs, SCAN_DIM)
+    return obs
+
+
+def _make_encoder(obs: TensorDict, **kwargs: object) -> MLPModel:
+    """Create the shared encoder over the 'encoder' obs set."""
+    defaults: dict[str, object] = {"hidden_dims": [16, 8], "activation": "elu"}
+    defaults.update(kwargs)
+    return MLPModel(obs, _ENCODER_OBS_GROUPS, "encoder", LATENT_DIM, **defaults)
+
+
+def _build_ppo_with_encoder(**encoder_cfg: object) -> tuple[PPO, TensorDict]:
+    """Build a PPO instance whose actor and critic consume a shared encoder latent."""
+    obs = _make_encoder_obs()
+    actor = _make_actor(obs, _ENCODER_OBS_GROUPS, NUM_ACTIONS, other_input_dims=(LATENT_DIM,))
+    critic = _make_critic(obs, _ENCODER_OBS_GROUPS, other_input_dims=(LATENT_DIM,))
+    storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+    ppo = PPO(
+        actor,
+        critic,
+        storage,
+        num_learning_epochs=2,
+        num_mini_batches=2,
+        learning_rate=1e-2,
+        schedule="fixed",
+        encoder=_make_encoder(obs),
+        encoder_cfg=dict(encoder_cfg),
+    )
+    return ppo, obs
+
+
+def _run_update(ppo: PPO, obs: TensorDict) -> dict[str, float]:
+    """Fill the rollout storage with a full set of transitions and run one PPO update."""
+    for _ in range(NUM_STEPS):
+        ppo.act(obs)
+        ppo.process_env_step(
+            obs,
+            torch.randn(NUM_ENVS),
+            torch.zeros(NUM_ENVS, dtype=torch.uint8),
+            {},
+        )
+    ppo.compute_returns(obs)
+    return ppo.update()
 
 
 class TestGAEComputation:
@@ -318,3 +372,150 @@ class TestAdaptiveLearningRate:
             ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
 
         assert ppo.learning_rate == initial_lr
+
+
+class TestSharedEncoder:
+    """Tests for the optional shared observation encoder feeding the actor and critic."""
+
+    def test_encoder_params_are_optimized_and_trained(self) -> None:
+        """Encoder params belong to the PPO optimizer and change over an update."""
+        ppo, obs = _build_ppo_with_encoder()
+
+        optimized = {id(p) for group in ppo.optimizer.param_groups for p in group["params"]}
+        assert {id(p) for p in ppo.encoder.parameters()} <= optimized
+
+        before = [p.clone() for p in ppo.encoder.parameters()]
+        _run_update(ppo, obs)
+        assert any(not torch.equal(b, a) for b, a in zip(before, ppo.encoder.parameters(), strict=True))
+
+    def test_detach_actor_gradients_still_trains_encoder(self) -> None:
+        """With the actor gradients detached the critic loss must still train the encoder."""
+        ppo, obs = _build_ppo_with_encoder(detach_actor_gradients=True)
+        assert ppo.encoder_detach_actor
+
+        before = [p.clone() for p in ppo.encoder.parameters()]
+        _run_update(ppo, obs)
+        assert any(not torch.equal(b, a) for b, a in zip(before, ppo.encoder.parameters(), strict=True))
+
+    def test_l2_coef_reported_only_when_enabled(self) -> None:
+        """``l2_coef`` adds a logged, non-negative term; leaving it at 0 keeps the loss dict unchanged."""
+        ppo, obs = _build_ppo_with_encoder(l2_coef=1e-3)
+        loss_dict = _run_update(ppo, obs)
+        assert loss_dict["encoder_l2"] >= 0.0
+
+        ppo_off, obs_off = _build_ppo_with_encoder()
+        assert "encoder_l2" not in _run_update(ppo_off, obs_off)
+
+    def test_l2_penalty_shrinks_the_latent(self) -> None:
+        """A large L2 coefficient must drive the latent magnitude down."""
+        torch.manual_seed(0)
+        ppo, obs = _build_ppo_with_encoder(l2_coef=10.0)
+        before = ppo.encoder(obs).pow(2).mean().item()
+        for _ in range(3):
+            _run_update(ppo, obs)
+        assert ppo.encoder(obs).pow(2).mean().item() < before
+
+    def test_save_load_round_trips_the_encoder(self) -> None:
+        """``encoder_state_dict`` is saved and restored, and is listed as a policy-only key."""
+        ppo, obs = _build_ppo_with_encoder()
+        _run_update(ppo, obs)
+        saved = ppo.save()
+        assert "encoder_state_dict" in saved
+        assert "encoder_state_dict" in PPO.policy_state_keys()
+
+        fresh, _ = _build_ppo_with_encoder()
+        assert not all(
+            torch.equal(a, b) for a, b in zip(ppo.encoder.parameters(), fresh.encoder.parameters(), strict=True)
+        )
+        # a slim (policy-only) checkpoint carries no critic/optimizer state; the encoder must still load
+        fresh.load({k: saved[k] for k in PPO.policy_state_keys() if k in saved}, load_cfg=None, strict=True)
+        assert all(torch.equal(a, b) for a, b in zip(ppo.encoder.parameters(), fresh.encoder.parameters(), strict=True))
+
+    def test_partial_load_cfg_still_restores_the_encoder(self) -> None:
+        """play.py-style partial load cfgs omit an 'encoder' key; the encoder must load regardless."""
+        ppo, obs = _build_ppo_with_encoder()
+        _run_update(ppo, obs)
+        saved = ppo.save()
+
+        fresh, _ = _build_ppo_with_encoder()
+        fresh.load(saved, load_cfg={"actor": True}, strict=True)
+        assert all(torch.equal(a, b) for a, b in zip(ppo.encoder.parameters(), fresh.encoder.parameters(), strict=True))
+
+    def test_strict_load_requires_the_encoder_weights(self) -> None:
+        """A strict load of a checkpoint without encoder weights raises instead of keeping a random encoder."""
+        ppo, _ = _build_ppo_with_encoder()
+        saved = ppo.save()
+        del saved["encoder_state_dict"]
+
+        fresh, _ = _build_ppo_with_encoder()
+        with pytest.raises(KeyError, match="encoder_state_dict"):
+            fresh.load(saved, load_cfg=None, strict=True)
+        fresh.load(saved, load_cfg=None, strict=False)
+
+    def test_encoder_rejects_symmetry(self) -> None:
+        """Symmetry augmentation cannot be combined with an encoder."""
+        obs = _make_encoder_obs()
+        with pytest.raises(ValueError, match="shared observation encoder"):
+            PPO(
+                _make_actor(obs, _ENCODER_OBS_GROUPS, NUM_ACTIONS, other_input_dims=(LATENT_DIM,)),
+                _make_critic(obs, _ENCODER_OBS_GROUPS, other_input_dims=(LATENT_DIM,)),
+                RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS]),
+                symmetry_cfg={"use_data_augmentation": True, "use_mirror_loss": False, "data_augmentation_func": None},
+                encoder=_make_encoder(obs),
+            )
+
+    def test_encoder_rejects_shared_memory(self) -> None:
+        """An encoder and a shared memory module cannot be combined."""
+        obs = _make_encoder_obs()
+        obs_groups = _ENCODER_OBS_GROUPS
+        with pytest.raises(ValueError, match="cannot be combined with a shared memory module"):
+            PPO(
+                _make_actor(obs, obs_groups, NUM_ACTIONS, other_input_dims=(LATENT_DIM,)),
+                _make_critic(obs, obs_groups, other_input_dims=(LATENT_DIM,)),
+                RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS]),
+                memory=_make_encoder(obs),
+                encoder=_make_encoder(obs),
+            )
+
+    def test_encoder_rejects_recurrent_heads(self) -> None:
+        """An encoder requires plain MLP actor/critic heads."""
+        obs = _make_encoder_obs()
+        obs_groups = _ENCODER_OBS_GROUPS
+        actor = _make_actor(obs, obs_groups, NUM_ACTIONS, other_input_dims=(LATENT_DIM,))
+        actor.is_recurrent = True
+        with pytest.raises(ValueError, match="requires plain MLP actor/critic models"):
+            PPO(
+                actor,
+                _make_critic(obs, obs_groups, other_input_dims=(LATENT_DIM,)),
+                RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS]),
+                encoder=_make_encoder(obs),
+            )
+
+    def test_get_policy_wraps_the_encoder(self) -> None:
+        """``get_policy`` returns an adapter that supplies the latent the actor now expects."""
+        ppo, obs = _build_ppo_with_encoder()
+        policy = ppo.get_policy()
+        assert isinstance(policy, EncoderInferencePolicy)
+        assert policy(obs).shape == (NUM_ENVS, NUM_ACTIONS)
+
+    def test_jit_export_matches_eager_inference(self) -> None:
+        """The scripted single-input export reproduces eager deterministic inference."""
+        ppo, obs = _build_ppo_with_encoder()
+        ppo.eval_mode()
+        policy = ppo.get_policy()
+
+        with torch.inference_mode():
+            eager = policy(obs, stochastic_output=False)
+            scripted = torch.jit.script(policy.as_jit())
+            exported = scripted(torch.cat([obs["policy"], obs["scan"]], dim=-1))
+
+        torch.testing.assert_close(eager, exported)
+
+    def test_no_encoder_run_is_unaffected(self) -> None:
+        """Without an encoder the algorithm keeps the plain actor and reports no encoder loss."""
+        ppo, obs = _build_ppo()
+        assert ppo.encoder is None
+        assert ppo._encoder_args(obs) == ()
+        assert ppo.get_policy() is ppo._raw_actor
+        assert "encoder_l2" not in _run_update(ppo, obs)
+        assert "encoder_state_dict" not in ppo.save()

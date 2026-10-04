@@ -12,6 +12,9 @@ import re
 import torch
 import torch.nn as nn
 
+from robot_rl.models.inference import EncoderInferencePolicy
+from robot_rl.models.rnn_model import RNNModel
+from robot_rl.modules.distribution import Distribution, bound_by_clip_actions
 from robot_rl.utils.utils import resolve_callable
 
 DEFAULT_ONNX_OPSET = 18
@@ -44,12 +47,24 @@ def _group_dims(nsd: dict[str, torch.Tensor]) -> dict[str, int]:
     return dims
 
 
-def _num_actions(actor_sd: dict[str, torch.Tensor]) -> int:
-    """Infer the action dimension from the distribution's per-action parameter vector."""
-    for k, v in actor_sd.items():
-        if "distribution" in k and isinstance(v, torch.Tensor) and v.ndim == 1:
-            return v.shape[0]
-    raise ValueError("Cannot infer num_actions from the actor state dict (no 1-D distribution parameter).")
+def _distribution_class(dist_cfg: dict) -> type[Distribution]:
+    """Return the distribution class a logged ``distribution_cfg`` names."""
+    if "class_name" not in dist_cfg:
+        raise ValueError("The logged distribution_cfg has no 'class_name'; it must name its distribution class.")
+    return resolve_callable(dist_cfg["class_name"])
+
+
+def _num_actions(model_cfg: dict, sd: dict[str, torch.Tensor], default_class: str = "MLPModel") -> int:
+    """Return a model's action dimension from its head width and its distribution's input layout.
+
+    Args:
+        model_cfg: The logged model cfg, naming its class and its distribution.
+        sd: The model's state dict.
+        default_class: Model class when the cfg names none.
+    """
+    width = resolve_callable(model_cfg.get("class_name", default_class)).head_output_width(sd)
+    dist_cfg = model_cfg.get("distribution_cfg")
+    return width if dist_cfg is None else _distribution_class(dist_cfg).output_dim_for_input_width(width)
 
 
 def _extend_bn_identity(bn: nn.BatchNorm1d, extra_dims: int) -> nn.BatchNorm1d:
@@ -94,33 +109,103 @@ def bake_normalizer(model: nn.Module, normalizer: nn.Module) -> nn.Module:
     return model
 
 
+def _first_mlp_input_dim(sd: dict[str, torch.Tensor]) -> int:
+    """Width of a model's first MLP layer, i.e. everything its trunk consumes."""
+    first_idx = min(int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k)))
+    return sd[f"mlp.{first_idx}.weight"].shape[1]
+
+
 def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.Module]:
     if "memory_state_dict" in ckpt:
         raise NotImplementedError("Export of recurrent (memory-bearing) policies is not supported.")
     cfg = copy.deepcopy(train_cfg)
     models: dict[str, nn.Module] = {}
 
-    def build(name: str, sd_key: str, output_dim: int, default_class: str = "MLPModel") -> nn.Module:
-        sd = ckpt[sd_key]
-        model_cfg = dict(cfg[name if name != "policy" else "actor"])
-        model_class = resolve_callable(model_cfg.pop("class_name", default_class))
-        dist_cfg = model_cfg.get("distribution_cfg")
-        if dist_cfg is not None:
-            dist_cfg.setdefault("class_name", "GaussianDistribution")
-        first_idx = min(int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k)))
-        obs_dim = sd[f"mlp.{first_idx}.weight"].shape[1]
-        obs_set = "actor" if name == "policy" else "critic"
+    # an encoder head's first layer is ``obs_dim + latent_dim`` wide; subtract the latent to size its obs
+    encoder_cfg = cfg.get("algorithm", {}).get("encoder_cfg")
+    latent_dim = int(encoder_cfg["output_dim"]) if encoder_cfg is not None else 0
+
+    def build_from_groups(
+        model_cfg: dict, sd: dict[str, torch.Tensor], obs_set: str, output_dim: int, other_dims: tuple[int, ...]
+    ) -> nn.Module:
+        model_cfg = dict(model_cfg)
+        model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
+        obs_dim = _first_mlp_input_dim(sd) - sum(other_dims)
         groups = cfg["obs_groups"][obs_set]
         # only the concatenated dim matters for layer sizes; put it all on the first group
         obs = {g: torch.zeros(1, obs_dim if i == 0 else 0) for i, g in enumerate(groups)}
-        model = model_class(obs, {obs_set: groups}, obs_set, output_dim, **model_cfg)
+        model = model_class(obs, {obs_set: groups}, obs_set, output_dim, other_input_dims=other_dims, **model_cfg)
         model.load_state_dict(sd, strict=True)
         return model.eval()
 
-    models["policy"] = build("policy", "actor_state_dict", _num_actions(ckpt["actor_state_dict"]))
+    def build(name: str, sd_key: str, output_dim: int) -> nn.Module:
+        obs_set = "actor" if name == "policy" else "critic"
+        other_dims = (latent_dim,) if latent_dim else ()
+        return build_from_groups(
+            cfg[name if name != "policy" else "actor"], ckpt[sd_key], obs_set, output_dim, other_dims
+        )
+
+    encoder: nn.Module | None = None
+    if encoder_cfg is not None:
+        if "encoder_state_dict" not in ckpt:
+            raise ValueError("The train cfg configures an encoder but the checkpoint has no 'encoder_state_dict'.")
+        encoder = build_from_groups(encoder_cfg["model"], ckpt["encoder_state_dict"], "encoder", latent_dim, ())
+
+    models["policy"] = build("policy", "actor_state_dict", _num_actions(cfg["actor"], ckpt["actor_state_dict"]))
     if all_models:
+        if "critic_state_dict" not in ckpt:
+            # SAC checkpoints a pair of fused critics, whose constructor this builder does not fit
+            raise NotImplementedError("all_models is not supported for this checkpoint; its policy exports alone.")
         models["critic"] = build("critic", "critic_state_dict", 1)
+    if encoder is not None:
+        # fold the encoder in, so the export takes one ``[head_obs ; encoder_obs]`` input
+        models = {name: EncoderInferencePolicy(encoder, model) for name, model in models.items()}
     return models
+
+
+def _rebuild_distillation(
+    train_cfg: dict, ckpt: dict, obs_shapes: dict[str, tuple[int, ...]] | None = None
+) -> dict[str, nn.Module]:
+    """Rebuild a distillation student from its checkpoint.
+
+    Args:
+        train_cfg: The run's train cfg, holding the ``student`` model cfg and its obs groups.
+        ckpt: The checkpoint, holding ``student_state_dict`` with its baked observation normalizer.
+        obs_shapes: ``(channels, height, width)`` of each image group, which a checkpoint does not record;
+            optionally ``(dim,)`` of each 1D group, needed when the student has no observation normalizer.
+
+    Returns:
+        The student under the ``policy`` export name.
+    """
+    cfg = copy.deepcopy(train_cfg)
+    sd = ckpt["student_state_dict"]
+    model_cfg = dict(cfg["student"])
+    model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
+    if issubclass(model_class, RNNModel):
+        raise NotImplementedError("Export of recurrent (memory-bearing) students is not supported.")
+    groups = cfg["obs_groups"]["student"]
+    shapes = {g: tuple(obs_shapes[g]) for g in groups if obs_shapes and g in obs_shapes}
+    images = {g: shape for g, shape in shapes.items() if len(shape) == 3}
+    if "cnn_cfg" in model_cfg and not images:
+        raise ValueError(f"{model_class.__name__} encodes images: give each image group's (C, H, W) in obs_shapes")
+    flat = [g for g in groups if g not in images]
+    if all(g in shapes for g in flat):
+        dims = {g: shapes[g][0] for g in flat}
+    else:
+        if not images:
+            total = _first_mlp_input_dim(sd)
+        elif "obs_normalizer._mean" in sd:
+            total = sd["obs_normalizer._mean"].shape[-1]
+        else:
+            raise ValueError("this image student records no 1D input size: give each 1D group's (dim,) in obs_shapes")
+        # only the concatenated 1D dim matters for layer sizes; put it all on the first 1D group
+        dims = {g: total if g == flat[0] else 0 for g in flat}
+    obs = {g: torch.zeros(1, dims[g]) for g in flat}
+    obs |= {g: torch.zeros(1, *shape) for g, shape in images.items()}
+    num_actions = _num_actions(cfg["student"], sd)
+    model = model_class(obs, {"student": groups}, "student", num_actions, **model_cfg)
+    model.load_state_dict(sd, strict=True)
+    return {"policy": model.eval()}
 
 
 # FB-CPR models: name -> (cfg key, obs set, default class, output spec, other-input spec)
@@ -138,15 +223,17 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
     cfg = copy.deepcopy(train_cfg)
     nsd = ckpt["obs_normalizer_state_dict"]
     obs = {group: torch.zeros(1, dim) for group, dim in _group_dims(nsd).items()}
-    dims = {"z_dim": cfg["algorithm"]["z_dim"], "num_actions": _num_actions(ckpt["actor_state_dict"])}
+    num_actions = _num_actions(cfg["actor"], ckpt["actor_state_dict"], default_class=_FBCPR_MODELS["policy"][2])
+    dims = {"z_dim": cfg["algorithm"]["z_dim"], "num_actions": num_actions}
 
     def build(name: str) -> nn.Module:
         cfg_key, obs_set, default_class, out_spec, other_spec = _FBCPR_MODELS[name]
-        model_cfg = dict(cfg[cfg_key])
+        # the actor sits at the top of the runner cfg, the FB maps and critics under ``algorithm``
+        model_cfg = dict(cfg[cfg_key] if cfg_key in cfg else cfg["algorithm"][cfg_key])
         model_class = resolve_callable(model_cfg.pop("class_name", default_class))
         dist_cfg = model_cfg.get("distribution_cfg")
-        if dist_cfg is not None:
-            dist_cfg.setdefault("class_name", "TruncatedGaussianDistribution")
+        # the same bounds rule as training; any other head keeps the bounds its cfg dumped
+        if dist_cfg is not None and not bound_by_clip_actions(dist_cfg, cfg["clip_actions"]):
             dist_cfg.setdefault("low", -cfg["clip_actions"])
             dist_cfg.setdefault("high", cfg["clip_actions"])
         out_dim = dims[out_spec] if isinstance(out_spec, str) else out_spec
@@ -169,10 +256,22 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
     return {name: build(name) for name in names}
 
 
-def rebuild_models(train_cfg: dict, ckpt: dict, all_models: bool = False) -> dict[str, nn.Module]:
-    """Rebuild the trained models from a checkpoint, normalizers baked in; keyed by export name."""
+def rebuild_models(
+    train_cfg: dict, ckpt: dict, all_models: bool = False, obs_shapes: dict[str, tuple[int, ...]] | None = None
+) -> dict[str, nn.Module]:
+    """Rebuild the trained models from a checkpoint, normalizers baked in; keyed by export name.
+
+    Args:
+        train_cfg: The run's train cfg.
+        ckpt: The loaded checkpoint.
+        all_models: Also rebuild the models that are not the policy, where the algorithm has them.
+        obs_shapes: ``(channels, height, width)`` of each image observation group, and optionally ``(dim,)`` of
+            each 1D group, for image students.
+    """
     if "backward_map_state_dict" in ckpt:
         return _rebuild_fbcpr(train_cfg, ckpt, all_models)
+    if "student_state_dict" in ckpt:
+        return _rebuild_distillation(train_cfg, ckpt, obs_shapes)
     return _rebuild_ppo(train_cfg, ckpt, all_models)
 
 

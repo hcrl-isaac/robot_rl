@@ -19,6 +19,8 @@ from .mlp_model import MLPModel
 class FuseModel(MLPModel):
     """Early fusion MLP-based neural model."""
 
+    head_module: str = "trunk"
+
     def __init__(
         self,
         obs: TensorDict,

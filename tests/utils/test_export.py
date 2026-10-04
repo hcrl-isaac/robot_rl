@@ -164,6 +164,54 @@ def test_rebuilt_encoder_policy_exports_to_onnx(tmp_path: Path) -> None:
     torch.testing.assert_close(torch.from_numpy(actual), expected, rtol=1e-4, atol=1e-5)
 
 
+_CLIP_ACTIONS = 5.0
+
+
+def _fbcpr_actor_checkpoint(distribution_cfg: dict) -> tuple[dict, dict]:
+    """Build the part of an FB-CPR run that the policy rebuild reads: its dumped cfg and its checkpoint."""
+    from tensordict import TensorDict
+
+    from robot_rl.models import ResidualFuseModel
+
+    z_dim, obs_dim, num_actions = 4, 8, 3
+    obs = TensorDict({"policy": torch.zeros(1, obs_dim)}, batch_size=[1])
+    obs_groups = {"actor": ["policy"]}
+    actor_cfg = {"embedding_dims": [16, 16], "hidden_dims": [16, 16], "distribution_cfg": dict(distribution_cfg)}
+    actor = ResidualFuseModel(obs, obs_groups, "actor", (z_dim, 0), num_actions, **copy.deepcopy(actor_cfg))
+    train_cfg = {
+        "actor": {"class_name": "ResidualFuseModel", **actor_cfg},
+        "obs_groups": obs_groups,
+        "algorithm": {"z_dim": z_dim},
+        "clip_actions": _CLIP_ACTIONS,
+    }
+    ckpt = {
+        "backward_map_state_dict": {},
+        "actor_state_dict": actor.state_dict(),
+        "obs_normalizer_state_dict": {
+            "policy.running_mean": torch.zeros(obs_dim),
+            "policy.running_var": torch.ones(obs_dim),
+            "policy.num_batches_tracked": torch.tensor(1),
+        },
+    }
+    return train_cfg, ckpt
+
+
+def test_a_truncated_gaussian_actor_is_bounded_by_clip_actions_whatever_the_cfg_dumped() -> None:
+    """Training bounds the actor by ``clip_actions``; a dump that still says +-1 must not shrink the export."""
+    dumped = {"class_name": "TruncatedGaussianDistribution", "low": -1.0, "high": 1.0}
+    policy = rebuild_models(*_fbcpr_actor_checkpoint(dumped))["policy"]
+    saturated = policy.distribution.deterministic_output(torch.tensor([-50.0, 50.0]))
+    torch.testing.assert_close(saturated, torch.tensor([-_CLIP_ACTIONS, _CLIP_ACTIONS]))
+
+
+def test_a_squashed_tanh_actor_keeps_the_bounds_its_cfg_gives() -> None:
+    """Only the truncated Gaussian takes its bounds from ``clip_actions``."""
+    dumped = {"class_name": "SquashedTanhGaussianDistribution", "low": -1.0, "high": 1.0}
+    policy = rebuild_models(*_fbcpr_actor_checkpoint(dumped))["policy"]
+    saturated = policy.distribution.deterministic_output(torch.tensor([-50.0, 50.0]))
+    torch.testing.assert_close(saturated, torch.tensor([-1.0, 1.0]))
+
+
 _STUDENT_DISTRIBUTIONS = {
     "Gaussian": dict(_ACTOR_CFG["distribution_cfg"]),
     "HeteroscedasticGaussian": {"class_name": "HeteroscedasticGaussianDistribution"},

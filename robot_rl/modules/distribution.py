@@ -82,6 +82,15 @@ class Distribution(nn.Module):
         """Return the input dimension required by the distribution."""
         raise NotImplementedError
 
+    @classmethod
+    def output_dim_for_input_width(cls, width: int) -> int:
+        """Return the ``output_dim`` whose :attr:`input_dim` flattens to ``width`` MLP outputs.
+
+        Args:
+            width: Width of the MLP's last layer.
+        """
+        return width
+
     @property
     def mean(self) -> torch.Tensor:
         """Return the mean of the distribution."""
@@ -339,6 +348,11 @@ class HeteroscedasticGaussianDistribution(GaussianDistribution):
         """
         return [2, self.output_dim]
 
+    @classmethod
+    def output_dim_for_input_width(cls, width: int) -> int:
+        """Return the ``output_dim`` whose ``[2, output_dim]`` input flattens to ``width`` MLP outputs."""
+        return width // 2
+
     def init_mlp_weights(self, mlp: nn.Module) -> None:
         """Initialize the std head weights in the MLP."""
         # Initialize weights and biases for the std portion of the last layer
@@ -506,6 +520,11 @@ class BetaDistribution(Distribution):
         dimension is the raw alpha parameter and the second is the raw beta parameter.
         """
         return [2, self.output_dim]
+
+    @classmethod
+    def output_dim_for_input_width(cls, width: int) -> int:
+        """Return the ``output_dim`` whose ``[2, output_dim]`` input flattens to ``width`` MLP outputs."""
+        return width // 2
 
     @property
     def mean(self) -> torch.Tensor:

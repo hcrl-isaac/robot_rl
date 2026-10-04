@@ -45,9 +45,17 @@ def _group_dims(nsd: dict[str, torch.Tensor]) -> dict[str, int]:
     return dims
 
 
+_VMF_PARAM = "distribution.log_kappa"
+
+
+def _default_distribution(sd: dict[str, torch.Tensor]) -> str:
+    """The distribution class a checkpoint's parameters name, for a logged cfg that does not say."""
+    return "VonMisesFisherDistribution" if _VMF_PARAM in sd else "GaussianDistribution"
+
+
 def _num_actions(actor_sd: dict[str, torch.Tensor]) -> int:
     """Infer the action dimension from the distribution's per-action parameter vector."""
-    if "distribution.log_kappa" in actor_sd:
+    if _VMF_PARAM in actor_sd:
         # a vMF's spread is one scalar; its action is the MLP's output direction itself
         last_idx = max(int(m.group(1)) for k in actor_sd if (m := re.match(r"mlp\.(\d+)\.weight", k)))
         return actor_sd[f"mlp.{last_idx}.weight"].shape[0]
@@ -122,7 +130,7 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
         model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
         dist_cfg = model_cfg.get("distribution_cfg")
         if dist_cfg is not None:
-            dist_cfg.setdefault("class_name", "GaussianDistribution")
+            dist_cfg.setdefault("class_name", _default_distribution(sd))
         obs_dim = _first_mlp_input_dim(sd) - sum(other_dims)
         groups = cfg["obs_groups"][obs_set]
         # only the concatenated dim matters for layer sizes; put it all on the first group
@@ -146,6 +154,9 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
 
     models["policy"] = build("policy", "actor_state_dict", _num_actions(ckpt["actor_state_dict"]))
     if all_models:
+        if "critic_state_dict" not in ckpt:
+            # SAC checkpoints a pair of fused critics, whose constructor this builder does not fit
+            raise NotImplementedError("all_models is not supported for this checkpoint; its policy exports alone.")
         models["critic"] = build("critic", "critic_state_dict", 1)
     if encoder is not None:
         # fold the encoder in, so the export takes one ``[head_obs ; encoder_obs]`` input
@@ -172,7 +183,7 @@ def _rebuild_distillation(
     model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
     dist_cfg = model_cfg.get("distribution_cfg")
     if dist_cfg is not None:
-        dist_cfg.setdefault("class_name", "GaussianDistribution")
+        dist_cfg.setdefault("class_name", _default_distribution(sd))
     groups = cfg["obs_groups"]["student"]
     images = {g: tuple(obs_shapes[g]) for g in groups if obs_shapes and g in obs_shapes}
     if "cnn_cfg" in model_cfg and not images:

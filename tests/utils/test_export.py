@@ -279,3 +279,45 @@ def test_an_image_student_needs_its_image_shapes() -> None:
     _, train_cfg, ckpt = _image_student("gru")
     with pytest.raises(ValueError, match="obs_shapes"):
         rebuild_models(train_cfg, ckpt)
+
+
+def _vmf_actor_checkpoint() -> tuple[nn.Module, dict, dict]:
+    """A hyperspherical actor as an off-policy run checkpoints it, with a cfg that does not name its distribution."""
+    from robot_rl.models import MLPModel
+    from tests.conftest import make_obs
+
+    obs = make_obs(4, 8)
+    actor = MLPModel(
+        obs,
+        {"actor": ["policy"]},
+        "actor",
+        6,
+        hidden_dims=[32, 32],
+        distribution_cfg={"class_name": "VonMisesFisherDistribution", "init_std": 0.05},
+    ).eval()
+    train_cfg = {
+        "actor": {"class_name": "MLPModel", "hidden_dims": [32, 32], "distribution_cfg": {"init_std": 0.05}},
+        "obs_groups": {"actor": ["policy"]},
+        "algorithm": {},
+    }
+    return actor, train_cfg, {"actor_state_dict": actor.state_dict()}
+
+
+def test_a_vmf_actor_is_named_by_its_checkpoint_when_the_cfg_is_silent() -> None:
+    """The rebuilt actor acts with the unit mean direction the trained one does, not a Gaussian mean."""
+    from tests.conftest import make_obs
+
+    actor, train_cfg, ckpt = _vmf_actor_checkpoint()
+    policy = rebuild_models(train_cfg, ckpt)["policy"]
+    obs = make_obs(4, 8)
+    with torch.inference_mode():
+        expected = actor(obs, stochastic_output=False)
+        actual = policy(obs, stochastic_output=False)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual.norm(dim=-1), torch.ones(4))
+
+
+def test_all_models_says_so_for_a_checkpoint_without_a_single_critic() -> None:
+    _, train_cfg, ckpt = _vmf_actor_checkpoint()
+    with pytest.raises(NotImplementedError, match="all_models"):
+        rebuild_models(train_cfg, ckpt, all_models=True)

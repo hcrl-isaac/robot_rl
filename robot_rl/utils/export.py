@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from robot_rl.models.inference import EncoderInferencePolicy
+from robot_rl.models.rnn_model import RNNModel
 from robot_rl.utils.utils import resolve_callable
 
 DEFAULT_ONNX_OPSET = 18
@@ -45,8 +46,32 @@ def _group_dims(nsd: dict[str, torch.Tensor]) -> dict[str, int]:
     return dims
 
 
-def _num_actions(actor_sd: dict[str, torch.Tensor]) -> int:
-    """Infer the action dimension from the distribution's per-action parameter vector."""
+_VMF_PARAM = "distribution.log_kappa"
+
+
+def _default_distribution(sd: dict[str, torch.Tensor]) -> str:
+    """Return the distribution class a checkpoint's parameters name, for a logged cfg that does not say."""
+    return "VonMisesFisherDistribution" if _VMF_PARAM in sd else "GaussianDistribution"
+
+
+def _last_mlp_output_dim(sd: dict[str, torch.Tensor]) -> int:
+    """Width of a model's last MLP layer, i.e. its raw output."""
+    idxs = [int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k))]
+    if not idxs:
+        raise ValueError("Cannot infer num_actions from the actor state dict (no mlp.N.weight layer).")
+    return sd[f"mlp.{max(idxs)}.weight"].shape[0]
+
+
+def _num_actions(actor_sd: dict[str, torch.Tensor], has_distribution: bool = True) -> int:
+    """Infer the action dimension from the distribution's per-action parameter vector.
+
+    Args:
+        actor_sd: The actor or student state dict.
+        has_distribution: Whether the model has an action distribution; without one the output layer is the action.
+    """
+    if _VMF_PARAM in actor_sd or not has_distribution:
+        # a vMF's spread is one scalar; its action is the MLP's output direction itself
+        return _last_mlp_output_dim(actor_sd)
     for k, v in actor_sd.items():
         if "distribution" in k and isinstance(v, torch.Tensor) and v.ndim == 1:
             return v.shape[0]
@@ -118,7 +143,7 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
         model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
         dist_cfg = model_cfg.get("distribution_cfg")
         if dist_cfg is not None:
-            dist_cfg.setdefault("class_name", "GaussianDistribution")
+            dist_cfg.setdefault("class_name", _default_distribution(sd))
         obs_dim = _first_mlp_input_dim(sd) - sum(other_dims)
         groups = cfg["obs_groups"][obs_set]
         # only the concatenated dim matters for layer sizes; put it all on the first group
@@ -150,7 +175,7 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
 
 
 def _rebuild_distillation(train_cfg: dict, ckpt: dict) -> dict[str, nn.Module]:
-    """Rebuild a distillation student; the teacher is the training signal, not an export target.
+    """Rebuild a distillation student from its checkpoint.
 
     Args:
         train_cfg: The run's train cfg, holding the ``student`` model cfg and its obs groups.
@@ -163,13 +188,16 @@ def _rebuild_distillation(train_cfg: dict, ckpt: dict) -> dict[str, nn.Module]:
     sd = ckpt["student_state_dict"]
     model_cfg = dict(cfg["student"])
     model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
+    if issubclass(model_class, RNNModel):
+        raise NotImplementedError("Export of recurrent (memory-bearing) students is not supported.")
     dist_cfg = model_cfg.get("distribution_cfg")
     if dist_cfg is not None:
-        dist_cfg.setdefault("class_name", "GaussianDistribution")
+        dist_cfg.setdefault("class_name", _default_distribution(sd))
     groups = cfg["obs_groups"]["student"]
     # only the concatenated dim matters for layer sizes; put it all on the first group
     obs = {g: torch.zeros(1, _first_mlp_input_dim(sd) if i == 0 else 0) for i, g in enumerate(groups)}
-    model = model_class(obs, {"student": groups}, "student", _num_actions(sd), **model_cfg)
+    num_actions = _num_actions(sd, has_distribution=dist_cfg is not None)
+    model = model_class(obs, {"student": groups}, "student", num_actions, **model_cfg)
     model.load_state_dict(sd, strict=True)
     return {"policy": model.eval()}
 

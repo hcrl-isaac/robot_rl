@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import copy
 import torch
 from pathlib import Path
 from torch import nn
@@ -17,6 +18,7 @@ import pytest
 
 from robot_rl.models import EncoderInferencePolicy
 from robot_rl.utils.export import rebuild_models, save_onnx
+from robot_rl.utils.utils import resolve_callable
 from tests.algorithms.test_ppo import (
     LATENT_DIM,
     NUM_ENVS,
@@ -162,36 +164,50 @@ def test_rebuilt_encoder_policy_exports_to_onnx(tmp_path: Path) -> None:
     torch.testing.assert_close(torch.from_numpy(actual), expected, rtol=1e-4, atol=1e-5)
 
 
-def test_rebuild_distillation_matches_the_student() -> None:
-    """A distillation checkpoint exports its student; the teacher was the training signal, not a target."""
+_STUDENT_DISTRIBUTIONS = {
+    "gaussian": dict(_ACTOR_CFG["distribution_cfg"]),
+    "vmf": {"class_name": "VonMisesFisherDistribution", "init_std": 0.5},
+    "none": None,
+}
+
+
+def _distillation_checkpoint(student_cfg: dict, num_actions: int = 4) -> tuple[dict, dict, object, object]:
+    """Train-cfg subset, checkpoint, observations and algorithm of a fresh distillation run."""
     from robot_rl.algorithms.distillation import Distillation
     from robot_rl.models import MLPModel
     from robot_rl.storage import RolloutStorage
     from tests.conftest import make_obs
 
-    num_envs, obs_dim, num_actions = 4, 8, 4
+    num_envs, obs_dim = 4, 8
     obs = make_obs(num_envs, obs_dim)
     obs_groups = {"student": ["policy"], "teacher": ["policy"]}
-    student_cfg = {
-        "class_name": "MLPModel",
-        "hidden_dims": [32, 32],
-        "distribution_cfg": dict(_ACTOR_CFG["distribution_cfg"]),
-    }
-    student = MLPModel(
-        obs,
-        obs_groups,
-        "student",
-        num_actions,
-        hidden_dims=[32, 32],
-        distribution_cfg=dict(_ACTOR_CFG["distribution_cfg"]),
-    )
+    model_cfg = {k: copy.deepcopy(v) for k, v in student_cfg.items() if k != "class_name"}
+    student = resolve_callable(student_cfg["class_name"])(obs, obs_groups, "student", num_actions, **model_cfg)
     teacher = MLPModel(obs, obs_groups, "teacher", num_actions, hidden_dims=[32, 32])
     alg = Distillation(student, teacher, RolloutStorage("distillation", num_envs, 4, obs, [num_actions]))
     alg.eval_mode()
-
     train_cfg = {"student": student_cfg, "obs_groups": obs_groups, "algorithm": {}}
-    policy = rebuild_models(train_cfg, alg.save())["policy"]
+    return train_cfg, alg.save(), obs, alg
+
+
+@pytest.mark.parametrize("distribution", list(_STUDENT_DISTRIBUTIONS))
+def test_rebuild_distillation_matches_the_student(distribution: str) -> None:
+    """Rebuild a distillation student from its checkpoint."""
+    student_cfg = {"class_name": "MLPModel", "hidden_dims": [32, 32]}
+    if _STUDENT_DISTRIBUTIONS[distribution] is not None:
+        student_cfg["distribution_cfg"] = dict(_STUDENT_DISTRIBUTIONS[distribution])
+    train_cfg, ckpt, obs, alg = _distillation_checkpoint(student_cfg)
+
+    policy = rebuild_models(train_cfg, ckpt)["policy"]
     with torch.inference_mode():
         expected = alg.student(obs, stochastic_output=False)
         actual = policy(obs, stochastic_output=False)
     torch.testing.assert_close(expected, actual)
+
+
+def test_rebuild_distillation_rejects_a_recurrent_student() -> None:
+    """A recurrent 1D student raises instead of failing on a state-dict size mismatch."""
+    student_cfg = {"class_name": "RNNModel", "hidden_dims": [32, 32], "rnn_hidden_dim": 16, "rnn_type": "gru"}
+    train_cfg, ckpt, _, _ = _distillation_checkpoint(student_cfg)
+    with pytest.raises(NotImplementedError, match="recurrent"):
+        rebuild_models(train_cfg, ckpt)

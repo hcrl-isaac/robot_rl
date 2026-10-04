@@ -285,3 +285,21 @@ class TestActorWarmup:
         restored, _ = self._warmup_ppo(tmp_path, warmup=10)
         restored.load(ppo.save(), {"actor": True, "critic": True, "iteration": True}, strict=True)
         assert restored.num_updates_done == ppo.num_updates_done == 1
+
+
+class TestActInference:
+    """Tests for the storage-free action path used by dataset collection."""
+
+    def test_act_inference_leaves_storage_untouched(self, tmp_path: Path) -> None:
+        """Collecting actions does not record a transition."""
+        ppo, obs = _build_style_ppo(tmp_path)
+        ppo.eval_mode()
+        actions = ppo.act_inference(obs)
+        assert actions.shape == (NUM_ENVS, NUM_ACTIONS)
+        assert ppo.storage.step == 0
+
+    def test_act_inference_sampling_differs_from_the_mean(self, tmp_path: Path) -> None:
+        """``stochastic`` samples the policy, which a rollout's states carry."""
+        ppo, obs = _build_style_ppo(tmp_path)
+        ppo.eval_mode()
+        assert not torch.equal(ppo.act_inference(obs, stochastic=True), ppo.act_inference(obs))

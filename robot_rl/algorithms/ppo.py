@@ -187,6 +187,16 @@ class PPO:
         latent = self.encoder(obs)
         return (latent.detach(),) if detach else (latent,)
 
+    def act_inference(self, obs: TensorDict, stochastic: bool = False) -> torch.Tensor:
+        """Actions for ``obs`` without recording a transition.
+
+        Args:
+            obs: Current observations.
+            stochastic: Sample from the policy instead of taking its mean, as a rollout does.
+        """
+        with torch.inference_mode():
+            return self.actor(obs, *self._encoder_args(obs, detach=True), stochastic_output=stochastic)
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
         # Pre-step batch info so the RNNModel can lazy-init its hidden states; without it the first

@@ -165,8 +165,12 @@ def test_rebuilt_encoder_policy_exports_to_onnx(tmp_path: Path) -> None:
 
 
 _STUDENT_DISTRIBUTIONS = {
-    "gaussian": dict(_ACTOR_CFG["distribution_cfg"]),
-    "vmf": {"class_name": "VonMisesFisherDistribution", "init_std": 0.5},
+    "Gaussian": dict(_ACTOR_CFG["distribution_cfg"]),
+    "HeteroscedasticGaussian": {"class_name": "HeteroscedasticGaussianDistribution"},
+    "TruncatedGaussian": {"class_name": "TruncatedGaussianDistribution"},
+    "Beta": {"class_name": "BetaDistribution"},
+    "VonMisesFisher": {"class_name": "VonMisesFisherDistribution", "init_std": 0.5},
+    "SquashedTanhGaussian": {"class_name": "SquashedTanhGaussianDistribution"},
     "none": None,
 }
 
@@ -211,3 +215,35 @@ def test_rebuild_distillation_rejects_a_recurrent_student() -> None:
     train_cfg, ckpt, _, _ = _distillation_checkpoint(student_cfg)
     with pytest.raises(NotImplementedError, match="recurrent"):
         rebuild_models(train_cfg, ckpt)
+
+
+def test_rebuild_requires_the_distribution_class_name() -> None:
+    """A logged distribution cfg must name its class; the export does not guess it."""
+    student_cfg = {
+        "class_name": "MLPModel",
+        "hidden_dims": [32, 32],
+        "distribution_cfg": {"class_name": "BetaDistribution"},
+    }
+    train_cfg, ckpt, _, _ = _distillation_checkpoint(student_cfg)
+    del train_cfg["student"]["distribution_cfg"]["class_name"]
+    with pytest.raises(ValueError, match="class_name"):
+        rebuild_models(train_cfg, ckpt)
+
+
+@pytest.mark.parametrize("distribution", ["TruncatedGaussian", "SquashedTanhGaussian"])
+def test_fuse_model_reports_its_output_width(distribution: str) -> None:
+    """A fused actor's action width reads from its ``trunk`` head, as the FB-CPR rebuild sizes it."""
+    from robot_rl.models import ResidualFuseModel
+    from robot_rl.utils.export import _num_actions
+    from tests.conftest import make_obs
+
+    num_actions, z_dim = 6, 8
+    obs = make_obs(2, 10)
+    model_cfg = {
+        "hidden_dims": [32, 32],
+        "embedding_dims": [16, 16],
+        "distribution_cfg": dict(_STUDENT_DISTRIBUTIONS[distribution]),
+    }
+    actor = ResidualFuseModel(obs, {"actor": ["policy"]}, "actor", (z_dim, 0), num_actions, **copy.deepcopy(model_cfg))
+    logged = {"class_name": "ResidualFuseModel", **model_cfg}
+    assert _num_actions(logged, actor.state_dict()) == num_actions

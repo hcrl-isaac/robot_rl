@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import copy
 import numpy as np
 import torch
 from pathlib import Path
@@ -18,6 +19,7 @@ import pytest
 
 from robot_rl.models import EncoderInferencePolicy
 from robot_rl.utils.export import rebuild_models, save_onnx
+from robot_rl.utils.utils import resolve_callable
 from tests.algorithms.test_ppo import (
     LATENT_DIM,
     NUM_ENVS,
@@ -163,35 +165,41 @@ def test_rebuilt_encoder_policy_exports_to_onnx(tmp_path: Path) -> None:
     torch.testing.assert_close(torch.from_numpy(actual), expected, rtol=1e-4, atol=1e-5)
 
 
-def test_rebuild_distillation_matches_the_student() -> None:
-    """A distillation checkpoint exports its student; the teacher was the training signal, not a target."""
+_STUDENT_DISTRIBUTIONS = {
+    "gaussian": dict(_ACTOR_CFG["distribution_cfg"]),
+    "vmf": {"class_name": "VonMisesFisherDistribution", "init_std": 0.5},
+    "none": None,
+}
+
+
+def _distillation_checkpoint(student_cfg: dict, num_actions: int = 4) -> tuple[dict, dict, object, object]:
+    """Train-cfg subset, checkpoint, observations and algorithm of a fresh distillation run."""
     from robot_rl.algorithms.distillation import Distillation
     from robot_rl.models import MLPModel
     from robot_rl.storage import RolloutStorage
     from tests.conftest import make_obs
 
-    num_envs, obs_dim, num_actions = 4, 8, 4
+    num_envs, obs_dim = 4, 8
     obs = make_obs(num_envs, obs_dim)
     obs_groups = {"student": ["policy"], "teacher": ["policy"]}
-    student_cfg = {
-        "class_name": "MLPModel",
-        "hidden_dims": [32, 32],
-        "distribution_cfg": dict(_ACTOR_CFG["distribution_cfg"]),
-    }
-    student = MLPModel(
-        obs,
-        obs_groups,
-        "student",
-        num_actions,
-        hidden_dims=[32, 32],
-        distribution_cfg=dict(_ACTOR_CFG["distribution_cfg"]),
-    )
+    model_cfg = {k: copy.deepcopy(v) for k, v in student_cfg.items() if k != "class_name"}
+    student = resolve_callable(student_cfg["class_name"])(obs, obs_groups, "student", num_actions, **model_cfg)
     teacher = MLPModel(obs, obs_groups, "teacher", num_actions, hidden_dims=[32, 32])
     alg = Distillation(student, teacher, RolloutStorage("distillation", num_envs, 4, obs, [num_actions]))
     alg.eval_mode()
-
     train_cfg = {"student": student_cfg, "obs_groups": obs_groups, "algorithm": {}}
-    policy = rebuild_models(train_cfg, alg.save())["policy"]
+    return train_cfg, alg.save(), obs, alg
+
+
+@pytest.mark.parametrize("distribution", list(_STUDENT_DISTRIBUTIONS))
+def test_rebuild_distillation_matches_the_student(distribution: str) -> None:
+    """Rebuild a distillation student from its checkpoint."""
+    student_cfg = {"class_name": "MLPModel", "hidden_dims": [32, 32]}
+    if _STUDENT_DISTRIBUTIONS[distribution] is not None:
+        student_cfg["distribution_cfg"] = dict(_STUDENT_DISTRIBUTIONS[distribution])
+    train_cfg, ckpt, obs, alg = _distillation_checkpoint(student_cfg)
+
+    policy = rebuild_models(train_cfg, ckpt)["policy"]
     with torch.inference_mode():
         expected = alg.student(obs, stochastic_output=False)
         actual = policy(obs, stochastic_output=False)
@@ -326,3 +334,65 @@ def test_all_models_says_so_for_a_checkpoint_without_a_single_critic() -> None:
     _, train_cfg, ckpt = _vmf_actor_checkpoint()
     with pytest.raises(NotImplementedError, match="all_models"):
         rebuild_models(train_cfg, ckpt, all_models=True)
+
+
+def test_rebuild_distillation_rejects_a_recurrent_student() -> None:
+    """A recurrent 1D student raises instead of failing on a state-dict size mismatch."""
+    student_cfg = {"class_name": "RNNModel", "hidden_dims": [32, 32], "rnn_hidden_dim": 16, "rnn_type": "gru"}
+    train_cfg, ckpt, _, _ = _distillation_checkpoint(student_cfg)
+    with pytest.raises(NotImplementedError, match="recurrent"):
+        rebuild_models(train_cfg, ckpt)
+
+
+def test_an_image_student_without_a_normalizer_takes_its_1d_shapes() -> None:
+    """Without normalizer statistics the 1D input size comes from ``obs_shapes``, and its absence is named."""
+    from tensordict import TensorDict
+
+    from robot_rl.models import CNNRNNModel
+
+    obs = TensorDict({"policy": torch.zeros(2, 7), "image": torch.zeros(2, 4, 12, 20)}, batch_size=[2])
+    obs_groups = {"student": ["policy", "image"]}
+    student_cfg = {
+        "class_name": "CNNRNNModel",
+        "hidden_dims": [32, 32],
+        "obs_normalization": False,
+        "cnn_cfg": {"output_channels": [8, 8], "kernel_size": 3, "stride": 2, "global_pool": "avg", "flatten": True},
+        "rnn_hidden_dim": 16,
+    }
+    model = CNNRNNModel(obs, obs_groups, "student", 6, **{k: v for k, v in student_cfg.items() if k != "class_name"})
+    train_cfg = {"student": student_cfg, "obs_groups": obs_groups, "algorithm": {}}
+    ckpt = {"student_state_dict": model.eval().state_dict()}
+
+    with pytest.raises(ValueError, match="1D group"):
+        rebuild_models(train_cfg, ckpt, obs_shapes={"image": (4, 12, 20)})
+    policy = rebuild_models(train_cfg, ckpt, obs_shapes={"image": (4, 12, 20), "policy": (7,)})["policy"]
+    step = TensorDict({"policy": torch.randn(1, 7), "image": torch.rand(1, 4, 12, 20)}, batch_size=[1])
+    model.reset()
+    with torch.inference_mode():
+        torch.testing.assert_close(policy(step, stochastic_output=False), model(step, stochastic_output=False))
+
+
+def test_a_subclass_that_changes_the_features_does_not_export() -> None:
+    """A model that overrides the feature or head-input path gets no export built from the plain one."""
+    from robot_rl.models import CNNRNNModel
+    from robot_rl.models.cref_model import CrefModel
+
+    class Gated(CNNRNNModel):
+        def _head_input(self, feats: torch.Tensor, rnn_out: torch.Tensor) -> torch.Tensor:
+            return torch.cat([feats * 0.5, rnn_out], dim=-1)
+
+    model, _, _ = _image_student("gru")
+    model.__class__ = Gated
+    for build in (model.as_jit, model.as_onnx):
+        with pytest.raises(NotImplementedError, match="Gated"):
+            build()
+    assert CrefModel._features is not CNNRNNModel._features  # the reference-action student is one such model
+
+
+def test_an_image_group_cannot_take_an_export_input_name() -> None:
+    """ONNX inputs are named after the image groups, so a group called ``obs`` or ``h_in`` is refused."""
+    model, _, _ = _image_student("gru")
+    model.obs_groups_2d = ["h_in"]
+    model.cnns = nn.ModuleDict({"h_in": model.cnns["image"]})
+    with pytest.raises(ValueError, match="h_in"):
+        model.as_onnx()

@@ -184,10 +184,18 @@ class CNNRNNModel(CNNModel):
 
 
 class _CNNRNNExport(nn.Module):
-    """The deterministic CNN-RNN policy, cut loose from its training wrappers."""
+    """The deterministic CNN-RNN policy, cut loose from its training wrappers.
+
+    Exports run one environment at a time: the recurrent state has batch size 1.
+    """
 
     def __init__(self, model: CNNRNNModel) -> None:
         super().__init__()
+        cls = type(model)
+        if cls._features is not CNNRNNModel._features or cls._head_input is not CNNRNNModel._head_input:
+            raise NotImplementedError(
+                f"{cls.__name__} changes the features or the head input; its export is not built."
+            )
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
         self.cnns = nn.ModuleList([copy.deepcopy(model.cnns[g]) for g in model.obs_groups_2d])
         self.rnn = copy.deepcopy(model.rnn.rnn)
@@ -222,7 +230,11 @@ class _CNNRNNExport(nn.Module):
 
 
 class _TorchCNNGRUModel(_CNNRNNExport):
-    """TorchScript export of a GRU CNN-RNN policy; ``reset()`` clears the state it carries."""
+    """TorchScript export of a GRU CNN-RNN policy; ``reset()`` clears the state it carries.
+
+    Called as ``forward(obs_1d, obs_2d)`` with ``obs_2d`` a list of one image tensor per image group, in the
+    model's group order. ``obs_1d`` is always passed, and is ignored by a model without 1D groups.
+    """
 
     def __init__(self, model: CNNRNNModel) -> None:
         super().__init__(model)
@@ -242,7 +254,11 @@ class _TorchCNNGRUModel(_CNNRNNExport):
 
 
 class _TorchCNNLSTMModel(_CNNRNNExport):
-    """TorchScript export of an LSTM CNN-RNN policy; ``reset()`` clears the state it carries."""
+    """TorchScript export of an LSTM CNN-RNN policy; ``reset()`` clears the state it carries.
+
+    Called as ``forward(obs_1d, obs_2d)`` with ``obs_2d`` a list of one image tensor per image group, in the
+    model's group order. ``obs_1d`` is always passed, and is ignored by a model without 1D groups.
+    """
 
     def __init__(self, model: CNNRNNModel) -> None:
         super().__init__(model)
@@ -267,8 +283,8 @@ class _TorchCNNLSTMModel(_CNNRNNExport):
 class _OnnxCNNRNNModel(_CNNRNNExport):
     """ONNX export of a CNN-RNN policy that takes its recurrent state as an input and returns the next one.
 
-    Inputs are ``obs``, one per image group and the state; outputs are the action and the next state. The
-    caller feeds zeros as the first state and each step's output state to the next.
+    Inputs are ``obs``, one per image group under the group's own name, and the state ``h_in`` (``c_in``); outputs
+    are the action and the next state. The caller feeds zeros first, then each step's output state.
     """
 
     is_recurrent: bool = True
@@ -277,6 +293,9 @@ class _OnnxCNNRNNModel(_CNNRNNExport):
         super().__init__(model)
         self.verbose = verbose
         self.is_lstm = isinstance(self.rnn, nn.LSTM)
+        reserved = {"obs", "h_in", "c_in"} & set(self.obs_groups_2d)
+        if reserved:
+            raise ValueError(f"Image groups named {sorted(reserved)} collide with the export's own input names.")
 
     def forward(self, obs: torch.Tensor, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """One step from the given state; returns the action and the state after it."""

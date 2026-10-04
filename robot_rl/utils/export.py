@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from robot_rl.models.inference import EncoderInferencePolicy
+from robot_rl.models.rnn_model import RNNModel
 from robot_rl.utils.utils import resolve_callable
 
 DEFAULT_ONNX_OPSET = 18
@@ -53,12 +54,24 @@ def _default_distribution(sd: dict[str, torch.Tensor]) -> str:
     return "VonMisesFisherDistribution" if _VMF_PARAM in sd else "GaussianDistribution"
 
 
-def _num_actions(actor_sd: dict[str, torch.Tensor]) -> int:
-    """Infer the action dimension from the distribution's per-action parameter vector."""
-    if _VMF_PARAM in actor_sd:
+def _last_mlp_output_dim(sd: dict[str, torch.Tensor]) -> int:
+    """Width of a model's last MLP layer, i.e. its raw output."""
+    idxs = [int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k))]
+    if not idxs:
+        raise ValueError("Cannot infer num_actions from the actor state dict (no mlp.N.weight layer).")
+    return sd[f"mlp.{max(idxs)}.weight"].shape[0]
+
+
+def _num_actions(actor_sd: dict[str, torch.Tensor], has_distribution: bool = True) -> int:
+    """Infer the action dimension from the distribution's per-action parameter vector.
+
+    Args:
+        actor_sd: The actor or student state dict.
+        has_distribution: Whether the model has an action distribution; without one the output layer is the action.
+    """
+    if _VMF_PARAM in actor_sd or not has_distribution:
         # a vMF's spread is one scalar; its action is the MLP's output direction itself
-        last_idx = max(int(m.group(1)) for k in actor_sd if (m := re.match(r"mlp\.(\d+)\.weight", k)))
-        return actor_sd[f"mlp.{last_idx}.weight"].shape[0]
+        return _last_mlp_output_dim(actor_sd)
     for k, v in actor_sd.items():
         if "distribution" in k and isinstance(v, torch.Tensor) and v.ndim == 1:
             return v.shape[0]
@@ -167,12 +180,13 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
 def _rebuild_distillation(
     train_cfg: dict, ckpt: dict, obs_shapes: dict[str, tuple[int, ...]] | None = None
 ) -> dict[str, nn.Module]:
-    """Rebuild a distillation student; the teacher is the training signal, not an export target.
+    """Rebuild a distillation student from its checkpoint.
 
     Args:
         train_cfg: The run's train cfg, holding the ``student`` model cfg and its obs groups.
         ckpt: The checkpoint, holding ``student_state_dict`` with its baked observation normalizer.
-        obs_shapes: ``(channels, height, width)`` of each image group, which a checkpoint does not record.
+        obs_shapes: ``(channels, height, width)`` of each image group, which a checkpoint does not record;
+            optionally ``(dim,)`` of each 1D group, needed when the student has no observation normalizer.
 
     Returns:
         The student under the ``policy`` export name.
@@ -181,24 +195,32 @@ def _rebuild_distillation(
     sd = ckpt["student_state_dict"]
     model_cfg = dict(cfg["student"])
     model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
+    if issubclass(model_class, RNNModel):
+        raise NotImplementedError("Export of recurrent (memory-bearing) students is not supported.")
     dist_cfg = model_cfg.get("distribution_cfg")
     if dist_cfg is not None:
         dist_cfg.setdefault("class_name", _default_distribution(sd))
     groups = cfg["obs_groups"]["student"]
-    images = {g: tuple(obs_shapes[g]) for g in groups if obs_shapes and g in obs_shapes}
+    shapes = {g: tuple(obs_shapes[g]) for g in groups if obs_shapes and g in obs_shapes}
+    images = {g: shape for g, shape in shapes.items() if len(shape) == 3}
     if "cnn_cfg" in model_cfg and not images:
         raise ValueError(f"{model_class.__name__} encodes images: give each image group's (C, H, W) in obs_shapes")
-    if images:
-        if "obs_normalizer._mean" not in sd:
-            raise ValueError("an image student needs its 1D observation normalizer to size its 1D input")
-        obs_dim = sd["obs_normalizer._mean"].shape[-1]
-    else:
-        obs_dim = _first_mlp_input_dim(sd)
     flat = [g for g in groups if g not in images]
-    # only the concatenated 1D dim matters for layer sizes; put it all on the first 1D group
-    obs = {g: torch.zeros(1, obs_dim if g == flat[0] else 0) for g in flat}
+    if all(g in shapes for g in flat):
+        dims = {g: shapes[g][0] for g in flat}
+    else:
+        if not images:
+            total = _first_mlp_input_dim(sd)
+        elif "obs_normalizer._mean" in sd:
+            total = sd["obs_normalizer._mean"].shape[-1]
+        else:
+            raise ValueError("this image student records no 1D input size: give each 1D group's (dim,) in obs_shapes")
+        # only the concatenated 1D dim matters for layer sizes; put it all on the first 1D group
+        dims = {g: total if g == flat[0] else 0 for g in flat}
+    obs = {g: torch.zeros(1, dims[g]) for g in flat}
     obs |= {g: torch.zeros(1, *shape) for g, shape in images.items()}
-    model = model_class(obs, {"student": groups}, "student", _num_actions(sd), **model_cfg)
+    num_actions = _num_actions(sd, has_distribution=dist_cfg is not None)
+    model = model_class(obs, {"student": groups}, "student", num_actions, **model_cfg)
     model.load_state_dict(sd, strict=True)
     return {"policy": model.eval()}
 
@@ -258,7 +280,8 @@ def rebuild_models(
         train_cfg: The run's train cfg.
         ckpt: The loaded checkpoint.
         all_models: Also rebuild the models that are not the policy, where the algorithm has them.
-        obs_shapes: ``(channels, height, width)`` of each image observation group, for image models.
+        obs_shapes: ``(channels, height, width)`` of each image observation group, and optionally ``(dim,)`` of
+            each 1D group, for image students.
     """
     if "backward_map_state_dict" in ckpt:
         return _rebuild_fbcpr(train_cfg, ckpt, all_models)

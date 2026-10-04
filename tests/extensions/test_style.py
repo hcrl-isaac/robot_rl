@@ -63,7 +63,7 @@ class TestDiscriminators:
         policy_states = torch.randn(512, STYLE_DIM)  # far from both experts
         for _ in range(30):
             losses = style.update(policy_states)
-        assert set(losses) == {f"style/{n}_{k}" for n in ("a", "b") for k in ("expert", "policy", "grad_penalty")}
+        assert set(losses) == {f"Style/{n}_{k}" for n in ("a", "b") for k in ("expert", "policy", "grad_penalty")}
         with torch.no_grad():
             a_on_a = style.discriminators[0](style.expert_states[0]).mean()
             a_on_b = style.discriminators[0](style.expert_states[1]).mean()
@@ -161,7 +161,7 @@ class TestMultiStreamPPO:
         assert st.returns.shape == (NUM_STEPS, NUM_ENVS, 3)
         assert st.advantages.shape == (NUM_STEPS, NUM_ENVS, 1)
         loss_dict = ppo.update()
-        assert "style/a_expert" in loss_dict and "Style/b_reward" in loss_dict
+        assert "Style/a_expert" in loss_dict and "Style/b_reward" in loss_dict
         saved = ppo.save()
         assert "style_state_dict" in saved
         ppo2, _ = _build_style_ppo(tmp_path)
@@ -181,3 +181,107 @@ class TestMultiStreamPPO:
         task_adv = ppo.storage.returns[..., :1] - ppo.storage.values[..., :1]
         expected = (task_adv - task_adv.mean()) / (task_adv.std() + 1e-8)
         assert torch.allclose(ppo.storage.advantages, expected, atol=1e-5)
+
+
+class TestGating:
+    """Tests for a stream that pays only inside its gate."""
+
+    @staticmethod
+    def _gated_style(tmp_path: Path) -> StyleDiscriminators:
+        experts = [
+            {"name": "a", "data_path": _write_expert(tmp_path / "ga.pt", 2.0), "gate_group": "flight"},
+            {"name": "b", "data_path": _write_expert(tmp_path / "gb.pt", -2.0)},
+        ]
+        return StyleDiscriminators(STYLE_DIM, {"style": ["style"]}, experts, hidden_dims=[32, 32], batch_size=64)
+
+    @staticmethod
+    def _gated_obs(open_rows: int) -> TensorDict:
+        obs = _obs()
+        gate = torch.zeros(NUM_ENVS, 1)
+        gate[:open_rows] = 1.0
+        obs["flight"] = gate
+        return obs
+
+    def test_reward_is_zero_outside_the_gate(self, tmp_path: Path) -> None:
+        """The gated stream pays only on rows whose gate is open; the ungated one pays everywhere."""
+        style = self._gated_style(tmp_path)
+        style.train()
+        rewards = style.compute_rewards(self._gated_obs(open_rows=4))
+        assert (rewards[4:, 0] == 0).all()
+        assert (rewards[:, 1] != 0).any()
+
+    def test_gate_masks_select_the_open_rows(self, tmp_path: Path) -> None:
+        """``gate_masks`` returns the open rows for a gated expert and None for an ungated one."""
+        style = self._gated_style(tmp_path)
+        masks = style.gate_masks(self._gated_obs(open_rows=4))
+        assert masks[0] is not None and int(masks[0].sum()) == 4
+        assert masks[1] is None
+
+    def test_update_skips_an_expert_with_no_gated_rows(self, tmp_path: Path) -> None:
+        """A closed gate leaves its discriminator untrained rather than training it on states it never pays on."""
+        style = self._gated_style(tmp_path)
+        style.train()
+        before = style.discriminators[0][0].weight.clone()
+        closed = [torch.zeros(64, dtype=torch.bool), None]
+        losses = style.update(torch.randn(64, STYLE_DIM), closed)
+        assert not any(k.startswith("Style/a_") for k in losses)
+        assert torch.equal(style.discriminators[0][0].weight, before)
+
+    def test_schedule_clock_survives_a_round_trip(self, tmp_path: Path) -> None:
+        """The weight ramp continues after a reload instead of restarting."""
+        style = self._gated_style(tmp_path)
+        for _ in range(5):
+            style.compute_rewards(self._gated_obs(open_rows=4))
+        restored = self._gated_style(tmp_path)
+        restored.load_state_dict(style.state_dict())
+        assert restored.update_counter == style.update_counter == 5
+
+
+class TestActorWarmup:
+    """Tests for the warm-up that trains only the value heads."""
+
+    @staticmethod
+    def _warmup_ppo(tmp_path: Path, warmup: int) -> tuple[PPO, TensorDict]:
+        ppo, obs = _build_style_ppo(tmp_path)
+        ppo.actor_warmup_iters = warmup
+        return ppo, obs
+
+    @staticmethod
+    def _rollout(ppo: PPO, obs: TensorDict) -> None:
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(
+                _obs(),
+                torch.randn(NUM_ENVS),
+                torch.zeros(NUM_ENVS, dtype=torch.uint8),
+                {"time_outs": torch.zeros(NUM_ENVS, dtype=torch.bool)},
+            )
+        ppo.compute_returns(obs)
+
+    def test_actor_is_frozen_during_warmup(self, tmp_path: Path) -> None:
+        """The value, mirror and encoder losses do not move the actor while it is warming up."""
+        ppo, obs = self._warmup_ppo(tmp_path, warmup=10)
+        ppo.train_mode()
+        before = [p.clone() for p in ppo.actor.parameters()]
+        self._rollout(ppo, obs)
+        ppo.update()
+        assert all(torch.equal(a, b) for a, b in zip(before, ppo.actor.parameters(), strict=True))
+
+    def test_actor_trains_after_warmup(self, tmp_path: Path) -> None:
+        """Past the warm-up the actor moves again."""
+        ppo, obs = self._warmup_ppo(tmp_path, warmup=0)
+        ppo.train_mode()
+        before = [p.clone() for p in ppo.actor.parameters()]
+        self._rollout(ppo, obs)
+        ppo.update()
+        assert any(not torch.equal(a, b) for a, b in zip(before, ppo.actor.parameters(), strict=True))
+
+    def test_warmup_counter_survives_a_resume(self, tmp_path: Path) -> None:
+        """A resume continues the warm-up instead of freezing the actor again."""
+        ppo, obs = self._warmup_ppo(tmp_path, warmup=10)
+        ppo.train_mode()
+        self._rollout(ppo, obs)
+        ppo.update()
+        restored, _ = self._warmup_ppo(tmp_path, warmup=10)
+        restored.load(ppo.save(), {"actor": True, "critic": True, "iteration": True}, strict=True)
+        assert restored.num_updates_done == ppo.num_updates_done == 1

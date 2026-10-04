@@ -60,7 +60,7 @@ class StyleDiscriminators(nn.Module):
             num_learning_epochs: Passes over the rollout's policy states per update.
             batch_size: Mini-batch size for the discriminator update.
             weight: Global multiplier of every style stream's advantage weight.
-            weight_schedule: Optional schedule of ``weight`` over env steps, as in the RND extension.
+            weight_schedule: Optional schedule of ``weight`` over collection steps, as in the RND extension.
             gate_threshold: When set, a transition gets zero style reward unless at least one normalized
                 discriminator score exceeds it (interface states no expert claims are not penalized).
             reward_clip: Symmetric clip on the normalized style rewards.
@@ -131,8 +131,16 @@ class StyleDiscriminators(nn.Module):
         if self.state_normalization:
             self.state_normalizer.update(self.get_style_state(obs))  # type: ignore[operator]
 
+    def gate_masks(self, obs: TensorDict) -> list[torch.Tensor | None]:
+        """Per-expert row mask of the transitions its stream pays on; ``None`` for an ungated expert."""
+        return [None if group is None else obs[group].reshape(-1) > 0.5 for group in self.gate_groups]
+
     def compute_rewards(self, obs: TensorDict) -> torch.Tensor:
-        """Per-expert style rewards for the current transitions, shape ``(num_envs, num_experts)``."""
+        """Per-expert style rewards for the current transitions, shape ``(num_envs, num_experts)``.
+
+        A reward is a standardized discriminator score, so it is zero-mean over the states a stream pays on and
+        is negative on about half of them; the task stream carries the positive per-step floor.
+        """
         self.update_counter += 1
         if self.weight_scheduler is not None:
             self.weight = self.weight_scheduler(step=self.update_counter, **self.weight_scheduler_params)
@@ -141,36 +149,52 @@ class StyleDiscriminators(nn.Module):
         with torch.no_grad():
             state = self.state_normalizer(self.get_style_state(obs))
             scores = torch.cat([disc(state) for disc in self.discriminators], dim=-1)  # (E, K)
+            gates = self.gate_masks(obs)
             columns = []
             for k, norm in enumerate(self.reward_normalizers):
+                column = scores[:, k : k + 1]
                 if self.reward_normalization:
-                    norm.update(scores[:, k : k + 1])  # type: ignore[operator]
-                columns.append(norm(scores[:, k : k + 1]))
+                    # only the rows the stream pays on: normalizing over the whole batch leaves the in-gate
+                    # reward a non-zero mean the gated critic reads as a regime signal
+                    rows = column if gates[k] is None else column[gates[k]]
+                    if rows.numel():
+                        norm.update(rows)  # type: ignore[operator]
+                columns.append(norm(column))
             rewards = torch.cat(columns, dim=-1).clamp(-self.reward_clip, self.reward_clip)
-            for k, group in enumerate(self.gate_groups):
+            for k, gate in enumerate(gates):
                 # an expert that describes a transient regime (e.g. free flight) must not pay outside it
-                if group is not None:
-                    rewards[:, k : k + 1] = rewards[:, k : k + 1] * obs[group].reshape(-1, 1)
+                if gate is not None:
+                    rewards[:, k : k + 1] = rewards[:, k : k + 1] * gate.reshape(-1, 1).float()
             if self.gate_threshold is not None:
                 # no discriminator claims the transition: it is an interface state, not a style violation
                 rewards = rewards * (rewards.max(dim=-1, keepdim=True).values > self.gate_threshold).float()
         return rewards
 
-    def update(self, policy_states: torch.Tensor) -> dict[str, float]:
-        """Train every discriminator against the rollout's policy states with WGAN-GP; returns mean losses."""
+    def update(self, policy_states: torch.Tensor, gates: list[torch.Tensor | None] | None = None) -> dict[str, float]:
+        """Train every discriminator against the rollout's policy states with WGAN-GP; returns mean losses.
+
+        Args:
+            policy_states: ``(N, style_dim)`` style states of the rollout.
+            gates: Per-expert row mask from :meth:`gate_masks`; a gated expert trains only on its own rows,
+                since states it never pays on are not states it should score.
+        """
         losses: dict[str, float] = {}
-        num = policy_states.shape[0]
-        batch = min(self.batch_size, num)
-        num_batches = max(1, num // batch)
         with torch.no_grad():
             policy_states = self.state_normalizer(policy_states)
         for k, (disc, expert) in enumerate(zip(self.discriminators, self.expert_states, strict=True)):
+            gate = None if gates is None else gates[k]
+            states = policy_states if gate is None else policy_states[gate]
+            num = states.shape[0]
+            if num == 0:
+                continue
+            batch = min(self.batch_size, num)
+            num_batches = max(1, num // batch)
             sums = {"expert": 0.0, "policy": 0.0, "grad_penalty": 0.0}
             count = 0
             for _ in range(self.num_learning_epochs):
                 perm = torch.randperm(num, device=self.device)
                 for b in range(num_batches):
-                    pol = policy_states[perm[b * batch : (b + 1) * batch]]
+                    pol = states[perm[b * batch : (b + 1) * batch]]
                     with torch.no_grad():
                         exp = self.state_normalizer(
                             expert[torch.randint(0, expert.shape[0], (pol.shape[0],), device=self.device)]
@@ -187,8 +211,20 @@ class StyleDiscriminators(nn.Module):
                     sums["grad_penalty"] += penalty.item()
                     count += 1
             for key, value in sums.items():
-                losses[f"style/{self.names[k]}_{key}"] = value / max(count, 1)
+                losses[f"Style/{self.names[k]}_{key}"] = value / max(count, 1)
         return losses
+
+    def state_dict(self, *args: Any, **kwargs: Any) -> dict:
+        """Return the module state plus the schedule clock, so a resume continues the weight ramp."""
+        state = super().state_dict(*args, **kwargs)
+        state["update_counter"] = self.update_counter
+        return state
+
+    def load_state_dict(self, state_dict: dict, strict: bool = True) -> Any:
+        """Restore the module state and the schedule clock."""
+        state_dict = dict(state_dict)
+        self.update_counter = int(state_dict.pop("update_counter", 0))
+        return super().load_state_dict(state_dict, strict=strict)
 
     @staticmethod
     def _gradient_penalty(disc: nn.Module, expert: torch.Tensor, policy: torch.Tensor) -> torch.Tensor:

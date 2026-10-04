@@ -265,7 +265,8 @@ class PPO:
 
         # Style rewards are separate streams next to the task reward, not added to it
         if self.style is not None:
-            style_rewards = self.style.compute_rewards(obs)
+            # obs is the next state, which for a done env is the new episode's spawn: it scores nothing here
+            style_rewards = self.style.compute_rewards(obs) * (1.0 - dones.view(-1, 1).float().to(self.device))
             self.transition.rewards = torch.cat([self.transition.rewards.view(-1, 1), style_rewards], dim=-1)
 
         # Bootstrapping on time outs
@@ -327,6 +328,9 @@ class PPO:
             adv = (adv - adv.mean(dim=(0, 1), keepdim=True)) / (adv.std(dim=(0, 1), keepdim=True) + 1e-8)
             weights = torch.ones(self.num_reward_streams, device=adv.device)
             weights[1:] = self.style.stream_weights.to(adv.device) * self.style.weight  # type: ignore[union-attr]
+            # a stream that paid nothing all rollout (gate never opened) standardizes to unit-variance value
+            # noise, so it would enter the sum at full weight
+            weights[1:] *= (st.rewards[..., 1:].abs().amax(dim=(0, 1)) > 0).float()
             st.advantages = (adv * weights).sum(dim=-1, keepdim=True)
         # Normalize the advantages if per minibatch normalization is not used
         elif not self.normalize_advantage_per_mini_batch:
@@ -483,6 +487,12 @@ class PPO:
                 self.rnd.optimizer.zero_grad()
                 rnd_loss.backward()
 
+            if self.num_updates_done < self.actor_warmup_iters:
+                # the value, mirror and encoder-penalty losses all reach the actor: freeze it outright
+                for param in self.actor.parameters():
+                    if param.grad is not None:
+                        param.grad.zero_()
+
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
                 self.reduce_parameters()
@@ -519,7 +529,13 @@ class PPO:
         num_updates = self.num_learning_epochs * self.num_mini_batches
 
         # Adapt the LR once per iteration
-        if self.desired_kl is not None and self.schedule == "adaptive" and self.adaptive_lr_once_per_iteration:
+        warming_up = self.num_updates_done < self.actor_warmup_iters
+        if (
+            not warming_up
+            and self.desired_kl is not None
+            and self.schedule == "adaptive"
+            and self.adaptive_lr_once_per_iteration
+        ):
             mean_kl_iter = sum_kl / num_updates
             if self.gpu_global_rank == 0:
                 if mean_kl_iter > self.desired_kl * 2.0:
@@ -568,8 +584,9 @@ class PPO:
 
         # Train the style discriminators on this rollout's policy states before the storage is cleared
         if self.style is not None:
-            policy_states = self.style.get_style_state(self.storage.observations.flatten(0, 1)).to(self.device)
-            loss_dict.update(self.style.update(policy_states))
+            flat_obs = self.storage.observations.flatten(0, 1)
+            policy_states = self.style.get_style_state(flat_obs).to(self.device)
+            loss_dict.update(self.style.update(policy_states, self.style.gate_masks(flat_obs)))
             for k, name in enumerate(self.style.names):
                 loss_dict[f"Style/{name}_reward"] = self.storage.rewards[..., 1 + k].mean().item()
             loss_dict["Style/weight"] = self.style.weight
@@ -686,6 +703,8 @@ class PPO:
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
+        # the actor warm-up counts updates, so a resume must not restart the freeze
+        saved_dict["num_updates_done"] = self.num_updates_done
         if self.style is not None:
             saved_dict["style_state_dict"] = self.style.state_dict()
             saved_dict["style_optimizer_state_dict"] = self.style.optimizer.state_dict()
@@ -702,6 +721,7 @@ class PPO:
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
+                "style": True,
             }
 
         # Load the specified models
@@ -723,7 +743,9 @@ class PPO:
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
-        if self.style is not None and "style_state_dict" in loaded_dict:
+        if load_cfg.get("iteration", False):
+            self.num_updates_done = int(loaded_dict.get("num_updates_done", 0))
+        if load_cfg.get("style", True) and self.style is not None and "style_state_dict" in loaded_dict:
             self.style.load_state_dict(loaded_dict["style_state_dict"], strict=strict)
             if load_cfg.get("optimizer") and "style_optimizer_state_dict" in loaded_dict:
                 self.style.optimizer.load_state_dict(loaded_dict["style_optimizer_state_dict"])

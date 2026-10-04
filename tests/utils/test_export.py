@@ -7,12 +7,12 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 from pathlib import Path
 from torch import nn
 from typing import ClassVar
 
-import numpy as np
 import onnx
 import pytest
 
@@ -199,7 +199,7 @@ def test_rebuild_distillation_matches_the_student() -> None:
 
 
 def _image_student(rnn_type: str) -> tuple[nn.Module, dict, dict]:
-    """A CNN-RNN vMF student over a proprioceptive group and a 4-frame depth image, with fitted normalizer stats."""
+    """Build a CNN-RNN vMF student over a proprioceptive group and a 4-frame depth image, with fitted stats."""
     from tensordict import TensorDict
 
     from robot_rl.models import CNNRNNModel
@@ -225,6 +225,7 @@ def _image_student(rnn_type: str) -> tuple[nn.Module, dict, dict]:
 
 
 def _steps(seed: int = 0, count: int = 5) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Return a short episode of random ``(proprioception, image)`` observations."""
     generator = torch.Generator().manual_seed(seed)
     return [
         (torch.randn(1, 7, generator=generator), torch.rand(1, 4, 12, 20, generator=generator)) for _ in range(count)
@@ -234,8 +235,9 @@ def _steps(seed: int = 0, count: int = 5) -> list[tuple[torch.Tensor, torch.Tens
 @pytest.mark.parametrize("rnn_type", ["gru", "lstm"])
 def test_an_image_student_exports_to_onnx_with_its_state_threaded_through(tmp_path: Path, rnn_type: str) -> None:
     """The exported student, fed back its own state each step, acts as the trained one does over an episode."""
-    import onnxruntime as ort
     from tensordict import TensorDict
+
+    import onnxruntime as ort
 
     model, train_cfg, ckpt = _image_student(rnn_type)
     policy = rebuild_models(train_cfg, ckpt, obs_shapes={"image": (4, 12, 20)})["policy"]
@@ -257,6 +259,7 @@ def test_an_image_student_exports_to_onnx_with_its_state_threaded_through(tmp_pa
 
 @pytest.mark.parametrize("rnn_type", ["gru", "lstm"])
 def test_an_image_student_exports_to_jit_carrying_its_state(tmp_path: Path, rnn_type: str) -> None:
+    """The scripted student carries its own state, and a reset starts the next episode from zeros."""
     from tensordict import TensorDict
 
     from robot_rl.utils.export import save_jit
@@ -276,13 +279,14 @@ def test_an_image_student_exports_to_jit_carrying_its_state(tmp_path: Path, rnn_
 
 
 def test_an_image_student_needs_its_image_shapes() -> None:
+    """A checkpoint does not record image shapes, so rebuilding without them says what is missing."""
     _, train_cfg, ckpt = _image_student("gru")
     with pytest.raises(ValueError, match="obs_shapes"):
         rebuild_models(train_cfg, ckpt)
 
 
 def _vmf_actor_checkpoint() -> tuple[nn.Module, dict, dict]:
-    """A hyperspherical actor as an off-policy run checkpoints it, with a cfg that does not name its distribution."""
+    """Build a hyperspherical actor checkpoint as an off-policy run writes it, its cfg not naming the distribution."""
     from robot_rl.models import MLPModel
     from tests.conftest import make_obs
 
@@ -318,6 +322,7 @@ def test_a_vmf_actor_is_named_by_its_checkpoint_when_the_cfg_is_silent() -> None
 
 
 def test_all_models_says_so_for_a_checkpoint_without_a_single_critic() -> None:
+    """An off-policy checkpoint has no single critic to rebuild, and asking for it names the limit."""
     _, train_cfg, ckpt = _vmf_actor_checkpoint()
     with pytest.raises(NotImplementedError, match="all_models"):
         rebuild_models(train_cfg, ckpt, all_models=True)

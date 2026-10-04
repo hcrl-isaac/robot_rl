@@ -49,7 +49,7 @@ _VMF_PARAM = "distribution.log_kappa"
 
 
 def _default_distribution(sd: dict[str, torch.Tensor]) -> str:
-    """The distribution class a checkpoint's parameters name, for a logged cfg that does not say."""
+    """Return the distribution class a checkpoint's parameters name, for a logged cfg that does not say."""
     return "VonMisesFisherDistribution" if _VMF_PARAM in sd else "GaussianDistribution"
 
 

@@ -203,7 +203,7 @@ class _CNNRNNExport(nn.Module):
         self.obs_channels_2d = list(model.obs_channels_2d)
 
     def features(self, obs_1d: torch.Tensor, obs_2d: list[torch.Tensor]) -> torch.Tensor:
-        """The recurrent input: normalized 1D observations, then each image group's CNN encoding."""
+        """Build the recurrent input: normalized 1D observations, then each image group's CNN encoding."""
         latents: list[torch.Tensor] = []
         if self.has_1d:
             latents.append(self.obs_normalizer(obs_1d))
@@ -212,11 +212,11 @@ class _CNNRNNExport(nn.Module):
         return torch.cat(latents, dim=-1)
 
     def head(self, feats: torch.Tensor, rnn_out: torch.Tensor) -> torch.Tensor:
-        """The deterministic action from the current features and the recurrent output."""
+        """Return the deterministic action from the current features and the recurrent output."""
         return self.deterministic_output(self.mlp(torch.cat([feats, rnn_out], dim=-1)))
 
     def dummy_observations(self) -> list[torch.Tensor]:
-        """A zero observation per input, 1D first and then each image group."""
+        """Return a zero observation per input, 1D first and then each image group."""
         images = [torch.zeros(1, c, h, w) for c, (h, w) in zip(self.obs_channels_2d, self.obs_dims_2d, strict=True)]
         return [torch.zeros(1, self.obs_dim_1d), *images]
 
@@ -265,8 +265,10 @@ class _TorchCNNLSTMModel(_CNNRNNExport):
 
 
 class _OnnxCNNRNNModel(_CNNRNNExport):
-    """ONNX export of a CNN-RNN policy: inputs ``obs``, one per image group and the state; outputs the action
-    and the next state. The caller feeds zeros as the first state and each step's output state to the next.
+    """ONNX export of a CNN-RNN policy that takes its recurrent state as an input and returns the next one.
+
+    Inputs are ``obs``, one per image group and the state; outputs are the action and the next state. The
+    caller feeds zeros as the first state and each step's output state to the next.
     """
 
     is_recurrent: bool = True
@@ -287,7 +289,7 @@ class _OnnxCNNRNNModel(_CNNRNNExport):
         return self.head(feats, out.squeeze(0)), h
 
     def get_dummy_inputs(self) -> tuple[torch.Tensor, ...]:
-        """Representative inputs for tracing: zero observations and a zero state."""
+        """Return representative inputs for tracing: zero observations and a zero state."""
         state = torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size)
         return (*self.dummy_observations(), state, *((state.clone(),) if self.is_lstm else ()))
 

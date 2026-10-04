@@ -434,9 +434,11 @@ class FbCpr:
             max_steps: Stop after this many ``env.step`` calls; unscored motions keep NaN.
 
         Returns:
-            ``emd`` and ``joint_error`` of shape ``(num_motions,)``; per-step ``root_error`` (root displacement
-            error from the clip's start [m]) and ``tilt_error`` (angle between the root's and the reference's
-            gravity directions in their own frames [rad], blind to heading), each ``(num_motions, bucket_size - 1)``.
+            emd: Per-motion EMD, shape ``(num_motions,)``.
+            joint_error: Per-motion joint error, shape ``(num_motions,)``.
+            root_error: Per-step root displacement error from the clip's start [m], ``(num_motions, bucket_size - 1)``.
+            tilt_error: Per-step angle between the root's and the reference's gravity directions [rad], blind to
+                heading, ``(num_motions, bucket_size - 1)``.
         """
         print("[INFO] Evaluating motions...")
         self.eval_mode()
@@ -472,13 +474,14 @@ class FbCpr:
             # a recorder may show the clip being tracked on a ghost twin
             publish_ref = getattr(getattr(env, "unwrapped", env), "write_reference_pose", None)
             if publish_ref is not None:
-                ref_root = pad_to_size_repeat(torch.cat([ref["root_pose"], ref["root_velocity"]], dim=-1), env.num_envs)
+                ghost_root = torch.cat([ref["root_pose"], ref["root_velocity"]], dim=-1)
+                ghost_root = pad_to_size_repeat(ghost_root, env.num_envs)
                 ref_joint_pos = pad_to_size_repeat(ref["joint_position"], env.num_envs)
                 ref_joint_vel = pad_to_size_repeat(ref["joint_velocity"], env.num_envs)
             for t in range(rollout_steps):
                 if publish_ref is not None:
                     # frame t+1 is what z targets this step: the pose the robot is asked to reach
-                    publish_ref(ref_root[:, t + 1], ref_joint_pos[:, t + 1], ref_joint_vel[:, t + 1])
+                    publish_ref(ghost_root[:, t + 1], ref_joint_pos[:, t + 1], ref_joint_vel[:, t + 1])
                 actions = pad_to_size(self.actor(self.obs_normalizer(obs), eval_zs[:, t, :]), env.num_envs, dim=0)
                 obs, _, _, _ = env.step(actions.to(env.device))
                 state = buffer.get_expert_state(obs)

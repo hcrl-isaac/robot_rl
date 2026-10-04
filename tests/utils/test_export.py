@@ -166,8 +166,12 @@ def test_rebuilt_encoder_policy_exports_to_onnx(tmp_path: Path) -> None:
 
 
 _STUDENT_DISTRIBUTIONS = {
-    "gaussian": dict(_ACTOR_CFG["distribution_cfg"]),
-    "vmf": {"class_name": "VonMisesFisherDistribution", "init_std": 0.5},
+    "Gaussian": dict(_ACTOR_CFG["distribution_cfg"]),
+    "HeteroscedasticGaussian": {"class_name": "HeteroscedasticGaussianDistribution"},
+    "TruncatedGaussian": {"class_name": "TruncatedGaussianDistribution"},
+    "Beta": {"class_name": "BetaDistribution"},
+    "VonMisesFisher": {"class_name": "VonMisesFisherDistribution", "init_std": 0.5},
+    "SquashedTanhGaussian": {"class_name": "SquashedTanhGaussianDistribution"},
     "none": None,
 }
 
@@ -294,7 +298,7 @@ def test_an_image_student_needs_its_image_shapes() -> None:
 
 
 def _vmf_actor_checkpoint() -> tuple[nn.Module, dict, dict]:
-    """Build a hyperspherical actor checkpoint as an off-policy run writes it, its cfg not naming the distribution."""
+    """Build a hyperspherical actor checkpoint as an off-policy run writes it."""
     from robot_rl.models import MLPModel
     from tests.conftest import make_obs
 
@@ -308,14 +312,18 @@ def _vmf_actor_checkpoint() -> tuple[nn.Module, dict, dict]:
         distribution_cfg={"class_name": "VonMisesFisherDistribution", "init_std": 0.05},
     ).eval()
     train_cfg = {
-        "actor": {"class_name": "MLPModel", "hidden_dims": [32, 32], "distribution_cfg": {"init_std": 0.05}},
+        "actor": {
+            "class_name": "MLPModel",
+            "hidden_dims": [32, 32],
+            "distribution_cfg": {"class_name": "VonMisesFisherDistribution", "init_std": 0.05},
+        },
         "obs_groups": {"actor": ["policy"]},
         "algorithm": {},
     }
     return actor, train_cfg, {"actor_state_dict": actor.state_dict()}
 
 
-def test_a_vmf_actor_is_named_by_its_checkpoint_when_the_cfg_is_silent() -> None:
+def test_a_vmf_actor_rebuilds_with_its_unit_mean_direction() -> None:
     """The rebuilt actor acts with the unit mean direction the trained one does, not a Gaussian mean."""
     from tests.conftest import make_obs
 
@@ -396,3 +404,35 @@ def test_an_image_group_cannot_take_an_export_input_name() -> None:
     model.cnns = nn.ModuleDict({"h_in": model.cnns["image"]})
     with pytest.raises(ValueError, match="h_in"):
         model.as_onnx()
+
+
+def test_rebuild_requires_the_distribution_class_name() -> None:
+    """A logged distribution cfg must name its class; the export does not guess it."""
+    student_cfg = {
+        "class_name": "MLPModel",
+        "hidden_dims": [32, 32],
+        "distribution_cfg": {"class_name": "BetaDistribution"},
+    }
+    train_cfg, ckpt, _, _ = _distillation_checkpoint(student_cfg)
+    del train_cfg["student"]["distribution_cfg"]["class_name"]
+    with pytest.raises(ValueError, match="class_name"):
+        rebuild_models(train_cfg, ckpt)
+
+
+@pytest.mark.parametrize("distribution", ["TruncatedGaussian", "SquashedTanhGaussian"])
+def test_fuse_model_reports_its_output_width(distribution: str) -> None:
+    """A fused actor's action width reads from its ``trunk`` head, as the FB-CPR rebuild sizes it."""
+    from robot_rl.models import ResidualFuseModel
+    from robot_rl.utils.export import _num_actions
+    from tests.conftest import make_obs
+
+    num_actions, z_dim = 6, 8
+    obs = make_obs(2, 10)
+    model_cfg = {
+        "hidden_dims": [32, 32],
+        "embedding_dims": [16, 16],
+        "distribution_cfg": dict(_STUDENT_DISTRIBUTIONS[distribution]),
+    }
+    actor = ResidualFuseModel(obs, {"actor": ["policy"]}, "actor", (z_dim, 0), num_actions, **copy.deepcopy(model_cfg))
+    logged = {"class_name": "ResidualFuseModel", **model_cfg}
+    assert _num_actions(logged, actor.state_dict()) == num_actions

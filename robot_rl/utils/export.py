@@ -14,6 +14,7 @@ import torch.nn as nn
 
 from robot_rl.models.inference import EncoderInferencePolicy
 from robot_rl.models.rnn_model import RNNModel
+from robot_rl.modules.distribution import Distribution
 from robot_rl.utils.utils import resolve_callable
 
 DEFAULT_ONNX_OPSET = 18
@@ -46,36 +47,24 @@ def _group_dims(nsd: dict[str, torch.Tensor]) -> dict[str, int]:
     return dims
 
 
-_VMF_PARAM = "distribution.log_kappa"
+def _distribution_class(dist_cfg: dict) -> type[Distribution]:
+    """Return the distribution class a logged ``distribution_cfg`` names."""
+    if "class_name" not in dist_cfg:
+        raise ValueError("The logged distribution_cfg has no 'class_name'; it must name its distribution class.")
+    return resolve_callable(dist_cfg["class_name"])
 
 
-def _default_distribution(sd: dict[str, torch.Tensor]) -> str:
-    """Return the distribution class a checkpoint's parameters name, for a logged cfg that does not say."""
-    return "VonMisesFisherDistribution" if _VMF_PARAM in sd else "GaussianDistribution"
-
-
-def _last_mlp_output_dim(sd: dict[str, torch.Tensor]) -> int:
-    """Width of a model's last MLP layer, i.e. its raw output."""
-    idxs = [int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k))]
-    if not idxs:
-        raise ValueError("Cannot infer num_actions from the actor state dict (no mlp.N.weight layer).")
-    return sd[f"mlp.{max(idxs)}.weight"].shape[0]
-
-
-def _num_actions(actor_sd: dict[str, torch.Tensor], has_distribution: bool = True) -> int:
-    """Infer the action dimension from the distribution's per-action parameter vector.
+def _num_actions(model_cfg: dict, sd: dict[str, torch.Tensor], default_class: str = "MLPModel") -> int:
+    """Return a model's action dimension from its head width and its distribution's input layout.
 
     Args:
-        actor_sd: The actor or student state dict.
-        has_distribution: Whether the model has an action distribution; without one the output layer is the action.
+        model_cfg: The logged model cfg, naming its class and its distribution.
+        sd: The model's state dict.
+        default_class: Model class when the cfg names none.
     """
-    if _VMF_PARAM in actor_sd or not has_distribution:
-        # a vMF's spread is one scalar; its action is the MLP's output direction itself
-        return _last_mlp_output_dim(actor_sd)
-    for k, v in actor_sd.items():
-        if "distribution" in k and isinstance(v, torch.Tensor) and v.ndim == 1:
-            return v.shape[0]
-    raise ValueError("Cannot infer num_actions from the actor state dict (no 1-D distribution parameter).")
+    width = resolve_callable(model_cfg.get("class_name", default_class)).head_output_width(sd)
+    dist_cfg = model_cfg.get("distribution_cfg")
+    return width if dist_cfg is None else _distribution_class(dist_cfg).output_dim_for_input_width(width)
 
 
 def _extend_bn_identity(bn: nn.BatchNorm1d, extra_dims: int) -> nn.BatchNorm1d:
@@ -141,9 +130,6 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
     ) -> nn.Module:
         model_cfg = dict(model_cfg)
         model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
-        dist_cfg = model_cfg.get("distribution_cfg")
-        if dist_cfg is not None:
-            dist_cfg.setdefault("class_name", _default_distribution(sd))
         obs_dim = _first_mlp_input_dim(sd) - sum(other_dims)
         groups = cfg["obs_groups"][obs_set]
         # only the concatenated dim matters for layer sizes; put it all on the first group
@@ -165,7 +151,7 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
             raise ValueError("The train cfg configures an encoder but the checkpoint has no 'encoder_state_dict'.")
         encoder = build_from_groups(encoder_cfg["model"], ckpt["encoder_state_dict"], "encoder", latent_dim, ())
 
-    models["policy"] = build("policy", "actor_state_dict", _num_actions(ckpt["actor_state_dict"]))
+    models["policy"] = build("policy", "actor_state_dict", _num_actions(cfg["actor"], ckpt["actor_state_dict"]))
     if all_models:
         if "critic_state_dict" not in ckpt:
             # SAC checkpoints a pair of fused critics, whose constructor this builder does not fit
@@ -197,9 +183,6 @@ def _rebuild_distillation(
     model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
     if issubclass(model_class, RNNModel):
         raise NotImplementedError("Export of recurrent (memory-bearing) students is not supported.")
-    dist_cfg = model_cfg.get("distribution_cfg")
-    if dist_cfg is not None:
-        dist_cfg.setdefault("class_name", _default_distribution(sd))
     groups = cfg["obs_groups"]["student"]
     shapes = {g: tuple(obs_shapes[g]) for g in groups if obs_shapes and g in obs_shapes}
     images = {g: shape for g, shape in shapes.items() if len(shape) == 3}
@@ -219,7 +202,7 @@ def _rebuild_distillation(
         dims = {g: total if g == flat[0] else 0 for g in flat}
     obs = {g: torch.zeros(1, dims[g]) for g in flat}
     obs |= {g: torch.zeros(1, *shape) for g, shape in images.items()}
-    num_actions = _num_actions(sd, has_distribution=dist_cfg is not None)
+    num_actions = _num_actions(cfg["student"], sd)
     model = model_class(obs, {"student": groups}, "student", num_actions, **model_cfg)
     model.load_state_dict(sd, strict=True)
     return {"policy": model.eval()}
@@ -240,7 +223,8 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
     cfg = copy.deepcopy(train_cfg)
     nsd = ckpt["obs_normalizer_state_dict"]
     obs = {group: torch.zeros(1, dim) for group, dim in _group_dims(nsd).items()}
-    dims = {"z_dim": cfg["algorithm"]["z_dim"], "num_actions": _num_actions(ckpt["actor_state_dict"])}
+    num_actions = _num_actions(cfg["actor"], ckpt["actor_state_dict"], default_class=_FBCPR_MODELS["policy"][2])
+    dims = {"z_dim": cfg["algorithm"]["z_dim"], "num_actions": num_actions}
 
     def build(name: str) -> nn.Module:
         cfg_key, obs_set, default_class, out_spec, other_spec = _FBCPR_MODELS[name]
@@ -248,7 +232,6 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
         model_class = resolve_callable(model_cfg.pop("class_name", default_class))
         dist_cfg = model_cfg.get("distribution_cfg")
         if dist_cfg is not None:
-            dist_cfg.setdefault("class_name", "TruncatedGaussianDistribution")
             dist_cfg.setdefault("low", -cfg["clip_actions"])
             dist_cfg.setdefault("high", cfg["clip_actions"])
         out_dim = dims[out_spec] if isinstance(out_spec, str) else out_spec

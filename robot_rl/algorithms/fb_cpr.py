@@ -31,6 +31,22 @@ def _up_axis(quat_wxyz: torch.Tensor) -> torch.Tensor:
     return torch.stack((2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)), dim=-1)
 
 
+def _expert_storage_device(cfg: dict, device: str) -> str | None:
+    """Return the device that holds the expert motions.
+
+    Args:
+        cfg: The runner cfg, with ``storage_device`` and ``algorithm.expert_storage_device``.
+        device: The runner's device.
+
+    Returns:
+        ``expert_storage_device``, or ``storage_device`` when it is unset. A bare ``"cuda"`` names the runner's GPU.
+    """
+    expert_device = cfg["algorithm"].get("expert_storage_device") or cfg["storage_device"]
+    if expert_device == "cuda" and torch.device(device).type == "cuda":
+        return str(device)
+    return expert_device
+
+
 class FbCpr:
     """Forward-Backward representations with Conditional Policy Regularization (FB-CPR) algorithm.
 
@@ -727,7 +743,7 @@ class FbCpr:
             cfg["storage_device"],
         )
         # A large corpus can exceed VRAM on its own, so it is placed independently of the replay buffer.
-        expert_device = cfg["algorithm"].get("expert_storage_device") or cfg["storage_device"]
+        expert_device = _expert_storage_device(cfg, device)
         expert_buffer = (
             TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], expert_device)
             if not inference

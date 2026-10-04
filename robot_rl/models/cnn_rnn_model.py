@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
@@ -168,13 +169,155 @@ class CNNRNNModel(CNNModel):
         self.rnn.detach_hidden_state(dones)
 
     def as_jit(self) -> nn.Module:
-        """Not supported yet: the recurrent export wrappers assume 1D inputs."""
-        raise NotImplementedError("CNNRNNModel export is not implemented yet")
+        """Return a TorchScript-ready copy that carries its recurrent state between calls."""
+        if isinstance(self.rnn.rnn, nn.LSTM):
+            return _TorchCNNLSTMModel(self)
+        return _TorchCNNGRUModel(self)
 
     def as_onnx(self, verbose: bool = False) -> nn.Module:
-        """Not supported yet: the recurrent export wrappers assume 1D inputs."""
-        raise NotImplementedError("CNNRNNModel export is not implemented yet")
+        """Return an ONNX-ready copy that takes its recurrent state as an input and returns the next one."""
+        return _OnnxCNNRNNModel(self, verbose)
 
     def _get_latent_dim(self) -> int:
         """Size the head for the feature concat plus the recurrent state."""
         return super()._get_latent_dim() + self.rnn_hidden_dim
+
+
+class _CNNRNNExport(nn.Module):
+    """The deterministic CNN-RNN policy, cut loose from its training wrappers.
+
+    Exports run one environment at a time: the recurrent state has batch size 1.
+    """
+
+    def __init__(self, model: CNNRNNModel) -> None:
+        super().__init__()
+        cls = type(model)
+        if cls._features is not CNNRNNModel._features or cls._head_input is not CNNRNNModel._head_input:
+            raise NotImplementedError(
+                f"{cls.__name__} changes the features or the head input; its export is not built."
+            )
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.cnns = nn.ModuleList([copy.deepcopy(model.cnns[g]) for g in model.obs_groups_2d])
+        self.rnn = copy.deepcopy(model.rnn.rnn)
+        self.mlp = copy.deepcopy(model.mlp)
+        if model.distribution is not None:
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+        self.has_1d = bool(model.obs_groups)
+        self.obs_dim_1d = model.obs_dim
+        self.obs_groups_2d = list(model.obs_groups_2d)
+        self.obs_dims_2d = [tuple(d) for d in model.obs_dims_2d]
+        self.obs_channels_2d = list(model.obs_channels_2d)
+
+    def features(self, obs_1d: torch.Tensor, obs_2d: list[torch.Tensor]) -> torch.Tensor:
+        """Build the recurrent input: normalized 1D observations, then each image group's CNN encoding."""
+        latents: list[torch.Tensor] = []
+        if self.has_1d:
+            latents.append(self.obs_normalizer(obs_1d))
+        for i, cnn in enumerate(self.cnns):
+            latents.append(cnn(obs_2d[i]))
+        return torch.cat(latents, dim=-1)
+
+    def head(self, feats: torch.Tensor, rnn_out: torch.Tensor) -> torch.Tensor:
+        """Return the deterministic action from the current features and the recurrent output."""
+        return self.deterministic_output(self.mlp(torch.cat([feats, rnn_out], dim=-1)))
+
+    def dummy_observations(self) -> list[torch.Tensor]:
+        """Return a zero observation per input, 1D first and then each image group."""
+        images = [torch.zeros(1, c, h, w) for c, (h, w) in zip(self.obs_channels_2d, self.obs_dims_2d, strict=True)]
+        return [torch.zeros(1, self.obs_dim_1d), *images]
+
+
+class _TorchCNNGRUModel(_CNNRNNExport):
+    """TorchScript export of a GRU CNN-RNN policy; ``reset()`` clears the state it carries.
+
+    Called as ``forward(obs_1d, obs_2d)`` with ``obs_2d`` a list of one image tensor per image group, in the
+    model's group order. ``obs_1d`` is always passed, and is ignored by a model without 1D groups.
+    """
+
+    def __init__(self, model: CNNRNNModel) -> None:
+        super().__init__(model)
+        self.register_buffer("hidden_state", torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size))
+
+    def forward(self, obs_1d: torch.Tensor, obs_2d: list[torch.Tensor]) -> torch.Tensor:
+        """One step: act on this observation and carry the updated state to the next call."""
+        feats = self.features(obs_1d, obs_2d)
+        out, h = self.rnn(feats.unsqueeze(0), self.hidden_state)
+        self.hidden_state[:] = h
+        return self.head(feats, out.squeeze(0))
+
+    @torch.jit.export
+    def reset(self) -> None:
+        """Zero the recurrent state, as an episode start does in training."""
+        self.hidden_state[:] = 0.0
+
+
+class _TorchCNNLSTMModel(_CNNRNNExport):
+    """TorchScript export of an LSTM CNN-RNN policy; ``reset()`` clears the state it carries.
+
+    Called as ``forward(obs_1d, obs_2d)`` with ``obs_2d`` a list of one image tensor per image group, in the
+    model's group order. ``obs_1d`` is always passed, and is ignored by a model without 1D groups.
+    """
+
+    def __init__(self, model: CNNRNNModel) -> None:
+        super().__init__(model)
+        self.register_buffer("hidden_state", torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size))
+        self.register_buffer("cell_state", torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size))
+
+    def forward(self, obs_1d: torch.Tensor, obs_2d: list[torch.Tensor]) -> torch.Tensor:
+        """One step: act on this observation and carry the updated state to the next call."""
+        feats = self.features(obs_1d, obs_2d)
+        out, (h, c) = self.rnn(feats.unsqueeze(0), (self.hidden_state, self.cell_state))
+        self.hidden_state[:] = h
+        self.cell_state[:] = c
+        return self.head(feats, out.squeeze(0))
+
+    @torch.jit.export
+    def reset(self) -> None:
+        """Zero the recurrent state, as an episode start does in training."""
+        self.hidden_state[:] = 0.0
+        self.cell_state[:] = 0.0
+
+
+class _OnnxCNNRNNModel(_CNNRNNExport):
+    """ONNX export of a CNN-RNN policy that takes its recurrent state as an input and returns the next one.
+
+    Inputs are ``obs``, one per image group under the group's own name, and the state ``h_in`` (``c_in``); outputs
+    are the action and the next state. The caller feeds zeros first, then each step's output state.
+    """
+
+    is_recurrent: bool = True
+
+    def __init__(self, model: CNNRNNModel, verbose: bool) -> None:
+        super().__init__(model)
+        self.verbose = verbose
+        self.is_lstm = isinstance(self.rnn, nn.LSTM)
+        reserved = {"obs", "h_in", "c_in"} & set(self.obs_groups_2d)
+        if reserved:
+            raise ValueError(f"Image groups named {sorted(reserved)} collide with the export's own input names.")
+
+    def forward(self, obs: torch.Tensor, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """One step from the given state; returns the action and the state after it."""
+        images = list(inputs[: len(self.cnns)])
+        feats = self.features(obs, images)
+        if self.is_lstm:
+            out, (h, c) = self.rnn(feats.unsqueeze(0), (inputs[len(self.cnns)], inputs[len(self.cnns) + 1]))
+            return self.head(feats, out.squeeze(0)), h, c
+        out, h = self.rnn(feats.unsqueeze(0), inputs[len(self.cnns)])
+        return self.head(feats, out.squeeze(0)), h
+
+    def get_dummy_inputs(self) -> tuple[torch.Tensor, ...]:
+        """Return representative inputs for tracing: zero observations and a zero state."""
+        state = torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size)
+        return (*self.dummy_observations(), state, *((state.clone(),) if self.is_lstm else ()))
+
+    @property
+    def input_names(self) -> list[str]:
+        """ONNX input names: ``obs``, the image groups', then ``h_in`` (and ``c_in``)."""
+        return ["obs", *self.obs_groups_2d, "h_in", *(["c_in"] if self.is_lstm else [])]
+
+    @property
+    def output_names(self) -> list[str]:
+        """ONNX output names: ``actions``, then ``h_out`` (and ``c_out``)."""
+        return ["actions", "h_out", *(["c_out"] if self.is_lstm else [])]

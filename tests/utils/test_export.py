@@ -18,6 +18,7 @@ import pytest
 
 from robot_rl.models import EncoderInferencePolicy
 from robot_rl.utils.export import rebuild_models, save_onnx
+from robot_rl.utils.utils import resolve_callable
 from tests.algorithms.test_ppo import (
     LATENT_DIM,
     NUM_ENVS,
@@ -209,3 +210,88 @@ def test_a_squashed_tanh_actor_keeps_the_bounds_its_cfg_gives() -> None:
     policy = rebuild_models(*_fbcpr_actor_checkpoint(dumped))["policy"]
     saturated = policy.distribution.deterministic_output(torch.tensor([-50.0, 50.0]))
     torch.testing.assert_close(saturated, torch.tensor([-1.0, 1.0]))
+
+
+_STUDENT_DISTRIBUTIONS = {
+    "Gaussian": dict(_ACTOR_CFG["distribution_cfg"]),
+    "HeteroscedasticGaussian": {"class_name": "HeteroscedasticGaussianDistribution"},
+    "TruncatedGaussian": {"class_name": "TruncatedGaussianDistribution"},
+    "Beta": {"class_name": "BetaDistribution"},
+    "VonMisesFisher": {"class_name": "VonMisesFisherDistribution", "init_std": 0.5},
+    "SquashedTanhGaussian": {"class_name": "SquashedTanhGaussianDistribution"},
+    "none": None,
+}
+
+
+def _distillation_checkpoint(student_cfg: dict, num_actions: int = 4) -> tuple[dict, dict, object, object]:
+    """Train-cfg subset, checkpoint, observations and algorithm of a fresh distillation run."""
+    from robot_rl.algorithms.distillation import Distillation
+    from robot_rl.models import MLPModel
+    from robot_rl.storage import RolloutStorage
+    from tests.conftest import make_obs
+
+    num_envs, obs_dim = 4, 8
+    obs = make_obs(num_envs, obs_dim)
+    obs_groups = {"student": ["policy"], "teacher": ["policy"]}
+    model_cfg = {k: copy.deepcopy(v) for k, v in student_cfg.items() if k != "class_name"}
+    student = resolve_callable(student_cfg["class_name"])(obs, obs_groups, "student", num_actions, **model_cfg)
+    teacher = MLPModel(obs, obs_groups, "teacher", num_actions, hidden_dims=[32, 32])
+    alg = Distillation(student, teacher, RolloutStorage("distillation", num_envs, 4, obs, [num_actions]))
+    alg.eval_mode()
+    train_cfg = {"student": student_cfg, "obs_groups": obs_groups, "algorithm": {}}
+    return train_cfg, alg.save(), obs, alg
+
+
+@pytest.mark.parametrize("distribution", list(_STUDENT_DISTRIBUTIONS))
+def test_rebuild_distillation_matches_the_student(distribution: str) -> None:
+    """Rebuild a distillation student from its checkpoint."""
+    student_cfg = {"class_name": "MLPModel", "hidden_dims": [32, 32]}
+    if _STUDENT_DISTRIBUTIONS[distribution] is not None:
+        student_cfg["distribution_cfg"] = dict(_STUDENT_DISTRIBUTIONS[distribution])
+    train_cfg, ckpt, obs, alg = _distillation_checkpoint(student_cfg)
+
+    policy = rebuild_models(train_cfg, ckpt)["policy"]
+    with torch.inference_mode():
+        expected = alg.student(obs, stochastic_output=False)
+        actual = policy(obs, stochastic_output=False)
+    torch.testing.assert_close(expected, actual)
+
+
+def test_rebuild_distillation_rejects_a_recurrent_student() -> None:
+    """A recurrent 1D student raises instead of failing on a state-dict size mismatch."""
+    student_cfg = {"class_name": "RNNModel", "hidden_dims": [32, 32], "rnn_hidden_dim": 16, "rnn_type": "gru"}
+    train_cfg, ckpt, _, _ = _distillation_checkpoint(student_cfg)
+    with pytest.raises(NotImplementedError, match="recurrent"):
+        rebuild_models(train_cfg, ckpt)
+
+
+def test_rebuild_requires_the_distribution_class_name() -> None:
+    """A logged distribution cfg must name its class; the export does not guess it."""
+    student_cfg = {
+        "class_name": "MLPModel",
+        "hidden_dims": [32, 32],
+        "distribution_cfg": {"class_name": "BetaDistribution"},
+    }
+    train_cfg, ckpt, _, _ = _distillation_checkpoint(student_cfg)
+    del train_cfg["student"]["distribution_cfg"]["class_name"]
+    with pytest.raises(ValueError, match="class_name"):
+        rebuild_models(train_cfg, ckpt)
+
+
+@pytest.mark.parametrize("distribution", ["TruncatedGaussian", "SquashedTanhGaussian"])
+def test_fuse_model_reports_its_output_width(distribution: str) -> None:
+    """A fused actor's action width reads from its ``trunk`` head, as the FB-CPR rebuild sizes it."""
+    from robot_rl.models import ResidualFuseModel
+    from robot_rl.utils.export import _num_actions
+    from tests.conftest import make_obs
+
+    num_actions, z_dim = 6, 8
+    obs = make_obs(2, 10)
+    model_cfg = {
+        "hidden_dims": [32, 32],
+        "embedding_dims": [16, 16],
+        "distribution_cfg": dict(_STUDENT_DISTRIBUTIONS[distribution]),
+    }
+    actor = ResidualFuseModel(obs, {"actor": ["policy"]}, "actor", (z_dim, 0), num_actions, **copy.deepcopy(model_cfg))
+    logged = {"class_name": "ResidualFuseModel", **model_cfg}
+    assert _num_actions(logged, actor.state_dict()) == num_actions

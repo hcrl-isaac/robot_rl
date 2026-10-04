@@ -132,6 +132,10 @@ class Distribution(nn.Module):
         """
         raise NotImplementedError
 
+    def export_std(self) -> torch.Tensor | None:
+        """Return the input-independent std of a plain Gaussian for export, or ``None`` for any other distribution."""
+        return None
+
     def init_mlp_weights(self, mlp: nn.Module) -> None:
         """Initialize distribution-specific weights in the MLP.
 
@@ -195,15 +199,19 @@ class GaussianDistribution(Distribution):
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
 
+    def _clamped_std(self) -> torch.Tensor:
+        """Return the std parameter clamped to its configured range."""
+        if self.std_type == "scalar":
+            return self.std_param.clamp(self.std_range[0], self.std_range[1])
+        return torch.exp(self.log_std_param.clamp(self.log_std_range[0], self.log_std_range[1]))
+
     def update(self, mlp_output: torch.Tensor) -> None:
         """Update the Gaussian distribution from MLP output."""
-        mean = mlp_output
-        if self.std_type == "scalar":
-            std = self.std_param.clamp(self.std_range[0], self.std_range[1])
-        elif self.std_type == "log":
-            log_std = self.log_std_param.clamp(self.log_std_range[0], self.log_std_range[1])
-            std = torch.exp(log_std)
-        self._distribution = Normal(mean, std)
+        self._distribution = Normal(mlp_output, self._clamped_std())
+
+    def export_std(self) -> torch.Tensor | None:
+        """Return the clamped std as a detached constant for export."""
+        return self._clamped_std().detach().clone()
 
     def sample(self, **kwargs: Any) -> torch.Tensor:
         """Sample from the Gaussian distribution."""
@@ -310,6 +318,10 @@ class HeteroscedasticGaussianDistribution(GaussianDistribution):
             std = torch.exp(log_std)
         self._distribution = Normal(mean, std)
 
+    def export_std(self) -> torch.Tensor | None:
+        """Return ``None``: the std is state-dependent, so it cannot be exported as a constant."""
+        return None
+
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Extract the mean from the MLP output (first slice of the second-to-last dimension)."""
         return mlp_output[..., 0, :]
@@ -397,6 +409,10 @@ class TruncatedGaussianDistribution(GaussianDistribution):
         elif self.std_type == "log":
             std = torch.exp(self.log_std_param).expand_as(mean)
         self._distribution = Normal(mean, std)
+
+    def export_std(self) -> torch.Tensor | None:
+        """Return ``None``: a truncated Gaussian is not described by ``(mean, std)`` alone."""
+        return None
 
     def sample(self, std_clip: float | None = None) -> torch.Tensor:
         """Sample from the Gaussian distribution.

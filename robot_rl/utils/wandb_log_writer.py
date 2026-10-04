@@ -31,7 +31,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         group: str | None = None,
         num_envs: int = 1,
         shared: bool = False,
-        log_videos_async: bool = False,
+        log_evals_async: bool = False,
         tags: list[str] | None = None,
         entity: str | None = None,
     ) -> None:
@@ -55,8 +55,8 @@ class WandbLogWriter(SummaryWriter, LogWriter):
             settings.x_label = "main"
             settings.mode = "shared"
             settings.x_primary = True
-        if log_videos_async:
-            tags.append("log_videos_async")
+        if log_evals_async:
+            tags.append("log_evals_async")
 
         # Initialize wandb
         self.run = wandb.init(

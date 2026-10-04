@@ -63,27 +63,16 @@ class EncoderInferencePolicy(nn.Module):
 
     is_recurrent: bool = False
 
-    def __init__(
-        self,
-        encoder: nn.Module,
-        actor: MLPModel,
-        zero_latent: bool = False,
-        fuse_latent: bool = False,
-    ) -> None:
+    def __init__(self, encoder: nn.Module, actor: MLPModel) -> None:
         """Wrap the encoder module and the actor consuming its latent.
 
         Args:
             encoder: The shared observation encoder.
             actor: The actor model taking the encoder latent as an extra input.
-            zero_latent: Feed the actor a zero latent instead of the encoder output (blind-degradation eval).
-            fuse_latent: CONCATENATE the latent onto the first extra input rather than passing it as its own
-                (FB-CPR: the actor takes one fused ``[z; c]`` input, so appending would be an arity error).
         """
         super().__init__()
         self.encoder = encoder
         self.actor = actor
-        self.zero_latent = zero_latent
-        self.fuse_latent = fuse_latent
 
     @property
     def output_mean(self) -> torch.Tensor:
@@ -107,13 +96,7 @@ class EncoderInferencePolicy(nn.Module):
 
     def forward(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Run the actor with the encoder latent as an extra input."""
-        latent = self.encoder(obs)
-        if self.zero_latent:
-            latent = torch.zeros_like(latent)
-        if self.fuse_latent:
-            # one fused input: [z; c]; zero_latent above already zeroes exactly the c slice
-            return self.actor(obs, torch.cat([args[0], latent], dim=-1), *args[1:], **kwargs)
-        return self.actor(obs, latent, *args, **kwargs)
+        return self.actor(obs, self.encoder(obs), *args, **kwargs)
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         """Reset the actor state (the encoder is stateless)."""
@@ -131,9 +114,9 @@ class EncoderInferencePolicy(nn.Module):
 def _encoder_export_parts(encoder: MLPModel, actor: MLPModel) -> tuple[nn.Module, ...]:
     """Deep-copy the inference-relevant submodules of an encoder-actor pair for export.
 
-    Returns ``(enc_normalizer, enc_mlp, enc_last_activation, obs_normalizer, mlp, deterministic_output,
-    last_activation)``. Mirrors what :class:`~robot_rl.models.mlp_model._TorchMLPModel` extracts, once per
-    model, so both export wrappers below stay in sync with the eager forward.
+    Returns:
+        ``(enc_normalizer, enc_mlp, enc_last_activation, obs_normalizer, mlp, deterministic_output,
+        last_activation)``.
     """
     enc_last_activation = copy.deepcopy(encoder.last_activation) or nn.Identity()
     if actor.distribution is not None:
@@ -152,15 +135,7 @@ def _encoder_export_parts(encoder: MLPModel, actor: MLPModel) -> tuple[nn.Module
 
 
 class _TorchEncoderPolicy(nn.Module):
-    """Exportable encoder+actor policy for JIT, taking ONE concatenated input ``[actor_obs ; encoder_obs]``.
-
-    The actor of an encoder run carries ``other_input_dims=(latent_dim,)``, so exporting it alone via
-    ``MLPModel.as_jit()`` is WRONG: :class:`_TorchMLPModel` pushes its entire input through an
-    ``obs_normalizer`` sized for observations only, and nothing supplies the latent. This wrapper folds the
-    encoder into the exported graph instead, splitting its input at ``actor.obs_dim`` and rebuilding the
-    ``[normalized_obs ; latent]`` vector the actor's MLP was trained on. Keeping it a single tensor matches
-    every other export in this package, so the artifact stays loadable wherever a plain policy is expected.
-    """
+    """Exportable encoder+actor policy for JIT, taking one concatenated input ``[actor_obs ; encoder_obs]``."""
 
     def __init__(self, encoder: MLPModel, actor: MLPModel) -> None:
         """Create a TorchScript-friendly copy of an encoder and the actor consuming its latent."""
@@ -175,14 +150,28 @@ class _TorchEncoderPolicy(nn.Module):
             self.deterministic_output,
             self.last_activation,
         ) = _encoder_export_parts(encoder, actor)
+        # empty buffer marks a policy whose ``(mean, std)`` cannot be exported; ``forward_dist`` rejects it
+        std = actor.distribution.export_std() if actor.distribution is not None else None
+        self.register_buffer("_std", torch.empty(0) if std is None else std)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run deterministic inference on the concatenated ``[actor_obs ; encoder_obs]`` input."""
+    def _mean(self, x: torch.Tensor) -> torch.Tensor:
         obs = x[..., : self.obs_dim]
         scan = x[..., self.obs_dim :]
         latent = self.enc_last_activation(self.enc_mlp(self.enc_normalizer(scan)))
         fused = torch.cat([self.obs_normalizer(obs), latent], dim=-1)
-        return self.last_activation(self.deterministic_output(self.mlp(fused)))
+        return self.deterministic_output(self.mlp(fused))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run deterministic inference on the concatenated ``[actor_obs ; encoder_obs]`` input."""
+        return self.last_activation(self._mean(x))
+
+    @torch.jit.export
+    def forward_dist(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the Gaussian policy's ``(mean, std)`` for the concatenated ``[actor_obs ; encoder_obs]`` input."""
+        if self._std.numel() == 0:
+            raise RuntimeError("forward_dist is only supported for a plain GaussianDistribution policy.")
+        mean = self._mean(x)
+        return mean, self._std.expand_as(mean)
 
     @torch.jit.export
     def reset(self) -> None:

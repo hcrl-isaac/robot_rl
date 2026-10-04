@@ -441,6 +441,29 @@ class TestSharedEncoder:
         fresh.load(saved, load_cfg={"actor": True}, strict=True)
         assert all(torch.equal(a, b) for a, b in zip(ppo.encoder.parameters(), fresh.encoder.parameters(), strict=True))
 
+    def test_strict_load_requires_the_encoder_weights(self) -> None:
+        """A strict load of a checkpoint without encoder weights raises instead of keeping a random encoder."""
+        ppo, _ = _build_ppo_with_encoder()
+        saved = ppo.save()
+        del saved["encoder_state_dict"]
+
+        fresh, _ = _build_ppo_with_encoder()
+        with pytest.raises(KeyError, match="encoder_state_dict"):
+            fresh.load(saved, load_cfg=None, strict=True)
+        fresh.load(saved, load_cfg=None, strict=False)
+
+    def test_encoder_rejects_symmetry(self) -> None:
+        """Symmetry augmentation cannot be combined with an encoder."""
+        obs = _make_encoder_obs()
+        with pytest.raises(ValueError, match="shared observation encoder"):
+            PPO(
+                _make_actor(obs, _ENCODER_OBS_GROUPS, NUM_ACTIONS, other_input_dims=(LATENT_DIM,)),
+                _make_critic(obs, _ENCODER_OBS_GROUPS, other_input_dims=(LATENT_DIM,)),
+                RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS]),
+                symmetry_cfg={"use_data_augmentation": True, "use_mirror_loss": False, "data_augmentation_func": None},
+                encoder=_make_encoder(obs),
+            )
+
     def test_encoder_rejects_shared_memory(self) -> None:
         """An encoder and a shared memory module cannot be combined."""
         obs = _make_encoder_obs()

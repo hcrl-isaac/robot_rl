@@ -27,7 +27,7 @@ class Distillation:
     """The teacher model."""
 
     teacher_loaded: bool = False
-    """Indicates whether the teacher model parameters have been loaded."""
+    """Whether the teacher is ready to supervise: its weights are loaded or come from its own configuration."""
 
     def __init__(
         self,
@@ -39,6 +39,8 @@ class Distillation:
         learning_rate: float = 1e-3,
         max_grad_norm: float | None = None,
         loss_type: str = "mse",
+        aux_obs_group: str | None = None,
+        aux_loss_weight: float = 1.0,
         optimizer: str = "adam",
         device: str = "cpu",
         # Distributed training parameters
@@ -60,12 +62,16 @@ class Distillation:
 
         # Distillation components
         self.student = student.to(self.device)
+        # privileged supervision of the student's encoder (e.g. ball position), as in the SAC actor's aux head
+        self.aux_obs_group = aux_obs_group
+        self.aux_loss_weight = aux_loss_weight
         self.teacher = teacher.to(self.device)
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
         # simply alias ``self.student`` / ``self.teacher``.
         self._raw_student = self.student
         self._raw_teacher = self.teacher
+        self.teacher_loaded = teacher.loads_own_weights
 
         # Create the optimizer
         self.optimizer = resolve_optimizer(optimizer)(self.student.parameters(), lr=learning_rate)  # type: ignore
@@ -126,6 +132,7 @@ class Distillation:
         """Run optimization epochs over stored batches and return mean losses."""
         self.num_updates += 1
         mean_behavior_loss = 0
+        mean_aux_loss = 0
         loss = 0
         cnt = 0
 
@@ -135,7 +142,8 @@ class Distillation:
             self.student.detach_hidden_state()
             for batch in self.storage.generator():
                 # Inference of the student for gradient computation
-                actions = self.student(batch.observations)
+                latent = self.student.get_latent(batch.observations)
+                actions = self.student.forward_from_latent(latent)
 
                 # Behavior cloning loss
                 behavior_loss = self.loss_fn(actions, batch.privileged_actions)
@@ -143,6 +151,11 @@ class Distillation:
                 # Total loss
                 loss = loss + behavior_loss
                 mean_behavior_loss += behavior_loss.item()
+                if self.aux_obs_group is not None:
+                    aux_pred = self.student.aux_prediction(latent)  # type: ignore[attr-defined]
+                    aux_loss = nn.functional.mse_loss(aux_pred, batch.observations[self.aux_obs_group])
+                    loss = loss + self.aux_loss_weight * aux_loss
+                    mean_aux_loss += aux_loss.item()
                 cnt += 1
 
                 # Gradient step
@@ -163,12 +176,15 @@ class Distillation:
                 self.student.detach_hidden_state(batch.dones.view(-1))
 
         mean_behavior_loss /= cnt
+        mean_aux_loss /= cnt
         self.storage.clear()
         self.last_hidden_states = (self.student.get_hidden_state(), self.teacher.get_hidden_state())
         self.student.detach_hidden_state()
 
         # Construct the loss dictionary
         loss_dict = {"behavior": mean_behavior_loss}
+        if self.aux_obs_group is not None:
+            loss_dict["aux"] = mean_aux_loss
 
         return loss_dict
 
@@ -209,10 +225,12 @@ class Distillation:
         if load_cfg.get("student"):
             self._raw_student.load_state_dict(loaded_dict["student_state_dict"], strict=strict)
         if load_cfg.get("teacher"):
-            self._raw_teacher.load_state_dict(
-                loaded_dict.get("teacher_state_dict") or loaded_dict["actor_state_dict"], strict=strict
-            )
-            self.teacher_loaded = True
+            teacher_state = loaded_dict.get("teacher_state_dict") or loaded_dict.get("actor_state_dict")
+            if teacher_state:
+                self._raw_teacher.load_state_dict(teacher_state, strict=strict)
+                self.teacher_loaded = True
+            elif not self.teacher_loaded:
+                raise ValueError("The checkpoint has no teacher weights, but the teacher model needs them.")
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         return load_cfg.get("iteration", False)
@@ -221,10 +239,16 @@ class Distillation:
         """Get the policy model."""
         return self._raw_student
 
-    def eval(self, env: VecEnv, max_steps: int = 200) -> list[dict[str, torch.Tensor]]:
-        """Run a deterministic student rollout for ``max_steps`` env steps.
+    def eval(
+        self, env: VecEnv, max_steps: int = 200, stochastic: bool = False, action_repeat: int = 1
+    ) -> list[dict[str, torch.Tensor]]:
+        """Roll out the student for ``max_steps`` env steps; API parity with :meth:`sac.SAC.eval`.
 
-        API parity with :meth:`ppo.PPO.eval`; no learning, no transition storage.
+        Args:
+            env: Vectorized environment to roll out in.
+            max_steps: Number of environment steps to run.
+            stochastic: Act with the deterministic mean when False; sample the action when True.
+            action_repeat: Hold each queried action for this many ``env.step`` calls before re-querying.
         """
         was_training = self.student.training
         self.eval_mode()
@@ -234,10 +258,13 @@ class Distillation:
         obs = env.get_observations() if hasattr(env, "get_observations") else env.reset()[0]
         if hasattr(self.student, "reset"):
             self.student.reset()
+        action_repeat = max(1, action_repeat)
 
         with torch.inference_mode():
-            for _ in range(max_steps):
-                actions = self.student(obs, stochastic_output=False)
+            actions = self.student(obs, stochastic_output=stochastic)
+            for step in range(max_steps):
+                if step > 0 and step % action_repeat == 0:
+                    actions = self.student(obs, stochastic_output=stochastic)
                 obs, _, _, _ = env.step(actions)
 
         if was_training:
@@ -278,6 +305,9 @@ class Distillation:
         cfg["algorithm"]["symmetry_cfg"] = None
 
         # Initialize the policy
+        aux_group = cfg["algorithm"].get("aux_obs_group")
+        if aux_group is not None:
+            cfg["student"]["aux_target_dim"] = obs[aux_group].shape[-1]
         student: MLPModel = student_class(obs, cfg["obs_groups"], "student", env.num_actions, **cfg["student"]).to(
             device
         )

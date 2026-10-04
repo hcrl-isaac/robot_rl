@@ -15,6 +15,8 @@ import torch.nn as nn
 from robot_rl.models.inference import EncoderInferencePolicy
 from robot_rl.utils.utils import resolve_callable
 
+DEFAULT_ONNX_OPSET = 18
+
 
 def _load_bn(nsd: dict[str, torch.Tensor], keys: list[str]) -> nn.BatchNorm1d:
     """Rebuild ONE BatchNorm1d covering the concatenation of the given obs groups.
@@ -105,9 +107,7 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
     cfg = copy.deepcopy(train_cfg)
     models: dict[str, nn.Module] = {}
 
-    # Optional shared observation encoder. On an encoder run each head's first layer is
-    # ``obs_dim + latent_dim`` wide, so the latent MUST be subtracted before sizing the head's fake obs --
-    # otherwise the rebuilt head silently expects a latent that no exported graph supplies.
+    # an encoder head's first layer is ``obs_dim + latent_dim`` wide; subtract the latent to size its obs
     encoder_cfg = cfg.get("algorithm", {}).get("encoder_cfg")
     latent_dim = int(encoder_cfg["output_dim"]) if encoder_cfg is not None else 0
 
@@ -144,8 +144,7 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
     if all_models:
         models["critic"] = build("critic", "critic_state_dict", 1)
     if encoder is not None:
-        # Fold the encoder into each head's export: the artifact then takes ONE concatenated
-        # ``[head_obs ; encoder_obs]`` input, matching every other export in this package.
+        # fold the encoder in, so the export takes one ``[head_obs ; encoder_obs]`` input
         models = {name: EncoderInferencePolicy(encoder, model) for name, model in models.items()}
     return models
 
@@ -216,8 +215,21 @@ def save_jit(module: nn.Module, path: str, filename: str) -> str:
     return save_path
 
 
-def save_onnx(module: nn.Module, path: str, filename: str, verbose: bool = False) -> str:
-    """Save an ONNX export; the module must provide dummy inputs and input/output names."""
+def save_onnx(
+    module: nn.Module, path: str, filename: str, verbose: bool = False, opset: int = DEFAULT_ONNX_OPSET
+) -> str:
+    """Save an ONNX export; the module must provide dummy inputs and input/output names.
+
+    Args:
+        module: Export-ready module (``as_onnx()`` output) with ``get_dummy_inputs``/``input_names``/``output_names``.
+        path: Directory to write into (created if missing).
+        filename: File name within ``path``.
+        verbose: Forward to ``torch.onnx.export``.
+        opset: ONNX opset to target; raise it for modules that need a newer operator.
+
+    Returns:
+        The saved file path.
+    """
     os.makedirs(path, exist_ok=True)
     save_path = os.path.join(path, filename)
     torch.onnx.export(
@@ -225,7 +237,7 @@ def save_onnx(module: nn.Module, path: str, filename: str, verbose: bool = False
         module.get_dummy_inputs(),
         save_path,
         export_params=True,
-        opset_version=18,
+        opset_version=opset,
         verbose=verbose,
         input_names=module.input_names,
         output_names=module.output_names,

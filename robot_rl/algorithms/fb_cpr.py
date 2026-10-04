@@ -17,6 +17,7 @@ from robot_rl.utils import (
     eval_mode,
     forward_sliding_mean,
     pad_to_size,
+    pad_to_size_repeat,
     resolve_callable,
     resolve_dtype,
     resolve_obs_groups,
@@ -308,7 +309,8 @@ class FbCpr:
             raise ValueError("Expected episode lengths to be uniform.")
         step = int(cur_episode_length[0].item())
         # Update from z buffer
-        if z is None:
+        # the z buffer is empty until the first update, e.g. when an eval resets rollouts during the seed phase
+        if z is None or (step % self.steps_per_z_update == 0 and len(self.z_buffer) == 0):
             z = self._sample_random_z(num_envs)
         elif step % self.steps_per_z_update == 0:
             z = self.z_buffer.sample(num_envs, device=self.device)
@@ -399,86 +401,100 @@ class FbCpr:
         return loss_dict, extras
 
     def eval(self, env: URLVecEnv, max_steps: int | None = None, **kwargs: Any) -> list[dict[str, torch.Tensor]]:
-        r"""Evaluate motions and update priorities in expert buffer.
-
-        Priorities are updated according to:
-
-        .. math::
-
-            2^\{4 * \min(2, \max(0.5, x))}
-
-        where x is the Earth Mover's Distance between the actual and expert joint positions for each trajectory.
+        """Track every expert motion and re-weight the expert buffer by how badly each one was tracked.
 
         Args:
             env: Vectorized environment to replay the expert motions in.
-            max_steps: When provided, ``env.step`` is called at most this many times across all motion
-                mini-batches and the loop breaks early -- intended for the video logger, which only needs a
-                bounded-length clip rather than the full priorities update. ``None`` runs every mini-batch.
-            **kwargs: Extra keyword eval arguments (e.g. ``stochastic``, ``action_repeat``) are accepted and
-                ignored, so this method tolerates a uniform eval call signature.
+            max_steps: Stop after this many ``env.step`` calls (a bounded video clip); priorities are then left
+                untouched. ``None`` scores every motion.
+            **kwargs: Accepted and ignored, so callers can use one eval signature across algorithms.
 
         Returns:
-            A list of per-batch info dicts collected over the evaluated motion mini-batches.
+            One info dict holding the per-motion ``emd`` and ``joint_error``.
+        """
+        result = self.eval_motions(env, max_steps=max_steps)
+        if max_steps is None:
+            self.apply_eval_outputs({"motion_priorities": self.motion_priorities(result["emd"])})
+        return [{"emd": result["emd"].cpu(), "joint_error": result["joint_error"].cpu()}]
+
+    def eval_motions(self, env: URLVecEnv, max_steps: int | None = None) -> dict[str, torch.Tensor]:
+        """Track every expert motion from its first frame and score it; the expert buffer is not modified.
+
+        Each motion is driven by ``z_t = B(obs_{t+1})`` with no termination guard, in a random env assignment
+        (per-env domain randomization is fixed), and results are returned in expert-buffer order.
+
+        Args:
+            env: Vectorized environment to replay the expert motions in.
+            max_steps: Stop after this many ``env.step`` calls; unscored motions keep NaN.
+
+        Returns:
+            ``emd`` and ``joint_error`` of shape ``(num_motions,)``, and ``root_error`` of shape
+            ``(num_motions, bucket_size - 1)``: per-step root displacement error [m] from the clip's start.
         """
         print("[INFO] Evaluating motions...")
-
-        # Switch to eval mode
         self.eval_mode()
         env.eval_mode()
 
-        eval_infos: list[dict[str, torch.Tensor]] = []
-        bucket_size = self.expert_buffer.bucket_size
-        idx = 0
+        buffer = self.expert_buffer
+        rollout_steps = buffer.bucket_size - 1
+        emd = torch.full((buffer.num_motions,), float("nan"), device=self.device)
+        joint_error = torch.full_like(emd, float("nan"))
+        root_error = torch.full((buffer.num_motions, rollout_steps), float("nan"), device=self.device)
+        start = 0
         steps_done = 0
-        for eval_obs in self.expert_buffer.get_batch_motions(env.num_envs, device=self.device):
-            mini_batch_size = eval_obs.shape[0]
-            eval_motions = self.expert_buffer.get_expert_state(eval_obs)
+        for eval_obs in buffer.get_batch_motions(env.num_envs, device=self.device):
+            batch = eval_obs.shape[0]
+            ids = buffer.eval_order[start : start + batch]
+            start += batch
+            ref = buffer.get_expert_state(eval_obs)
             norm_eval_obs = self.obs_normalizer(eval_obs.view(-1))
             # z at rollout step t encodes the next desired state (frame t+1), matching how the actor is
             # trained on (obs_t, z=encode(next_obs)) pairs.
-            eval_zs = self.backward_map(norm_eval_obs).view(mini_batch_size, bucket_size, -1)[:, 1:, :]
-            rollout_steps = bucket_size - 1
-            eval_zs = pad_to_size(eval_zs, env.num_envs, dim=0)
-            # Zero-pad motions to full number of environments (in case batch is truncated)
-            first_motions = {k: pad_to_size(v[:, 0, :], env.num_envs, dim=0) for k, v in eval_motions.items()}
-            obs, _ = env.reset_to({"articulation": {"robot": first_motions}}, is_relative=True)
-            num_joints = first_motions["joint_position"].shape[1]
-            actual_qpos = torch.zeros((mini_batch_size, rollout_steps, num_joints), device=self.device)
-            # Run rollouts for each trajectory latent task and save qpos at each step
-            for it in range(rollout_steps):
-                obs = self.obs_normalizer(obs)
-                actions = self.actor(obs, eval_zs[:, it, :])
-                # Pad out remaining envs with zeros
-                actions = pad_to_size(actions, env.num_envs, dim=0)
+            eval_zs = self.backward_map(norm_eval_obs).view(batch, buffer.bucket_size, -1)[:, 1:, :]
+            # spare envs replay the batch's first motion: a zero root quaternion is not a legal pose and
+            # leaves NaN physics behind in an env that goes on training
+            eval_zs = pad_to_size_repeat(eval_zs, env.num_envs, dim=0)
+            first = {k: pad_to_size_repeat(v[:, 0, :], env.num_envs, dim=0) for k, v in ref.items()}
+            obs, _ = env.reset_to({"articulation": {"robot": first}}, is_relative=True)
+            qpos = torch.zeros((batch, rollout_steps, first["joint_position"].shape[1]), device=self.device)
+            root = torch.zeros((batch, rollout_steps, 3), device=self.device)
+            root_start = buffer.get_expert_state(obs)["root_pose"][:batch, :3].to(self.device)
+            steps = rollout_steps
+            for t in range(rollout_steps):
+                actions = pad_to_size(self.actor(self.obs_normalizer(obs), eval_zs[:, t, :]), env.num_envs, dim=0)
                 obs, _, _, _ = env.step(actions.to(env.device))
-                actual_qpos[:, it, :] = self.expert_buffer.get_expert_state(obs)["joint_position"][:mini_batch_size].to(
-                    self.device
-                )
+                state = buffer.get_expert_state(obs)
+                qpos[:, t] = state["joint_position"][:batch].to(self.device)
+                root[:, t] = state["root_pose"][:batch, :3].to(self.device)
                 steps_done += 1
                 if max_steps is not None and steps_done >= max_steps:
+                    steps = t + 1
                     break
-            # Compute priorities as 2^{2 * emd} where emd is clamped to [0.5, 2.0]
-            # Compare against frames 1..bucket_size-1 since actual_qpos[:, t] is the pose after targeting frame t+1.
-            eval_qpos = eval_motions["joint_position"][:, 1:]
-            emds = torch.empty((mini_batch_size,), device=self.device)
-            for i in range(mini_batch_size):
-                emds[i] = compute_emd(actual_qpos[i], eval_qpos[i])
-            priorities = torch.pow(2, emds.clamp(min=0.5, max=2.0) * 2)
-            # Save priorities to expert buffer
-            self.expert_buffer.update_priorities(priorities, slice(idx, idx + priorities.shape[0]))
-            eval_infos.append({"emd": emds.detach().cpu()})
-
-            idx += mini_batch_size
+            # actual step t is the pose after targeting frame t+1
+            ref_qpos = ref["joint_position"][:, 1 : steps + 1]
+            ref_root = ref["root_pose"][:, : steps + 1, :3]
+            act_disp = root[:, :steps] - root_start[:, None]
+            ref_disp = ref_root[:, 1:] - ref_root[:, :1]
+            root_error[ids, :steps] = (act_disp - ref_disp).norm(dim=-1)
+            joint_error[ids] = (qpos[:, :steps] - ref_qpos).norm(dim=-1).mean(dim=-1)
+            emd[ids] = torch.stack([compute_emd(qpos[i, :steps], ref_qpos[i]) for i in range(batch)])
             if max_steps is not None and steps_done >= max_steps:
                 break
-        self.expert_buffer.normalize_priorities()
 
-        # Revert to train mode
         self.train_mode()
         env.train_mode()
-
         print("[INFO] Finished evaluating motions.")
-        return eval_infos
+        return {"emd": emd, "joint_error": joint_error, "root_error": root_error}
+
+    @staticmethod
+    def motion_priorities(emd: torch.Tensor) -> torch.Tensor:
+        """Expert sampling weight per motion: ``2^(2 * clamp(emd, 0.5, 2))``, so poorly tracked motions recur."""
+        return torch.pow(2, emd.clamp(min=0.5, max=2.0) * 2)
+
+    def apply_eval_outputs(self, outputs: dict[str, torch.Tensor]) -> None:
+        """Consume an eval's outputs; ``motion_priorities`` (buffer order) replaces the expert sampling weights."""
+        if "motion_priorities" in outputs:
+            self.expert_buffer.set_priorities(outputs["motion_priorities"])
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""

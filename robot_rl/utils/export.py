@@ -14,7 +14,7 @@ import torch.nn as nn
 
 from robot_rl.models.inference import EncoderInferencePolicy
 from robot_rl.models.rnn_model import RNNModel
-from robot_rl.modules.distribution import Distribution, TruncatedGaussianDistribution
+from robot_rl.modules.distribution import Distribution, bound_by_clip_actions
 from robot_rl.utils.utils import resolve_callable
 
 DEFAULT_ONNX_OPSET = 18
@@ -232,13 +232,10 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
         model_cfg = dict(cfg[cfg_key] if cfg_key in cfg else cfg["algorithm"][cfg_key])
         model_class = resolve_callable(model_cfg.pop("class_name", default_class))
         dist_cfg = model_cfg.get("distribution_cfg")
-        if dist_cfg is not None:
-            # training sets a truncated Gaussian's bounds from clip_actions over whatever the cfg dumped
-            if issubclass(_distribution_class(dist_cfg), TruncatedGaussianDistribution):
-                dist_cfg["low"], dist_cfg["high"] = -cfg["clip_actions"], cfg["clip_actions"]
-            else:
-                dist_cfg.setdefault("low", -cfg["clip_actions"])
-                dist_cfg.setdefault("high", cfg["clip_actions"])
+        # the same bounds rule as training; any other head keeps the bounds its cfg dumped
+        if dist_cfg is not None and not bound_by_clip_actions(dist_cfg, cfg["clip_actions"]):
+            dist_cfg.setdefault("low", -cfg["clip_actions"])
+            dist_cfg.setdefault("high", cfg["clip_actions"])
         out_dim = dims[out_spec] if isinstance(out_spec, str) else out_spec
         other_dims = tuple(dims[k] for k in other_spec)
         bn = _load_bn(nsd, cfg["obs_groups"][obs_set])

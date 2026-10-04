@@ -13,6 +13,8 @@ import torch.nn as nn
 from torch.distributions import Beta, Normal
 from typing import Any
 
+from robot_rl.utils.utils import resolve_callable
+
 
 class Distribution(nn.Module):
     """Base class for distribution modules.
@@ -976,3 +978,20 @@ class _BetaDeterministicOutput(nn.Module):
         alpha = torch.nn.functional.softplus(alpha_raw) + 1.0
         beta = torch.nn.functional.softplus(beta_raw) + 1.0
         return (alpha / (alpha + beta)) * self.range_scale + self.range_offset
+
+
+def bound_by_clip_actions(distribution_cfg: dict, clip_actions: float) -> bool:
+    """Set a truncated-Gaussian distribution cfg's bounds to ``+-clip_actions``, in place.
+
+    Args:
+        distribution_cfg: A distribution cfg; one that names no class is left alone.
+        clip_actions: The runner's action clip.
+
+    Returns:
+        Whether the cfg names :class:`TruncatedGaussianDistribution` or a subclass of it, and so was bounded.
+    """
+    class_name = distribution_cfg.get("class_name")
+    if class_name is None or not issubclass(resolve_callable(class_name), TruncatedGaussianDistribution):
+        return False
+    distribution_cfg["low"], distribution_cfg["high"] = -clip_actions, clip_actions
+    return True

@@ -9,12 +9,8 @@ from typing import Any
 
 from robot_rl.env import URLVecEnv
 from robot_rl.models import FuseModel, MLPModel
-from robot_rl.modules import (
-    DictModule,
-    ExponentialMovingAverageNormalization,
-    TargetNetwork,
-    TruncatedGaussianDistribution,
-)
+from robot_rl.modules import DictModule, ExponentialMovingAverageNormalization, TargetNetwork
+from robot_rl.modules.distribution import bound_by_clip_actions
 from robot_rl.storage import ReplayBuffer, TrajectoryBuffer, ZBuffer
 from robot_rl.utils import (
     compute_emd,
@@ -688,13 +684,10 @@ class FbCpr:
         default_sets = ["actor", "critic", "backward", "discriminator", "expert"]
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
 
-        # Match TruncatedGaussianDistribution bounds with clip_action bounds.
+        # a truncated-Gaussian actor is bounded by the action clip, whatever bounds its cfg lists
         actor_dist_cfg = cfg["actor"].get("distribution_cfg")
-        actor_dist_name = None if actor_dist_cfg is None else actor_dist_cfg.get("class_name")
-        if actor_dist_name is not None and issubclass(resolve_callable(actor_dist_name), TruncatedGaussianDistribution):
-            clip_actions = cfg["clip_actions"]
-            actor_dist_cfg["low"] = -clip_actions
-            actor_dist_cfg["high"] = clip_actions
+        if actor_dist_cfg is not None:
+            bound_by_clip_actions(actor_dist_cfg, cfg["clip_actions"])
 
         # Initialize the policy
         z_dim = cfg["algorithm"]["z_dim"]

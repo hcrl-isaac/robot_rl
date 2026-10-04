@@ -20,6 +20,7 @@ import pytest
 from robot_rl.models import EncoderInferencePolicy
 from robot_rl.utils.export import rebuild_models, save_onnx
 from robot_rl.utils.utils import resolve_callable
+from tests.algorithms.test_fb_cpr import TRUNCATED_GAUSSIAN_NAMES
 from tests.algorithms.test_ppo import (
     LATENT_DIM,
     NUM_ENVS,
@@ -197,9 +198,7 @@ def _fbcpr_actor_checkpoint(distribution_cfg: dict) -> tuple[dict, dict]:
     return train_cfg, ckpt
 
 
-@pytest.mark.parametrize(
-    "class_name", ["TruncatedGaussianDistribution", "robot_rl.modules.distribution:TruncatedGaussianDistribution"]
-)
+@pytest.mark.parametrize("class_name", TRUNCATED_GAUSSIAN_NAMES)
 def test_a_truncated_gaussian_actor_is_bounded_by_clip_actions_whatever_the_cfg_dumped(class_name: str) -> None:
     """Training bounds the actor by ``clip_actions``; a dump that still says +-1 must not shrink the export."""
     dumped = {"class_name": class_name, "low": -1.0, "high": 1.0}

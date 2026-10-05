@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
@@ -287,6 +288,8 @@ class Distillation:
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> Distillation:
         """Construct the distillation algorithm."""
+        # resolve on a copy: the runner logs the cfg it was given
+        cfg = copy.deepcopy(cfg)
         # Resolve class callables
         alg_class: type[Distillation] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
         student_class: type[MLPModel] = resolve_callable(cfg["student"].pop("class_name"))  # type: ignore

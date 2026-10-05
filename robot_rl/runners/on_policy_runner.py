@@ -99,7 +99,7 @@ class OnPolicyRunner(CheckpointHooks):
                     if new_trial_ids is not None and len(new_trial_ids):
                         self.env.apply("trial", new_trial_ids)
                     # Extract intrinsic rewards if RND is used (only for logging)
-                    intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"]["rnd_cfg"] else None
+                    intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"].get("rnd_cfg") else None
                     # Book keeping
                     self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
 
@@ -127,7 +127,7 @@ class OnPolicyRunner(CheckpointHooks):
                 loss_dict=loss_dict,
                 learning_rate=self.alg.learning_rate,
                 action_std=self.alg.get_policy().output_std,
-                rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"]["rnd_cfg"] else None,
+                rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"].get("rnd_cfg") else None,
             )
 
             # Save model

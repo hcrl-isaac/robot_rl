@@ -119,8 +119,10 @@ class MLPModel(nn.Module):
 
         # Distribution
         if distribution_cfg is not None:
-            dist_class: type[Distribution] = resolve_callable(distribution_cfg.pop("class_name"))  # type: ignore
-            self.distribution: Distribution | None = dist_class(output_dim, **distribution_cfg)
+            dist_class: type[Distribution] = resolve_callable(distribution_cfg["class_name"])  # type: ignore
+            self.distribution: Distribution | None = dist_class(
+                output_dim, **{k: v for k, v in distribution_cfg.items() if k != "class_name"}
+            )
             mlp_output_dim = self.distribution.input_dim
         else:
             self.distribution = None

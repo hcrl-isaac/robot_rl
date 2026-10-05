@@ -80,6 +80,8 @@ class Logger:
         """
         if self.log_dir is not None and not self.disable_logs:
             logger_cfg = self.cfg.get("logger", "tensorboard")
+            if not isinstance(logger_cfg, str):
+                logger_cfg = dict(logger_cfg)  # store_config logs self.cfg, so it must keep its class_name
             self.logger_type = logger_cfg if isinstance(logger_cfg, str) else logger_cfg.pop("class_name")
 
             # Handle deprecated plain string logger types for W&B and Neptune

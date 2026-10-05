@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 import torch
 import torch.nn as nn
 from itertools import chain
@@ -806,6 +807,8 @@ class PPO:
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPO:
         """Construct the PPO algorithm."""
+        # resolve on a copy: the runner logs the cfg it was given
+        cfg = copy.deepcopy(cfg)
         # Resolve class callables
         alg_class: type[PPO] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
         actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore

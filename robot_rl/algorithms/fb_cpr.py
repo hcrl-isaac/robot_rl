@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import os
 import torch
@@ -665,6 +666,8 @@ class FbCpr:
         ~GB-scale motion dataset at ``cfg["algorithm"]["motion_path"]``). Only training/eval touch it,
         so play/visualization paths (which just need the actor + obs normalizer) can avoid the disk load.
         """
+        # resolve on a copy: the runner logs the cfg it was given
+        cfg = copy.deepcopy(cfg)
         # Resolve class callables. The FB-CPR-specific models live on the algorithm cfg; pop them so they
         # aren't re-passed as kwargs to the algorithm constructor below.
         alg_class: type[FbCpr] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore

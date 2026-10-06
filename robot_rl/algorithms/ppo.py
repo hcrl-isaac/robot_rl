@@ -727,6 +727,10 @@ class PPO:
             self._raw_encoder.load_state_dict(loaded_dict["encoder_state_dict"], strict=strict)
         if load_cfg.get("optimizer") and "optimizer_state_dict" in loaded_dict:
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            # The adaptive schedule writes ``self.learning_rate`` into the optimizer on every minibatch, so it has
+            # to resume too: left at the cfg value (1e-3 against a checkpoint's adapted ~1e-5), the first update
+            # after a resume ran 100x too large (KL 144-330, clip fraction 0.95) before the schedule caught up.
+            self.learning_rate = float(self.optimizer.param_groups[0]["lr"])
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])

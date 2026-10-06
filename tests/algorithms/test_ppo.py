@@ -373,6 +373,19 @@ class TestAdaptiveLearningRate:
 
         assert ppo.learning_rate == initial_lr
 
+    def test_resume_restores_the_adapted_lr(self) -> None:
+        """A loaded checkpoint brings its adapted LR: the schedule writes ``learning_rate`` into the optimizer."""
+        ppo, _obs = _build_ppo(schedule="adaptive", desired_kl=0.01, learning_rate=1e-3)
+        ppo.learning_rate = 2e-5
+        for group in ppo.optimizer.param_groups:
+            group["lr"] = ppo.learning_rate
+        saved = ppo.save()
+
+        fresh, _ = _build_ppo(schedule="adaptive", desired_kl=0.01, learning_rate=1e-3)
+        fresh.load(saved, load_cfg=None, strict=True)
+        assert fresh.learning_rate == 2e-5
+        assert fresh.optimizer.param_groups[0]["lr"] == 2e-5
+
 
 class TestSharedEncoder:
     """Tests for the optional shared observation encoder feeding the actor and critic."""

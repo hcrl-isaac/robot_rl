@@ -493,6 +493,7 @@ class TestLoadDefaults:
         )
 
     def test_a_full_load_restores_them(self, tmp_path: Path) -> None:
+        """A resume takes the discriminators back, so training continues against the same critics."""
         trained, _ = _build_style_ppo(tmp_path)
         trained.style.train()
         trained.style.update(torch.randn(64, STYLE_DIM))
@@ -516,6 +517,7 @@ class TestLoadDefaults:
         assert all(torch.equal(p, q) for p, q in zip(fresh.style.discriminators.parameters(), before, strict=True))
 
     def test_a_partial_load_can_ask_for_them(self, tmp_path: Path) -> None:
+        """Naming the key overrides the default, for a caller that does want them."""
         trained, _ = _build_style_ppo(tmp_path)
         trained.style.train()
         trained.style.update(torch.randn(64, STYLE_DIM))

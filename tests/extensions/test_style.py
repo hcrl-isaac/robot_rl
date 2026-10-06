@@ -480,3 +480,47 @@ class TestCheckpointCompat:
         restored = TestGating._gated_style(tmp_path)
         restored.load_state_dict(state)
         assert restored.reward_steps == 7
+
+
+class TestLoadDefaults:
+    """Which loads restore the discriminators."""
+
+    @staticmethod
+    def _diverged(a: PPO, b: PPO) -> bool:
+        return not all(
+            torch.equal(x, y)
+            for x, y in zip(a.style.discriminators.parameters(), b.style.discriminators.parameters(), strict=True)
+        )
+
+    def test_a_full_load_restores_them(self, tmp_path: Path) -> None:
+        trained, _ = _build_style_ppo(tmp_path)
+        trained.style.train()
+        trained.style.update(torch.randn(64, STYLE_DIM))
+        saved = trained.save()
+
+        fresh, _ = _build_style_ppo(tmp_path)
+        assert self._diverged(trained, fresh)
+        fresh.load(saved, load_cfg=None, strict=True)
+        assert not self._diverged(trained, fresh)
+
+    def test_a_partial_load_leaves_them_alone(self, tmp_path: Path) -> None:
+        """A caller naming the models it wants is loading for inference, which never reads them."""
+        trained, _ = _build_style_ppo(tmp_path)
+        trained.style.train()
+        trained.style.update(torch.randn(64, STYLE_DIM))
+        saved = trained.save()
+
+        fresh, _ = _build_style_ppo(tmp_path)
+        before = [p.clone() for p in fresh.style.discriminators.parameters()]
+        fresh.load(saved, load_cfg={"actor": True, "memory": True}, strict=True)
+        assert all(torch.equal(p, q) for p, q in zip(fresh.style.discriminators.parameters(), before, strict=True))
+
+    def test_a_partial_load_can_ask_for_them(self, tmp_path: Path) -> None:
+        trained, _ = _build_style_ppo(tmp_path)
+        trained.style.train()
+        trained.style.update(torch.randn(64, STYLE_DIM))
+        saved = trained.save()
+
+        fresh, _ = _build_style_ppo(tmp_path)
+        fresh.load(saved, load_cfg={"actor": True, "style": True}, strict=True)
+        assert not self._diverged(trained, fresh)

@@ -770,7 +770,9 @@ class PPO:
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         if load_cfg.get("iteration", False):
             self.num_updates_done = int(loaded_dict.get("num_updates_done", 0))
-        if load_cfg.get("style", True) and self.style is not None and "style_state_dict" in loaded_dict:
+        # a caller naming the models it wants is loading for inference: the discriminators train the policy
+        # and nothing reads them at rollout, so they come back only on a full load or when asked for
+        if load_cfg.get("style", False) and self.style is not None and "style_state_dict" in loaded_dict:
             self.style.load_state_dict(loaded_dict["style_state_dict"], strict=strict)
             if load_cfg.get("optimizer") and "style_optimizer_state_dict" in loaded_dict:
                 self.style.optimizer.load_state_dict(loaded_dict["style_optimizer_state_dict"])

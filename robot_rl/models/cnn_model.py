@@ -25,6 +25,9 @@ class CNNModel(MLPModel):
     model can be either deterministic or stochastic, in which case a distribution module is used to sample the outputs.
     """
 
+    requires_2d: bool = True
+    """Whether at least one 2D observation group is required; without one the model is a normalized-1D MLP."""
+
     def __init__(
         self,
         obs: TensorDict,
@@ -62,7 +65,9 @@ class CNNModel(MLPModel):
         self._get_obs_dim(obs, obs_groups, obs_set)
 
         # Create or validate CNN encoders
-        if cnns is not None:
+        if not self.obs_groups_2d:
+            cnns = {}
+        elif cnns is not None:
             # Check compatibility if CNNs are provided
             if set(cnns.keys()) != set(self.obs_groups_2d):
                 raise ValueError("The 2D observations must be identical for all models sharing CNN encoders.")
@@ -116,6 +121,8 @@ class CNNModel(MLPModel):
 
     def get_latent(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Build the model latent by combining (optional) normalized 1D and CNN-encoded 2D observation groups."""
+        if not self.obs_groups_2d:
+            return super().get_latent(obs)
         # Process 2D observation groups with CNNs
         latent_cnn = torch.cat([self.cnns[obs_group](obs[obs_group]) for obs_group in self.obs_groups_2d], dim=-1)
         # If there are no 1D observations, return the CNN latent directly
@@ -155,7 +162,7 @@ class CNNModel(MLPModel):
             else:
                 raise ValueError(f"Invalid observation shape for {obs_group}: {obs[obs_group].shape}")
 
-        if not obs_groups_2d:
+        if not obs_groups_2d and self.requires_2d:
             raise ValueError("No 2D observations are provided. If this is intentional, use the MLP model instead.")
 
         # Store active 2D observation groups and dimensions directly as attributes

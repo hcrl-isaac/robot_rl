@@ -26,6 +26,9 @@ class CNNRNNModel(CNNModel):
     :meth:`encode_sequence`.
     """
 
+    requires_2d: bool = False
+    """A recurrent actor over 1D observations alone is allowed; recurrent SAC needs this class's sequence API."""
+
     is_recurrent: bool = True
 
     def __init__(

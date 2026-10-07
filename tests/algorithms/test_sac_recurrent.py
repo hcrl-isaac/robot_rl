@@ -8,6 +8,8 @@
 import torch
 from tensordict import TensorDict
 
+import pytest
+
 from robot_rl.algorithms import SAC
 
 OBS_DIM, ACT_DIM, NUM_ENVS = 6, 3, 8
@@ -288,3 +290,57 @@ class TestRecurrentSAC:
         _collect(alg, env, 12)
         _, diag = alg.update()
         assert "Actor/aux_loss" not in diag
+
+
+def _build_state_only(done_prob: float = 0.1, obs_normalization: bool = True) -> tuple[SAC, _DummyImageVecEnv]:
+    """Build SAC with a recurrent actor that reads only the 1D policy group: no image, no CNN configuration."""
+    env = _DummyImageVecEnv(done_prob=done_prob)
+    cfg = _make_cfg(obs_normalization)
+    cfg["obs_groups"] = {"actor": ["policy"], "critic": ["critic"]}
+    del cfg["actor"]["cnn_cfg"]
+    alg = SAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu")
+    return alg, env
+
+
+class TestStateOnlyRecurrentSAC:
+    """The same recurrent actor over 1D observations alone, as for a state-based teacher with memory."""
+
+    def test_builds_without_an_image(self) -> None:
+        """No 2D group: no CNN encoders, and the head reads the normalized features plus the RNN state."""
+        alg, _ = _build_state_only()
+        assert alg.recurrent and len(alg.actor.cnns) == 0
+        assert alg.actor.cnn_latent_dim == 0
+        assert alg.actor._get_latent_dim() == alg.actor.obs_dim + 16
+
+    def test_stored_state_is_self_consistent(self) -> None:
+        """Stored states chain across steps and zero on done, as with an image group."""
+        torch.manual_seed(0)
+        alg, env = _build_state_only(done_prob=0.5, obs_normalization=False)
+        dones = _collect(alg, env, 6)
+        buf, n = alg.replay_buffer, env.num_envs
+        for t in range(5):
+            row_t, row_next = t * n, (t + 1) * n
+            h_t = buf.hidden[row_t : row_t + n, 0].permute(1, 0, 2)
+            with torch.no_grad():
+                _, h_after = alg.actor.encode_sequence(buf.observations[row_t : row_t + n].unsqueeze(0), h_t)
+            h_stored_next = buf.hidden[row_next : row_next + n, 0].permute(1, 0, 2)
+            assert torch.allclose(h_after[:, ~dones[t]], h_stored_next[:, ~dones[t]], atol=1e-6)
+            if dones[t].any():
+                assert torch.all(h_stored_next[:, dones[t]] == 0)
+
+    def test_update_runs_and_is_finite(self) -> None:
+        """The windowed update runs every loss on a state-only recurrent actor."""
+        torch.manual_seed(0)
+        alg, env = _build_state_only()
+        _collect(alg, env, 12)
+        losses, _ = alg.update()
+        for key in ("critic_1", "critic_2", "actor", "alpha"):
+            assert torch.isfinite(torch.tensor(losses[key])), key
+
+    def test_an_image_model_still_requires_an_image(self) -> None:
+        """The plain CNN model keeps refusing a configuration with no 2D group."""
+        from robot_rl.models import CNNModel
+
+        env = _DummyImageVecEnv()
+        with pytest.raises(ValueError, match="No 2D observations"):
+            CNNModel(env.get_observations(), {"actor": ["policy"]}, "actor", 4, cnn_cfg={})

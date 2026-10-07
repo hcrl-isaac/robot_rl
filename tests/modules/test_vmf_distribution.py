@@ -82,3 +82,17 @@ def test_fused_bessel_terms_match_eager(kappa: float) -> None:
         (grad,) = torch.autograd.grad(log_norm + a, k)
         out.append(torch.stack([log_norm.detach(), a.detach(), grad.squeeze()]))
     assert torch.allclose(out[0], out[1], rtol=1e-3, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_sampling_compiles_without_a_graph_break() -> None:
+    """Inside a compiled region (SAC's compile_mode) the distribution traces as one graph."""
+    dist = _dist(1e3, 256, "cuda")
+    torch._dynamo.reset()
+
+    def step(mlp_output: torch.Tensor) -> torch.Tensor:
+        dist.update(mlp_output)
+        x, logp = dist.sample_and_log_prob()
+        return (x.sum(dim=-1) + logp).mean()
+
+    torch.compile(step, backend="eager", fullgraph=True)(torch.randn(256, P, device="cuda"))

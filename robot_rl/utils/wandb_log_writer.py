@@ -49,7 +49,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         self.shared = shared
         self.num_envs = num_envs
 
-        settings = wandb.Settings(start_method="thread")
+        settings = wandb.Settings()  # wandb >= 0.30 rejects the retired start_method setting
         tags = list(tags or [])
         if self.shared:
             settings.x_label = "main"

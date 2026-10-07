@@ -235,11 +235,12 @@ class SAC:
         """Run the off-policy SAC updates over sampled mini-batches; returns mean losses."""
         if self.recurrent:
             return self._update_recurrent()
-        mean_critic_1_loss = 0.0
-        mean_critic_2_loss = 0.0
-        mean_actor_loss = 0.0
-        mean_alpha_loss = 0.0
-        mean_rnd_loss = 0.0 if self.rnd else None
+        # losses add up on the device and are read once at the end: a read per minibatch stalls the host
+        mean_critic_1_loss = torch.zeros((), device=self.device)
+        mean_critic_2_loss = torch.zeros((), device=self.device)
+        mean_actor_loss = torch.zeros((), device=self.device)
+        mean_alpha_loss = torch.zeros((), device=self.device)
+        mean_rnd_loss = torch.zeros((), device=self.device) if self.rnd else None
         num_actor_updates = 0
 
         n_updates = self.num_learning_epochs * self.num_mini_batches
@@ -267,8 +268,7 @@ class SAC:
                     torch.distributed.all_reduce(self.log_alpha.grad, op=torch.distributed.ReduceOp.SUM)
                     self.log_alpha.grad /= self.gpu_world_size
                 self.alpha_optimizer.step()
-                self.alpha = self.log_alpha.exp().item()
-                mean_alpha_loss += alpha_loss.item()
+                mean_alpha_loss += alpha_loss.detach()
 
             if self.update_step % self.policy_frequency == 0:
                 for p in self.critic_parameters:
@@ -276,7 +276,7 @@ class SAC:
                 actor_loss = self._update_actor(obs_b, new_actions, logp)
                 for p in self.critic_parameters:
                     p.requires_grad_(True)
-                mean_actor_loss += actor_loss.item()
+                mean_actor_loss += actor_loss
                 num_actor_updates += 1
 
             # Soft-update the target critics.
@@ -291,21 +291,23 @@ class SAC:
                 if self.is_multi_gpu:
                     self.reduce_parameters(list(self.rnd.predictor.parameters()))
                 self.rnd.optimizer.step()
-                mean_rnd_loss += rnd_loss.item()
+                mean_rnd_loss += rnd_loss.detach()
 
-            mean_critic_1_loss += critic_1_loss.item()
-            mean_critic_2_loss += critic_2_loss.item()
+            mean_critic_1_loss += critic_1_loss
+            mean_critic_2_loss += critic_2_loss
             self.update_step += 1
 
+        if self.auto_alpha:
+            self.alpha = self.log_alpha.exp().item()
         loss_dict = {
-            "critic_1": mean_critic_1_loss / n_updates,
-            "critic_2": mean_critic_2_loss / n_updates,
-            "actor": mean_actor_loss / max(num_actor_updates, 1),
-            "alpha": mean_alpha_loss / n_updates if self.auto_alpha else 0.0,
+            "critic_1": mean_critic_1_loss.item() / n_updates,
+            "critic_2": mean_critic_2_loss.item() / n_updates,
+            "actor": mean_actor_loss.item() / max(num_actor_updates, 1),
+            "alpha": mean_alpha_loss.item() / n_updates if self.auto_alpha else 0.0,
             "alpha_value": self.alpha,
         }
         if self.rnd:
-            loss_dict["rnd"] = mean_rnd_loss / n_updates
+            loss_dict["rnd"] = mean_rnd_loss.item() / n_updates
         return loss_dict
 
     def _update_recurrent(self) -> tuple[dict, dict]:

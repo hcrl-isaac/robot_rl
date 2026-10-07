@@ -20,6 +20,16 @@ except ModuleNotFoundError:
     wandb = None
 
 
+def run_settings(shared: bool) -> wandb.Settings:
+    """Return the W&B run settings; ``shared`` makes this process the primary writer of a shared-mode run."""
+    settings = wandb.Settings()
+    if shared:
+        settings.x_label = "main"
+        settings.mode = "shared"
+        settings.x_primary = True
+    return settings
+
+
 class WandbLogWriter(SummaryWriter, LogWriter):
     """Summary writer for W&B."""
 
@@ -49,12 +59,8 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         self.shared = shared
         self.num_envs = num_envs
 
-        settings = wandb.Settings()  # wandb >= 0.30 rejects the retired start_method setting
+        settings = run_settings(self.shared)
         tags = list(tags or [])
-        if self.shared:
-            settings.x_label = "main"
-            settings.mode = "shared"
-            settings.x_primary = True
         if log_evals_async:
             tags.append("log_evals_async")
 

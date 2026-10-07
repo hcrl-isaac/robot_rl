@@ -19,10 +19,10 @@ from robot_rl.modules import RNN, HiddenState
 class RNNModel(MLPModel):
     """RNN-based neural model.
 
-    This model uses a recurrent neural network (RNN) to process 1D observation groups before passing the resulting
-    latent to an MLP. Available RNN types are "lstm" and "gru". Observations can be normalized before being passed to
-    the RNN. The output of the model can be either deterministic or stochastic, in which case a distribution module is
-    used to sample the outputs.
+    The base model's latent (normalized 1D observation groups here, plus CNN encodings in :class:`CNNRNNModel`)
+    drives an LSTM/GRU whose output feeds the MLP head. The output can be deterministic or stochastic, in which case
+    a distribution module samples it. In rollout mode the hidden state is carried across steps internally; a sequence
+    update passes a time-major ``(L, B)`` window and an explicit starting state to :meth:`encode_sequence`.
     """
 
     is_recurrent: bool = True
@@ -34,14 +34,9 @@ class RNNModel(MLPModel):
         obs_groups: dict[str, list[str]],
         obs_set: str,
         output_dim: int,
-        hidden_dims: tuple[int, ...] | list[int] = (256, 256, 256),
-        activation: str = "elu",
-        obs_normalization: bool = False,
-        distribution_cfg: dict | None = None,
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
-        memory_only: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the RNN-based model.
@@ -51,65 +46,103 @@ class RNNModel(MLPModel):
             obs_groups: Dictionary mapping observation sets to lists of observation groups.
             obs_set: Observation set to use for this model (e.g., "actor" or "critic").
             output_dim: Dimension of the output.
-            hidden_dims: Hidden dimensions of the MLP.
-            activation: Activation function of the MLP.
-            obs_normalization: Whether to normalize the observations before feeding them to the MLP.
-            distribution_cfg: Configuration dictionary for the output distribution.
             rnn_type: Type of RNN to use ("lstm" or "gru").
             rnn_hidden_dim: Dimension of the RNN hidden state.
             rnn_num_layers: Number of RNN layers.
-            memory_only: When ``True``, skip building the MLP head and output distribution. Used when this
-                model is constructed as a shared memory module under :class:`MetaRlCfg.memory`.
-            **kwargs: Ignored extra keyword arguments accepted for cfg-class symmetry with other models.
+            **kwargs: Forwarded to the base model (``hidden_dims``, ``distribution_cfg``, ``memory_only``, ...).
         """
-        self.latent_dim = rnn_hidden_dim
+        # read by the head construction in the base __init__, so it must exist first
+        self.rnn_hidden_dim = rnn_hidden_dim
+        super().__init__(obs, obs_groups, obs_set, output_dim, **kwargs)
+        self.rnn = RNN(self._feature_dim(), rnn_hidden_dim, rnn_num_layers, rnn_type)
 
-        # Initialize the parent MLP model
-        super().__init__(
-            obs,
-            obs_groups,
-            obs_set,
-            output_dim,
-            hidden_dims=hidden_dims,
-            activation=activation,
-            obs_normalization=obs_normalization,
-            distribution_cfg=distribution_cfg,
-            memory_only=memory_only,
-        )
-
-        # RNN
-        self.rnn = RNN(self.obs_dim, rnn_hidden_dim, rnn_num_layers, rnn_type)
+    @property
+    def latent_dim(self) -> int:
+        """Width of the latent the MLP head reads, which a shared-memory head is sized from."""
+        return self._get_latent_dim()
 
     def get_latent(
         self, obs: TensorDict, *args: torch.Tensor, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
     ) -> torch.Tensor:
-        """Build the model latent by passing normalized observation groups through the RNN."""
-        # Extract and concatenate observation groups and normalize
-        latent = super().get_latent(obs, *args)
-        # Pass through the RNN
-        latent = self.rnn(latent, masks, hidden_state).squeeze(0)
-        return latent
+        """Rollout-mode latent advancing the internal hidden state, or a padded trajectory batch with ``masks``."""
+        feats = self._features(obs, *args)
+        return self._head_input(feats, self.rnn(feats, masks, hidden_state).squeeze(0))
+
+    def encode_sequence(
+        self, obs: TensorDict, hidden_state: HiddenState, resets: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, HiddenState]:
+        """Run a time-major ``(L, B)`` observation window from an explicit starting state.
+
+        Args:
+            obs: Observations with batch size ``(L, B)``.
+            hidden_state: State before the first step, ``(layers, B, hidden)``; ``None`` starts from zeros.
+            resets: ``(L, B)`` flags zeroing the state before the marked steps (episode starts).
+
+        Returns:
+            The per-step head input ``(L, B, latent)`` and the state after the last step.
+        """
+        feats = self._sequence_features(obs)
+        out, state = self.rnn.forward_sequence(feats, hidden_state, resets)
+        return self._head_input(feats, out), state
+
+    def encode_sequence_with_states(
+        self, obs: TensorDict, hidden_state: HiddenState, resets: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, HiddenState, HiddenState]:
+        """As :meth:`encode_sequence`, also returning the full state after every step, ``(L, layers, B, hidden)``."""
+        feats = self._sequence_features(obs)
+        out, state, states = self.rnn.forward_sequence_with_states(feats, hidden_state, resets)
+        return self._head_input(feats, out), state, states
+
+    def encode_step(self, obs: TensorDict, hidden_state: HiddenState) -> torch.Tensor:
+        """One recurrent step for a flat ``(N,)`` batch from explicit per-sample states ``(layers, N, hidden)``."""
+        feats = self._features(obs)
+        out, _ = self.rnn.forward_sequence(feats.unsqueeze(0), hidden_state)
+        return self._head_input(feats, out.squeeze(0))
+
+    def step_state(self, obs: TensorDict, hidden_state: HiddenState) -> HiddenState:
+        """Return the recurrent state after consuming a flat ``(N,)`` batch from explicit per-sample states."""
+        _, state = self.rnn.forward_sequence(self._features(obs).unsqueeze(0), hidden_state)
+        return state
+
+    def act_and_log_prob(
+        self,
+        obs: TensorDict,
+        *args: torch.Tensor,
+        std_clip: float | None = None,
+        hidden_state: HiddenState = None,
+        sequence: bool = False,
+        resets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample an action and its log-prob; in sequence mode over an ``(L, B)`` window from ``hidden_state``.
+
+        Sequence-mode outputs come back time-major, ``(L, B, A)`` and ``(L, B)``.
+        """
+        if not sequence:
+            return super().act_and_log_prob(obs, *args, std_clip=std_clip)
+        seq_len, batch = obs.batch_size
+        latent, _ = self.encode_sequence(obs, hidden_state, resets)
+        action, log_prob = self.act_and_log_prob_from_latent(latent.reshape(seq_len * batch, -1), std_clip=std_clip)
+        return action.view(seq_len, batch, -1), log_prob.view(seq_len, batch)
+
+    def act_and_log_prob_from_latent(
+        self, latent: torch.Tensor, std_clip: float | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample an action and its log-prob from an already computed flat ``(N, latent)`` head input."""
+        self.distribution.update(self.mlp(latent))  # type: ignore
+        return self.distribution.sample_and_log_prob(std_clip=std_clip)  # type: ignore
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
-        """Reset the recurrent hidden state of the RNN."""
+        """Reset the recurrent hidden state for all, or only the done, environments."""
         self.rnn.reset(dones, hidden_state)
 
     def get_hidden_state(self, batch_size: int | None = None, device: torch.device | None = None) -> HiddenState:
-        """Return the recurrent hidden state of the RNN.
+        """Return the rollout hidden state, materializing zeros on the very first step if needed.
 
-        If the hidden state has not yet been materialized (i.e. the model has never run a
-        forward pass) and ``batch_size`` is provided, lazily allocate a zero hidden state so
-        callers that snapshot the pre-step state (PPO ``act()`` on the first rollout step)
-        get a valid tensor rather than ``None``. This matches the TXL memory module which
-        pre-allocates its memory cache on the first rollout call. Without this, the saved
-        per-trajectory-start hidden buffer is short by ``num_envs`` entries (the step-0
-        entries of the very first rollout are skipped by ``_save_hidden_states``), and PPO's
-        first ``update()`` crashes with a GRU shape mismatch.
+        PPO snapshots the pre-step state on its first rollout step, so the state must exist before any forward.
         """
         if self.rnn.hidden_state is None and batch_size is not None:
             dev = device if device is not None else next(self.parameters()).device
-            dtype = next(self.parameters()).dtype
-            self.rnn._materialize_zero_hidden_state(batch_size, dev, dtype)
+            self.rnn._materialize_zero_hidden_state(batch_size, dev, next(self.parameters()).dtype)
         return self.rnn.hidden_state  # type: ignore
 
     def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:
@@ -129,9 +162,26 @@ class RNNModel(MLPModel):
         """Return a version of the model compatible with ONNX export."""
         return _OnnxRNNModel(self, verbose)
 
+    def _features(self, obs: TensorDict, *args: torch.Tensor) -> torch.Tensor:
+        """Recurrent input for a flat ``(N,)`` batch: the base model's latent, shape ``(N, F)``."""
+        return super().get_latent(obs, *args)
+
+    def _feature_dim(self) -> int:
+        """Width of the recurrent input: the base model's latent width."""
+        return super()._get_latent_dim()
+
+    def _sequence_features(self, obs: TensorDict) -> torch.Tensor:
+        """Recurrent input for an ``(L, B)`` window, shape ``(L, B, F)``."""
+        seq_len, batch = obs.batch_size
+        return self._features(obs.reshape(seq_len * batch)).view(seq_len, batch, -1)
+
+    def _head_input(self, feats: torch.Tensor, rnn_out: torch.Tensor) -> torch.Tensor:
+        """Combine the current features and the recurrent output into the head input (the recurrent output)."""
+        return rnn_out
+
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""
-        return self.latent_dim
+        return self.rnn_hidden_dim
 
 
 class _TorchGRUModel(nn.Module):

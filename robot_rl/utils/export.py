@@ -12,6 +12,7 @@ import re
 import torch
 import torch.nn as nn
 
+from robot_rl.models.cnn_rnn_model import CNNRNNModel
 from robot_rl.models.inference import EncoderInferencePolicy
 from robot_rl.models.rnn_model import RNNModel
 from robot_rl.modules.distribution import Distribution, bound_by_clip_actions
@@ -181,7 +182,7 @@ def _rebuild_distillation(
     sd = ckpt["student_state_dict"]
     model_cfg = dict(cfg["student"])
     model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
-    if issubclass(model_class, RNNModel):
+    if issubclass(model_class, RNNModel) and not issubclass(model_class, CNNRNNModel):
         raise NotImplementedError("Export of recurrent (memory-bearing) students is not supported.")
     groups = cfg["obs_groups"]["student"]
     shapes = {g: tuple(obs_shapes[g]) for g in groups if obs_shapes and g in obs_shapes}

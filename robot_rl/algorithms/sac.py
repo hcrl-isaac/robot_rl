@@ -398,7 +398,8 @@ class SAC:
                     self.reduce_parameters(self.actor_parameters)
                 _acc("Actor/grad_norm", nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm))
                 _acc("Actor/grad_norm_rnn", _param_grad_norm(self.actor.rnn.parameters()))  # type: ignore[attr-defined]
-                _acc("Actor/grad_norm_cnn", _param_grad_norm(self.actor.cnns.parameters()))  # type: ignore[attr-defined]
+                if hasattr(self.actor, "cnns"):
+                    _acc("Actor/grad_norm_cnn", _param_grad_norm(self.actor.cnns.parameters()))
                 self.actor_optimizer.step()
                 for p in self.critic_parameters:
                     p.requires_grad_(True)

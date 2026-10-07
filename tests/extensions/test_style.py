@@ -287,9 +287,9 @@ class TestActorWarmup:
         self._rollout(ppo, obs)
         ppo.update()
         restored, _ = self._warmup_ppo(tmp_path, warmup=10)
-        restored.load(ppo.save(), {"actor": True, "critic": True, "iteration": True}, strict=True)
+        restored.load(ppo.save(), {"actor": True, "critic": True, "iteration": True, "style": True}, strict=True)
         assert restored.num_updates_done == ppo.num_updates_done == 1
-        # a partial cfg that restores the critic is a resume, so the style state comes back with it
+        # a resume asks for the style state by name, so it comes back with the rest
         assert restored.style.reward_steps == ppo.style.reward_steps
         assert all(
             torch.equal(a, b)
@@ -513,7 +513,7 @@ class TestLoadDefaults:
         assert not self._diverged(trained, fresh)
 
     def test_a_partial_load_leaves_them_alone(self, tmp_path: Path) -> None:
-        """A caller naming the models it wants is loading for inference, which never reads them."""
+        """A cfg that does not name the key leaves the style modules as they are."""
         trained, _ = _build_style_ppo(tmp_path)
         trained.style.train()
         trained.style.update(torch.randn(64, STYLE_DIM))
@@ -525,14 +525,14 @@ class TestLoadDefaults:
         assert all(torch.equal(p, q) for p, q in zip(fresh.style.discriminators.parameters(), before, strict=True))
 
     def test_a_partial_resume_restores_them(self, tmp_path: Path) -> None:
-        """A cfg restoring the optimizer is resuming training, so it keeps the discriminators and their optimizer."""
+        """A resume names the key, so it keeps the discriminators and their optimizer."""
         trained, _ = _build_style_ppo(tmp_path)
         trained.style.train()
         trained.style.update(torch.randn(64, STYLE_DIM))
         saved = trained.save()
 
         fresh, _ = _build_style_ppo(tmp_path)
-        cfg = {"actor": True, "critic": True, "memory": True, "optimizer": True, "iteration": True, "rnd": True}
+        cfg = {"actor": True, "critic": True, "memory": True, "optimizer": True, "iteration": True, "style": True}
         fresh.load(saved, load_cfg=cfg, strict=True)
         assert not self._diverged(trained, fresh)
         assert (

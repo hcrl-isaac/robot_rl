@@ -738,8 +738,7 @@ class PPO:
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
         """Load specified models from a saved dict.
 
-        A partial ``load_cfg`` skips the style modules unless it sets ``style`` or restores the critic or
-        optimizer, so an inference load leaves them alone and a resume keeps its discriminators and clock.
+        A partial ``load_cfg`` loads the style modules only when it sets ``style``; the full default sets it.
         """
         # If no load_cfg is provided, load all models and states
         if load_cfg is None:
@@ -774,9 +773,7 @@ class PPO:
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         if load_cfg.get("iteration", False):
             self.num_updates_done = int(loaded_dict.get("num_updates_done", 0))
-        # a cfg restoring the critic or the optimizer is resuming training, which needs the style state
-        wants_resume = any(load_cfg.get(k) for k in ("critic", "optimizer"))
-        if load_cfg.get("style", wants_resume) and self.style is not None and "style_state_dict" in loaded_dict:
+        if load_cfg.get("style", False) and self.style is not None and "style_state_dict" in loaded_dict:
             self.style.load_state_dict(loaded_dict["style_state_dict"], strict=strict)
             if load_cfg.get("optimizer") and "style_optimizer_state_dict" in loaded_dict:
                 self.style.optimizer.load_state_dict(loaded_dict["style_optimizer_state_dict"])

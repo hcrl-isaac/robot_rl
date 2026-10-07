@@ -688,9 +688,11 @@ class VonMisesFisherDistribution(Distribution):
     def _bessel_terms(self, kappa: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute ``(log C_p(kappa), A_p(kappa))`` for a scalar concentration, differentiably.
 
-        See :func:`_vmf_bessel_terms`; fused on CUDA with Triton.
+        See :func:`_vmf_bessel_terms`; fused on CUDA with Triton, and by the enclosing graph when compiled.
         """
-        fn = _vmf_bessel_terms_fused if kappa.is_cuda and _has_triton() else _vmf_bessel_terms
+        # inside a compiled region the Triton check would break the graph (dynamo does not trace it)
+        fused = not torch.compiler.is_compiling() and kappa.is_cuda and _has_triton()
+        fn = _vmf_bessel_terms_fused if fused else _vmf_bessel_terms
         return fn(kappa, self.output_dim // 2, self._cf_extra)
 
     def update(self, mlp_output: torch.Tensor) -> None:

@@ -736,7 +736,10 @@ class PPO:
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
-        """Load specified models from a saved dict."""
+        """Load specified models from a saved dict.
+
+        A partial ``load_cfg`` loads the style modules only when it sets ``style``; the full default sets it.
+        """
         # If no load_cfg is provided, load all models and states
         if load_cfg is None:
             load_cfg = {
@@ -770,7 +773,7 @@ class PPO:
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         if load_cfg.get("iteration", False):
             self.num_updates_done = int(loaded_dict.get("num_updates_done", 0))
-        if load_cfg.get("style", True) and self.style is not None and "style_state_dict" in loaded_dict:
+        if load_cfg.get("style", False) and self.style is not None and "style_state_dict" in loaded_dict:
             self.style.load_state_dict(loaded_dict["style_state_dict"], strict=strict)
             if load_cfg.get("optimizer") and "style_optimizer_state_dict" in loaded_dict:
                 self.style.optimizer.load_state_dict(loaded_dict["style_optimizer_state_dict"])

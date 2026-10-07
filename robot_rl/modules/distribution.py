@@ -605,7 +605,7 @@ _vmf_bessel_terms_fused = torch.compile(_vmf_bessel_terms, fullgraph=True, dynam
 
 @functools.cache
 def _has_triton() -> bool:
-    """Whether inductor can generate GPU kernels here (Isaac Sim's aarch64 image ships torch without Triton)."""
+    """Whether inductor can generate GPU kernels here."""
     from torch.utils._triton import has_triton
 
     return has_triton()
@@ -688,8 +688,7 @@ class VonMisesFisherDistribution(Distribution):
     def _bessel_terms(self, kappa: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute ``(log C_p(kappa), A_p(kappa))`` for a scalar concentration, differentiably.
 
-        See :func:`_vmf_bessel_terms`. On CUDA with Triton the recurrence runs as one fused kernel each way:
-        eager, its hundreds of scalar ops are as many kernel launches per forward and per backward.
+        See :func:`_vmf_bessel_terms`; fused on CUDA with Triton.
         """
         fn = _vmf_bessel_terms_fused if kappa.is_cuda and _has_triton() else _vmf_bessel_terms
         return fn(kappa, self.output_dim // 2, self._cf_extra)
@@ -749,11 +748,8 @@ class VonMisesFisherDistribution(Distribution):
     def _sample_weight_noise(self, batch: int, p: int, kappa: torch.Tensor, device: torch.device) -> torch.Tensor:
         """Rejection-sample the Beta noise behind the tangential component ``w`` (Wood, 1994).
 
-        Each row draws :data:`VMF_PROPOSALS` proposals at once and keeps its first accepted one, which is the
-        same distribution as proposing until acceptance, with fixed shapes and no host sync (so it can be
-        captured in a CUDA graph). A row with none accepted keeps ``z = 0.5``, which maps exactly to the mode
-        ``w = x0``. The acceptance rate is at least 0.7 for ``p = 256`` at any concentration, so that has
-        probability below 1e-17 per row.
+        Each row keeps the first accepted of :data:`VMF_PROPOSALS` proposals (fixed shapes, no host sync); a row
+        with none keeps ``z = 0.5``, the mode.
         """
         z, accepted = _wood_noise(kappa, float(p - 1), batch, device)
         return torch.where(accepted, z, 0.5).float()

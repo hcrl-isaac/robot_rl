@@ -289,6 +289,14 @@ class TestActorWarmup:
         restored, _ = self._warmup_ppo(tmp_path, warmup=10)
         restored.load(ppo.save(), {"actor": True, "critic": True, "iteration": True}, strict=True)
         assert restored.num_updates_done == ppo.num_updates_done == 1
+        # a partial cfg that restores the critic is a resume, so the style state comes back with it
+        assert restored.style.reward_steps == ppo.style.reward_steps
+        assert all(
+            torch.equal(a, b)
+            for a, b in zip(
+                ppo.style.discriminators.parameters(), restored.style.discriminators.parameters(), strict=True
+            )
+        )
 
 
 class TestActInference:
@@ -515,6 +523,21 @@ class TestLoadDefaults:
         before = [p.clone() for p in fresh.style.discriminators.parameters()]
         fresh.load(saved, load_cfg={"actor": True, "memory": True}, strict=True)
         assert all(torch.equal(p, q) for p, q in zip(fresh.style.discriminators.parameters(), before, strict=True))
+
+    def test_a_partial_resume_restores_them(self, tmp_path: Path) -> None:
+        """A cfg restoring the optimizer is resuming training, so it keeps the discriminators and their optimizer."""
+        trained, _ = _build_style_ppo(tmp_path)
+        trained.style.train()
+        trained.style.update(torch.randn(64, STYLE_DIM))
+        saved = trained.save()
+
+        fresh, _ = _build_style_ppo(tmp_path)
+        cfg = {"actor": True, "critic": True, "memory": True, "optimizer": True, "iteration": True, "rnd": True}
+        fresh.load(saved, load_cfg=cfg, strict=True)
+        assert not self._diverged(trained, fresh)
+        assert (
+            fresh.style.optimizer.state_dict()["state"].keys() == trained.style.optimizer.state_dict()["state"].keys()
+        )
 
     def test_a_partial_load_can_ask_for_them(self, tmp_path: Path) -> None:
         """Naming the key overrides the default, for a caller that does want them."""

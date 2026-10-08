@@ -29,6 +29,7 @@ class StyleDiscriminators(nn.Module):
         num_states: int,
         obs_groups: dict[str, list[str]],
         experts: list[dict[str, Any]],
+        group_dims: dict[str, int] | None = None,
         hidden_dims: tuple[int, ...] | list[int] = (512, 256),
         activation: str = "elu",
         state_normalization: bool = True,
@@ -47,11 +48,13 @@ class StyleDiscriminators(nn.Module):
         """Initialize the discriminators and load the expert datasets.
 
         Args:
-            num_states: Dimension of the style state (the concatenated ``style`` observation groups).
-            obs_groups: Observation groups dictionary; ``obs_groups["style"]`` names the groups read.
+            num_states: Dimension of the style state (every style group any expert reads, concatenated).
+            obs_groups: Observation groups dictionary; ``obs_groups["style"]`` names the groups read by default.
             experts: One dict per expert with ``name``, ``data_path`` (a ``.pt`` file holding a ``states``
-                tensor of shape ``(M, num_states)``), ``weight`` (advantage weight of its reward stream) and
-                optionally ``gate_group`` (observation group whose flag limits where the stream pays).
+                tensor of shape ``(M, its groups' width)``), ``weight`` (advantage weight of its reward stream),
+                optionally ``obs_groups`` (the style groups it reads, in its data's order; default
+                ``obs_groups["style"]``) and ``gate_group`` (observation group whose flag limits where it pays).
+            group_dims: Width of each style group; required when an expert names its own ``obs_groups``.
             hidden_dims: Hidden dimensions of every discriminator MLP.
             activation: Activation function.
             state_normalization: Normalize the style state with running statistics from the policy rollouts.
@@ -71,6 +74,22 @@ class StyleDiscriminators(nn.Module):
         super().__init__()
         self.num_states = num_states
         self.obs_groups = obs_groups
+        expert_groups = [list(e.get("obs_groups") or obs_groups["style"]) for e in experts]
+        self.state_groups = list(dict.fromkeys([*obs_groups["style"], *(g for gs in expert_groups for g in gs)]))
+        if group_dims is None:
+            if self.state_groups != list(obs_groups["style"]):
+                raise ValueError("Experts that name their own obs_groups need group_dims.")
+            self.expert_columns = [torch.arange(num_states, device=device) for _ in experts]
+        else:
+            offsets, start = {}, 0
+            for g in self.state_groups:
+                offsets[g], start = start, start + group_dims[g]
+            if start != num_states:
+                raise ValueError(f"Style groups {self.state_groups} span {start} columns, not {num_states}.")
+            self.expert_columns = [
+                torch.cat([torch.arange(offsets[g], offsets[g] + group_dims[g]) for g in gs]).to(device)
+                for gs in expert_groups
+            ]
         self.device = device
         self.names = [str(e["name"]) for e in experts]
         self.stream_weights = torch.tensor([float(e.get("weight", 1.0)) for e in experts], device=device)
@@ -102,9 +121,13 @@ class StyleDiscriminators(nn.Module):
             for _ in experts
         ])
         self.discriminators = nn.ModuleList([
-            MLP(num_states, 1, hidden_dims, activation=activation).to(device) for _ in experts
+            MLP(len(cols), 1, hidden_dims, activation=activation).to(device) for cols in self.expert_columns
         ])
-        self.expert_states = [self._load_expert(e["data_path"]) for e in experts] if load_experts else []
+        self.expert_states = (
+            [self._load_expert(e["data_path"], len(cols)) for e, cols in zip(experts, self.expert_columns, strict=True)]
+            if load_experts
+            else []
+        )
         self.optimizer = torch.optim.Adam(self.discriminators.parameters(), lr=learning_rate)
 
     @property
@@ -112,20 +135,27 @@ class StyleDiscriminators(nn.Module):
         """Number of expert datasets (reward streams)."""
         return len(self.discriminators)
 
-    def _load_expert(self, path: str) -> torch.Tensor:
+    def _load_expert(self, path: str, width: int) -> torch.Tensor:
         path = os.path.expanduser(path)
         data = torch.load(path, map_location=self.device, weights_only=False)
         states = data["states"] if isinstance(data, dict) else data
-        if states.ndim != 2 or states.shape[1] != self.num_states:
+        if states.ndim != 2 or states.shape[1] != width:
             raise ValueError(
-                f"Expert data {path} has shape {tuple(states.shape)}; expected (M, {self.num_states}) to match the"
-                " style observation groups."
+                f"Expert data {path} has shape {tuple(states.shape)}; expected (M, {width}) to match its style"
+                " observation groups."
             )
         return states.to(self.device, dtype=torch.float32)
 
     def get_style_state(self, obs: TensorDict) -> torch.Tensor:
-        """Concatenate the observation groups that make up the style state."""
-        return torch.cat([obs[g] for g in self.obs_groups["style"]], dim=-1)
+        """Concatenate every style group any expert reads."""
+        return torch.cat([obs[g] for g in self.state_groups], dim=-1)
+
+    def _normalize_expert(self, states: torch.Tensor, k: int) -> torch.Tensor:
+        """Normalize expert ``k``'s data with the state normalizer's statistics for its columns."""
+        if not self.state_normalization:
+            return states
+        cols, norm = self.expert_columns[k], self.state_normalizer
+        return (states - norm._mean[:, cols]) / (norm._std[:, cols] + norm.eps)  # type: ignore[index, operator]
 
     def update_normalization(self, obs: TensorDict) -> None:
         """Update the state normalizer from policy observations."""
@@ -149,7 +179,8 @@ class StyleDiscriminators(nn.Module):
             self.weight = self.initial_weight
         with torch.no_grad():
             state = self.state_normalizer(self.get_style_state(obs))
-            scores = torch.cat([disc(state) for disc in self.discriminators], dim=-1)  # (E, K)
+            pairs = zip(self.discriminators, self.expert_columns, strict=True)
+            scores = torch.cat([disc(state[:, cols]) for disc, cols in pairs], dim=-1)  # (E, K)
             gates = self.gate_masks(obs)
             columns = []
             for k, norm in enumerate(self.reward_normalizers):
@@ -184,7 +215,8 @@ class StyleDiscriminators(nn.Module):
             policy_states = self.state_normalizer(policy_states)
         for k, (disc, expert) in enumerate(zip(self.discriminators, self.expert_states, strict=True)):
             gate = None if gates is None else gates[k]
-            states = policy_states if gate is None else policy_states[gate]
+            states = policy_states[:, self.expert_columns[k]]
+            states = states if gate is None else states[gate]
             num = states.shape[0]
             if num == 0:
                 continue
@@ -197,8 +229,8 @@ class StyleDiscriminators(nn.Module):
                 for b in range(num_batches):
                     pol = states[perm[b * batch : (b + 1) * batch]]
                     with torch.no_grad():
-                        exp = self.state_normalizer(
-                            expert[torch.randint(0, expert.shape[0], (pol.shape[0],), device=self.device)]
+                        exp = self._normalize_expert(
+                            expert[torch.randint(0, expert.shape[0], (pol.shape[0],), device=self.device)], k
                         )
                     expert_score = disc(exp).mean()
                     policy_score = disc(pol).mean()
@@ -270,16 +302,19 @@ class StyleDiscriminators(nn.Module):
 
 
 def resolve_style_config(alg_cfg: dict, obs: TensorDict, obs_groups: dict[str, list[str]]) -> dict:
-    """Fill in the style-state dimension and observation groups, or set ``style_cfg`` to None."""
+    """Fill in the style-state dimension, group widths and observation groups, or set ``style_cfg`` to None."""
     if "style_cfg" in alg_cfg and alg_cfg["style_cfg"] is not None:
-        num_states = 0
-        for obs_group in obs_groups["style"]:
+        experts = alg_cfg["style_cfg"].get("experts", [])
+        groups = dict.fromkeys([*obs_groups["style"], *(g for e in experts for g in (e.get("obs_groups") or []))])
+        group_dims = {}
+        for obs_group in groups:
             if len(obs[obs_group].shape) != 2:
                 raise ValueError(
                     f"Style discriminators only support 1D observations, got {obs[obs_group].shape} for '{obs_group}'."
                 )
-            num_states += obs[obs_group].shape[-1]
-        alg_cfg["style_cfg"]["num_states"] = num_states
+            group_dims[obs_group] = obs[obs_group].shape[-1]
+        alg_cfg["style_cfg"]["num_states"] = sum(group_dims.values())
+        alg_cfg["style_cfg"]["group_dims"] = group_dims
         alg_cfg["style_cfg"]["obs_groups"] = obs_groups
     else:
         alg_cfg["style_cfg"] = None

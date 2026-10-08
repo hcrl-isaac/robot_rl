@@ -59,9 +59,9 @@ class CNNRNNModel(RNNModel, CNNModel):
             rnn_type=rnn_type,
             rnn_hidden_dim=rnn_hidden_dim,
             rnn_num_layers=rnn_num_layers,
+            aux_target_dim=aux_target_dim,
             **kwargs,
         )
-        self.aux_head = nn.Linear(self._aux_input_dim(), aux_target_dim) if aux_target_dim > 0 else None
 
     def get_latent(
         self, obs: TensorDict, *args: torch.Tensor, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
@@ -70,14 +70,6 @@ class CNNRNNModel(RNNModel, CNNModel):
         if masks is not None:
             raise ValueError("CNNRNNModel batched updates go through encode_sequence, not masks")
         return super().get_latent(obs, *args)
-
-    def aux_prediction(self, latent: torch.Tensor) -> torch.Tensor:
-        """Auxiliary-head prediction from a flat head input ``(N, latent)``."""
-        return self.aux_head(latent[:, : self._aux_input_dim()])  # type: ignore[misc]
-
-    def _aux_input_dim(self) -> int:
-        """Width of the head input the auxiliary head reads (the full head input by default)."""
-        return self._get_latent_dim()
 
     def _head_input(self, feats: torch.Tensor, rnn_out: torch.Tensor) -> torch.Tensor:
         """Combine the current features and the recurrent output into the head input (concatenation)."""

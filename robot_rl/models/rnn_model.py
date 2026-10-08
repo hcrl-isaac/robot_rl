@@ -37,6 +37,7 @@ class RNNModel(MLPModel):
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
+        aux_target_dim: int = 0,
         **kwargs: Any,
     ) -> None:
         """Initialize the RNN-based model.
@@ -49,12 +50,15 @@ class RNNModel(MLPModel):
             rnn_type: Type of RNN to use ("lstm" or "gru").
             rnn_hidden_dim: Dimension of the RNN hidden state.
             rnn_num_layers: Number of RNN layers.
+            aux_target_dim: Width of an auxiliary linear head on the head input, for a supervised
+                prediction target (e.g. a privileged object position); ``0`` adds none.
             **kwargs: Forwarded to the base model (``hidden_dims``, ``distribution_cfg``, ``memory_only``, ...).
         """
         # read by the head construction in the base __init__, so it must exist first
         self.rnn_hidden_dim = rnn_hidden_dim
         super().__init__(obs, obs_groups, obs_set, output_dim, **kwargs)
         self.rnn = RNN(self._feature_dim(), rnn_hidden_dim, rnn_num_layers, rnn_type)
+        self.aux_head = nn.Linear(self._aux_input_dim(), aux_target_dim) if aux_target_dim > 0 else None
 
     @property
     def latent_dim(self) -> int:
@@ -131,6 +135,10 @@ class RNNModel(MLPModel):
         self.distribution.update(self.mlp(latent))  # type: ignore
         return self.distribution.sample_and_log_prob(std_clip=std_clip)  # type: ignore
 
+    def aux_prediction(self, latent: torch.Tensor) -> torch.Tensor:
+        """Auxiliary-head prediction from a flat head input ``(N, latent)``."""
+        return self.aux_head(latent[:, : self._aux_input_dim()])  # type: ignore[misc]
+
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         """Reset the recurrent hidden state for all, or only the done, environments."""
         self.rnn.reset(dones, hidden_state)
@@ -178,6 +186,10 @@ class RNNModel(MLPModel):
     def _head_input(self, feats: torch.Tensor, rnn_out: torch.Tensor) -> torch.Tensor:
         """Combine the current features and the recurrent output into the head input (the recurrent output)."""
         return rnn_out
+
+    def _aux_input_dim(self) -> int:
+        """Width of the head input the auxiliary head reads (the full head input by default)."""
+        return self._get_latent_dim()
 
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""

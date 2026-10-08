@@ -290,10 +290,12 @@ class TestRecurrentSAC:
         assert "Actor/aux_loss" not in diag
 
 
-def _build_state_only(done_prob: float = 0.1, obs_normalization: bool = True) -> tuple[SAC, _DummyImageVecEnv]:
+def _build_state_only(
+    done_prob: float = 0.1, obs_normalization: bool = True, aux_obs_group: str | None = None
+) -> tuple[SAC, _DummyImageVecEnv]:
     """Build SAC with an RNNModel actor that reads only the 1D policy group."""
     env = _DummyImageVecEnv(done_prob=done_prob)
-    cfg = _make_cfg(obs_normalization)
+    cfg = _make_cfg(obs_normalization, aux_obs_group)
     cfg["obs_groups"] = {"actor": ["policy"], "critic": ["critic"]}
     cfg["actor"]["class_name"] = "RNNModel"
     del cfg["actor"]["cnn_cfg"]
@@ -333,3 +335,13 @@ class TestStateOnlyRecurrentSAC:
         losses, _ = alg.update()
         for key in ("critic_1", "critic_2", "actor", "alpha"):
             assert torch.isfinite(torch.tensor(losses[key])), key
+
+    def test_aux_head_estimates_a_privileged_target(self) -> None:
+        """An aux group gives the RNNModel actor a head on its recurrent state and the update trains it."""
+        torch.manual_seed(0)
+        alg, env = _build_state_only(aux_obs_group="target")
+        assert alg.actor.aux_head is not None and alg.actor.aux_head.in_features == 16
+        assert alg.actor.aux_head.out_features == 3
+        _collect(alg, env, 12)
+        _, diag = alg.update()
+        assert "Actor/aux_loss" in diag and diag["Actor/aux_loss"] > 0

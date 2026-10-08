@@ -124,7 +124,7 @@ class StyleDiscriminators(nn.Module):
             MLP(len(cols), 1, hidden_dims, activation=activation).to(device) for cols in self.expert_columns
         ])
         self.expert_states = (
-            [self._load_expert(e["data_path"], len(cols)) for e, cols in zip(experts, self.expert_columns)]
+            [self._load_expert(e["data_path"], len(cols)) for e, cols in zip(experts, self.expert_columns, strict=True)]
             if load_experts
             else []
         )
@@ -179,9 +179,8 @@ class StyleDiscriminators(nn.Module):
             self.weight = self.initial_weight
         with torch.no_grad():
             state = self.state_normalizer(self.get_style_state(obs))
-            scores = torch.cat(
-                [disc(state[:, cols]) for disc, cols in zip(self.discriminators, self.expert_columns)], dim=-1
-            )  # (E, K)
+            pairs = zip(self.discriminators, self.expert_columns, strict=True)
+            scores = torch.cat([disc(state[:, cols]) for disc, cols in pairs], dim=-1)  # (E, K)
             gates = self.gate_masks(obs)
             columns = []
             for k, norm in enumerate(self.reward_normalizers):

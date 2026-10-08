@@ -24,6 +24,7 @@ NUM_ENVS = 16
 NUM_STEPS = 8
 OBS_DIM = 6
 STYLE_DIM = 5
+EXTRA_DIM = 2
 NUM_ACTIONS = 3
 
 
@@ -76,6 +77,36 @@ class TestDiscriminators:
         assert a_on_a > a_on_b
         assert b_on_b > b_on_a
 
+    def test_expert_reads_its_own_groups(self, tmp_path: Path) -> None:
+        """An expert naming extra groups gets a discriminator over its columns only, in its listed order."""
+        torch.save({"states": torch.randn(500, STYLE_DIM + EXTRA_DIM)}, tmp_path / "wide.pt")
+        experts = [
+            {"name": "a", "data_path": _write_expert(tmp_path / "a.pt", 2.0)},
+            {"name": "w", "data_path": str(tmp_path / "wide.pt"), "obs_groups": ["style", "extra"]},
+        ]
+        dims = {"style": STYLE_DIM, "extra": EXTRA_DIM}
+        style = StyleDiscriminators(
+            STYLE_DIM + EXTRA_DIM, {"style": ["style"]}, experts, group_dims=dims, hidden_dims=[16], batch_size=32
+        )
+        style.train()
+        obs = _obs()
+        obs["extra"] = torch.randn(NUM_ENVS, EXTRA_DIM)
+        assert style.get_style_state(obs).shape == (NUM_ENVS, STYLE_DIM + EXTRA_DIM)
+        assert style.discriminators[0][0].in_features == STYLE_DIM
+        assert style.discriminators[1][0].in_features == STYLE_DIM + EXTRA_DIM
+        assert style.compute_rewards(obs).shape == (NUM_ENVS, 2)
+        assert set(style.update(style.get_style_state(obs))) >= {"Style/a_expert", "Style/w_expert"}
+
+    def test_resolve_config_fills_group_dims(self) -> None:
+        """The resolver widens the style state by every group an expert names."""
+        obs = _obs()
+        obs["extra"] = torch.randn(NUM_ENVS, EXTRA_DIM)
+        cfg = resolve_style_config(
+            {"style_cfg": {"experts": [{"name": "w", "obs_groups": ["style", "extra"]}]}}, obs, {"style": ["style"]}
+        )
+        assert cfg["style_cfg"]["group_dims"] == {"style": STYLE_DIM, "extra": EXTRA_DIM}
+        assert cfg["style_cfg"]["num_states"] == STYLE_DIM + EXTRA_DIM
+
     def test_gate_zeroes_unclaimed_transitions(self, tmp_path: Path) -> None:
         """An unreachable gate threshold zeroes every style reward."""
         style = _make_style(tmp_path, reward_normalization=False, state_normalization=False, gate_threshold=1e6)
@@ -116,23 +147,25 @@ class TestDiscriminators:
         assert resolve_style_config({}, obs, {})["style_cfg"] is None
 
 
-def _build_style_ppo(tmp_path: Path) -> tuple[PPO, TensorDict]:
+def _build_style_ppo(tmp_path: Path, extra: bool = False) -> tuple[PPO, TensorDict]:
     obs = _obs()
+    if extra:
+        obs["extra"] = torch.randn(NUM_ENVS, EXTRA_DIM)
     obs_groups = {"actor": ["policy"], "critic": ["policy"], "style": ["style"]}
     dist = {"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"}
     actor = MLPModel(obs, obs_groups, "actor", NUM_ACTIONS, hidden_dims=[32], activation="elu", distribution_cfg=dist)
     critic = MLPModel(obs, obs_groups, "critic", 3, hidden_dims=[32], activation="elu")
     storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS], num_reward_streams=3)
-    style_cfg = {
-        "num_states": STYLE_DIM,
-        "obs_groups": obs_groups,
-        "experts": [
-            {"name": "a", "data_path": _write_expert(tmp_path / "a.pt", 2.0), "weight": 1.0},
-            {"name": "b", "data_path": _write_expert(tmp_path / "b.pt", -2.0), "weight": 0.5},
-        ],
-        "hidden_dims": [32],
-        "batch_size": 32,
-    }
+    experts = [
+        {"name": "a", "data_path": _write_expert(tmp_path / "a.pt", 2.0), "weight": 1.0},
+        {"name": "b", "data_path": _write_expert(tmp_path / "b.pt", -2.0), "weight": 0.5},
+    ]
+    if extra:
+        torch.save({"states": torch.randn(500, STYLE_DIM + EXTRA_DIM)}, tmp_path / "wide.pt")
+        experts[1] = {"name": "b", "data_path": str(tmp_path / "wide.pt"), "obs_groups": ["style", "extra"]}
+    style_cfg = resolve_style_config(
+        {"style_cfg": {"experts": experts, "hidden_dims": [32], "batch_size": 32}}, obs, obs_groups
+    )["style_cfg"]
     ppo = PPO(
         actor,
         critic,
@@ -172,6 +205,18 @@ class TestMultiStreamPPO:
         ppo2.load(saved, None, strict=True)
         for p1, p2 in zip(ppo.style.discriminators.parameters(), ppo2.style.discriminators.parameters(), strict=True):
             assert torch.equal(p1, p2)
+
+    def test_rollout_with_an_expert_reading_extra_groups(self, tmp_path: Path) -> None:
+        """An expert's extra style group flows from storage into its discriminator update."""
+        ppo, obs = _build_style_ppo(tmp_path, extra=True)
+        ppo.train_mode()
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            nxt = _obs()
+            nxt["extra"] = torch.randn(NUM_ENVS, EXTRA_DIM)
+            ppo.process_env_step(nxt, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS, dtype=torch.uint8), {})
+        ppo.compute_returns(obs)
+        assert "Style/b_expert" in ppo.update()
 
     def test_stream_advantages_are_standardized_and_weighted(self, tmp_path: Path) -> None:
         """A stream with zero weight must not move the combined advantage."""

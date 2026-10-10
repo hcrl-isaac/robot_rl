@@ -8,6 +8,8 @@
 import torch
 from tensordict import TensorDict
 
+import pytest
+
 from robot_rl.algorithms import SAC
 
 OBS_DIM, ACT_DIM, NUM_ENVS = 6, 3, 8
@@ -31,6 +33,7 @@ class _DummyImageVecEnv:
                 "critic": torch.randn(self.num_envs, OBS_DIM),
                 "target": torch.randn(self.num_envs, 3),
                 "pixel": torch.cat([torch.rand(self.num_envs, 2), torch.ones(self.num_envs, 1)], dim=1),
+                "view": torch.cat([torch.randn(self.num_envs, 3), (torch.rand(self.num_envs, 1) < 0.5).float()], dim=1),
             },
             batch_size=self.num_envs,
         )
@@ -345,3 +348,47 @@ class TestStateOnlyRecurrentSAC:
         _collect(alg, env, 12)
         _, diag = alg.update()
         assert "Actor/aux_loss" in diag and diag["Actor/aux_loss"] > 0
+
+
+def _build_with_estimator(image_actor: bool) -> tuple[SAC, _DummyImageVecEnv]:
+    """Build SAC with a separate supervised estimator of the ``target`` group."""
+    env = _DummyImageVecEnv()
+    cfg = _make_cfg()
+    if not image_actor:
+        cfg["obs_groups"] = {"actor": ["policy"], "critic": ["critic"]}
+        cfg["actor"] = {k: v for k, v in cfg["actor"].items() if k != "cnn_cfg"} | {"class_name": "RNNModel"}
+    cfg["algorithm"] |= {"estimator_obs_group": "target", "estimator_view_group": "view", "estimator_hidden_dim": 8}
+    return SAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu"), env
+
+
+class TestSequenceEstimator:
+    """The separate estimator trains on replay windows, logs split errors, and checkpoints."""
+
+    @pytest.mark.parametrize("image_actor", [False, True])
+    def test_estimator_trains_and_logs_split_error(self, image_actor: bool) -> None:
+        """It reads only the actor's vector groups, steps its own optimizer, and logs masked and visible error."""
+        torch.manual_seed(0)
+        alg, env = _build_with_estimator(image_actor)
+        assert alg.estimator is not None and alg.estimator.readout.out_features == 3
+        assert alg.estimator.norm.normalized_shape == (OBS_DIM,)
+        assert getattr(alg.actor, "aux_head", None) is None
+        before = [p.detach().clone() for p in alg.estimator.parameters()]
+        _collect(alg, env, 12)
+        _, diag = alg.update()
+        for key in ("Estimator/loss", "Estimator/abs_err", "Estimator/abs_err_mean_guess", "Estimator/masked_frac"):
+            assert key in diag and torch.isfinite(torch.tensor(diag[key])), key
+        assert "Estimator/abs_err_masked" in diag and "Estimator/abs_err_visible" in diag
+        assert any(not torch.equal(b, p) for b, p in zip(before, alg.estimator.parameters(), strict=True))
+
+    def test_estimator_round_trips_through_a_checkpoint(self) -> None:
+        """Its weights save with the algorithm and load back."""
+        torch.manual_seed(0)
+        alg, env = _build_with_estimator(image_actor=False)
+        _collect(alg, env, 12)
+        alg.update()
+        saved = alg.save()
+        assert "estimator_state_dict" in saved
+        other, _ = _build_with_estimator(image_actor=False)
+        other.load(saved)
+        for a, b in zip(alg.estimator.parameters(), other.estimator.parameters(), strict=True):
+            assert torch.equal(a, b)

@@ -35,7 +35,7 @@ class DistillationPPO(Distillation):
         gradient_length: int = 15,
         learning_rate: float = 1e-3,
         max_grad_norm: float | None = None,
-        loss_type: str = "mse",
+        loss_type: str = "nll",
         aux_obs_group: str | None = None,
         aux_loss_weight: float = 1.0,
         optimizer: str = "adam",
@@ -64,7 +64,8 @@ class DistillationPPO(Distillation):
             gradient_length: Timesteps accumulated before each gradient step.
             learning_rate: Shared learning rate of the student and the critic.
             max_grad_norm: Gradient-norm clip, or None.
-            loss_type: Behavior-cloning loss between the student's mean action and the teacher's action.
+            loss_type: Behavior-cloning loss: ``"nll"`` is the teacher action's negative log-likelihood under
+                the student's distribution, in the surrogate's units; ``"mse"``/``"huber"`` act on the mean.
             aux_obs_group: Observation group an auxiliary head on the student regresses, or None.
             aux_loss_weight: Weight of that auxiliary loss.
             optimizer: Optimizer name.
@@ -83,6 +84,7 @@ class DistillationPPO(Distillation):
             multi_gpu_cfg: Distributed training configuration, or None.
             **kwargs: Unused configuration entries.
         """
+        self.nll_cloning = loss_type == "nll"
         super().__init__(
             student,
             teacher,
@@ -91,7 +93,7 @@ class DistillationPPO(Distillation):
             gradient_length=gradient_length,
             learning_rate=learning_rate,
             max_grad_norm=max_grad_norm,
-            loss_type=loss_type,
+            loss_type="mse" if self.nll_cloning else loss_type,
             aux_obs_group=aux_obs_group,
             aux_loss_weight=aux_loss_weight,
             optimizer=optimizer,
@@ -181,7 +183,10 @@ class DistillationPPO(Distillation):
             for batch in self.storage.generator():
                 latent = self.student.get_latent(batch.observations)
                 self.student.forward_from_latent(latent, stochastic_output=True)
-                behavior_loss = self.loss_fn(self.student.output_mean, batch.privileged_actions)
+                if self.nll_cloning:
+                    behavior_loss = -self.student.get_output_log_prob(batch.privileged_actions).mean()
+                else:
+                    behavior_loss = self.loss_fn(self.student.output_mean, batch.privileged_actions)
                 step_loss = bc_weight * behavior_loss
 
                 log_prob = self.student.get_output_log_prob(batch.actions)

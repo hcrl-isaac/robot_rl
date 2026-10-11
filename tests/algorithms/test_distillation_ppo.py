@@ -118,6 +118,27 @@ class TestDistillationPPO:
         assert any(not torch.equal(b, p) for b, p in zip(before_s, alg.student.parameters(), strict=True))
         assert any(not torch.equal(b, p) for b, p in zip(before_c, alg.critic.parameters(), strict=True))
 
+    def test_nll_cloning_pulls_the_student_toward_the_teacher(self) -> None:
+        """With the default likelihood loss, the teacher's action grows more likely under the student."""
+        torch.manual_seed(0)
+        alg, env = _build(loss_type="nll", bc_weight=1.0, bc_weight_final=1.0, critic_warmup_updates=10)
+        assert alg.nll_cloning
+        obs = env.get_observations()
+        teacher_action = alg.teacher(obs).detach()
+        with torch.no_grad():
+            alg.student.reset()
+            alg.student(obs, stochastic_output=True)
+            before = alg.student.get_output_log_prob(teacher_action).mean().item()
+        for _ in range(6):
+            _rollout(alg, env)
+            losses = alg.update()
+            assert torch.isfinite(torch.tensor(losses["behavior"]))
+        with torch.no_grad():
+            alg.student.reset()
+            alg.student(obs, stochastic_output=True)
+            after = alg.student.get_output_log_prob(teacher_action).mean().item()
+        assert after > before
+
     def test_bc_weight_anneals_linearly_then_holds(self) -> None:
         """The cloning weight falls linearly to its final value over the anneal window and then stays there."""
         torch.manual_seed(0)

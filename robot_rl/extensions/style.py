@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Per-expert Wasserstein style discriminators: experts enter PPO as data, each with its own reward stream."""
+"""Per-expert least-squares style discriminators: experts enter PPO as data, each with its own reward stream."""
 
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ from robot_rl.modules import MLP, EmpiricalNormalization
 
 
 class StyleDiscriminators(nn.Module):
-    """One Wasserstein discriminator per expert dataset, each producing a style reward stream.
+    """One least-squares discriminator per expert dataset, each producing a bounded style reward stream.
 
     References:
-        - Li et al. "Learning Agile Skills via Adversarial Imitation of Rough Partial Demonstrations." CoRL (2022).
+        - Peng et al. "AMP: Adversarial Motion Priors for Stylized Physics-Based Character Control." SIGGRAPH (2021).
         - Xu et al. "Composite Motion Learning with Task Control." SIGGRAPH (2023) -- one value head per reward.
     """
 
@@ -56,14 +56,15 @@ class StyleDiscriminators(nn.Module):
             activation: Activation function.
             state_normalization: Normalize the style state with running statistics from the policy rollouts.
             reward_normalization: Standardize each discriminator's reward with its own running statistics.
-            gradient_penalty_coef: Coefficient of the gradient penalty on expert/policy interpolates.
+            gradient_penalty_coef: Weight ``w_gp`` of the zero-centred gradient penalty on expert states, applied
+                as ``w_gp / 2``.
             learning_rate: Discriminator learning rate.
             num_learning_epochs: Passes over the rollout's policy states per update.
             batch_size: Mini-batch size for the discriminator update.
             weight: Global multiplier of every style stream's advantage weight.
             weight_schedule: Optional schedule of ``weight`` over collection steps, as in the RND extension.
-            gate_threshold: When set, a transition gets zero style reward unless at least one normalized
-                discriminator score exceeds it (interface states no expert claims are not penalized).
+            gate_threshold: When set, a transition gets zero style reward unless at least one (normalized)
+                style reward exceeds it (interface states no expert claims are not penalized).
             reward_clip: Symmetric clip on the normalized style rewards.
             load_experts: Load the expert datasets (False for inference-only use; ``update`` then fails).
             device: Device.
@@ -139,8 +140,8 @@ class StyleDiscriminators(nn.Module):
     def compute_rewards(self, obs: TensorDict) -> torch.Tensor:
         """Per-expert style rewards for the current transitions, shape ``(num_envs, num_experts)``.
 
-        A reward is a standardized discriminator score, so it is zero-mean over the states a stream pays on and
-        is negative on about half of them; the task stream carries the positive per-step floor.
+        A reward is ``max(0, 1 - (D - 1)^2 / 4)`` in [0, 1]; with ``reward_normalization`` it is standardized
+        over the states the stream pays on, and the task stream carries the positive per-step floor.
         """
         self.reward_steps += 1
         if self.weight_scheduler is not None:
@@ -150,6 +151,7 @@ class StyleDiscriminators(nn.Module):
         with torch.no_grad():
             state = self.state_normalizer(self.get_style_state(obs))
             scores = torch.cat([disc(state) for disc in self.discriminators], dim=-1)  # (E, K)
+            scores = (1.0 - 0.25 * (scores - 1.0).square()).clamp_min(0.0)
             gates = self.gate_masks(obs)
             columns = []
             for k, norm in enumerate(self.reward_normalizers):
@@ -172,7 +174,7 @@ class StyleDiscriminators(nn.Module):
         return rewards
 
     def update(self, policy_states: torch.Tensor, gates: list[torch.Tensor | None] | None = None) -> dict[str, float]:
-        """Train every discriminator against the rollout's policy states with WGAN-GP; returns mean losses.
+        """Train every discriminator to score expert states +1 and the rollout's states -1; returns mean losses.
 
         Args:
             policy_states: ``(N, style_dim)`` style states of the rollout.
@@ -200,10 +202,16 @@ class StyleDiscriminators(nn.Module):
                         exp = self.state_normalizer(
                             expert[torch.randint(0, expert.shape[0], (pol.shape[0],), device=self.device)]
                         )
-                    expert_score = disc(exp).mean()
-                    policy_score = disc(pol).mean()
-                    penalty = self._gradient_penalty(disc, exp, pol)
-                    loss = policy_score - expert_score + self.gradient_penalty_coef * penalty
+                    exp = exp.requires_grad_(True)
+                    expert_d = disc(exp)
+                    policy_d = disc(pol)
+                    penalty = self._gradient_penalty(expert_d, exp)
+                    expert_score, policy_score = expert_d.mean(), policy_d.mean()
+                    loss = (
+                        (expert_d - 1.0).square().mean()
+                        + (policy_d + 1.0).square().mean()
+                        + 0.5 * self.gradient_penalty_coef * penalty
+                    )
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
@@ -229,11 +237,9 @@ class StyleDiscriminators(nn.Module):
         return super().load_state_dict(state_dict, strict=strict)
 
     @staticmethod
-    def _gradient_penalty(disc: nn.Module, expert: torch.Tensor, policy: torch.Tensor) -> torch.Tensor:
-        alpha = torch.rand(expert.shape[0], 1, device=expert.device)
-        mixed = (alpha * expert + (1.0 - alpha) * policy).requires_grad_(True)
-        grad = torch.autograd.grad(disc(mixed).sum(), mixed, create_graph=True)[0]
-        return (grad.norm(dim=-1) - 1.0).pow(2).mean()
+    def _gradient_penalty(expert_d: torch.Tensor, expert: torch.Tensor) -> torch.Tensor:
+        grad = torch.autograd.grad(expert_d.sum(), expert, create_graph=True)[0]
+        return grad.square().sum(dim=-1).mean()
 
     def forward(self, *args: Any, **kwargs: Any) -> NoReturn:
         """Disallow generic forward calls for this module."""

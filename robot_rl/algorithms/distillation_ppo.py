@@ -34,6 +34,11 @@ class DistillationPPO(Distillation):
         num_learning_epochs: int = 1,
         gradient_length: int = 15,
         learning_rate: float = 1e-3,
+        critic_learning_rate: float | None = None,
+        schedule: str = "fixed",
+        desired_kl: float | None = 0.01,
+        max_learning_rate: float = 1e-2,
+        min_learning_rate: float = 1e-5,
         max_grad_norm: float | None = None,
         loss_type: str = "nll",
         aux_obs_group: str | None = None,
@@ -62,7 +67,13 @@ class DistillationPPO(Distillation):
             storage: Rollout storage in ``distillation_rl`` mode.
             num_learning_epochs: Replays of each rollout per update.
             gradient_length: Timesteps accumulated before each gradient step.
-            learning_rate: Shared learning rate of the student and the critic.
+            learning_rate: Student learning rate; the starting value under the adaptive schedule.
+            critic_learning_rate: Critic learning rate, or None to share ``learning_rate``.
+            schedule: ``"adaptive"`` rescales the student's rate by 1.5 whenever the rollout-to-replay KL leaves
+                ``[desired_kl / 2, 2 * desired_kl]``; ``"fixed"`` keeps it.
+            desired_kl: KL target of the adaptive schedule.
+            max_learning_rate: Ceiling of the adaptive schedule.
+            min_learning_rate: Floor of the adaptive schedule.
             max_grad_norm: Gradient-norm clip, or None.
             loss_type: Behavior-cloning loss: ``"nll"`` is the teacher action's negative log-likelihood under
                 the student's distribution, in the surrogate's units; ``"mse"``/``"huber"`` act on the mean.
@@ -102,9 +113,16 @@ class DistillationPPO(Distillation):
         )
         self.critic = critic.to(self.device)
         self._raw_critic = self.critic
-        self.optimizer = resolve_optimizer(optimizer)(
-            list(self.student.parameters()) + list(self.critic.parameters()), lr=learning_rate
-        )
+        self.learning_rate = learning_rate
+        self.critic_learning_rate = learning_rate if critic_learning_rate is None else critic_learning_rate
+        self.optimizer = resolve_optimizer(optimizer)([
+            {"params": list(self.student.parameters()), "lr": self.learning_rate},
+            {"params": list(self.critic.parameters()), "lr": self.critic_learning_rate},
+        ])
+        self.schedule = schedule
+        self.desired_kl = desired_kl
+        self.max_learning_rate = max_learning_rate
+        self.min_learning_rate = min_learning_rate
         self.gamma = gamma
         self.lam = lam
         self.clip_param = clip_param
@@ -172,9 +190,18 @@ class DistillationPPO(Distillation):
         bc_weight = self.current_bc_weight
         rl_on = self.num_updates >= self.critic_warmup_updates
         self.num_updates += 1
-        sums = {"behavior": 0.0, "surrogate": 0.0, "value": 0.0, "entropy": 0.0, "clip_fraction": 0.0, "aux": 0.0}
+        sums = {
+            "behavior": 0.0,
+            "surrogate": 0.0,
+            "value": 0.0,
+            "entropy": 0.0,
+            "clip_fraction": 0.0,
+            "kl": 0.0,
+            "aux": 0.0,
+        }
         loss = 0
         cnt = 0
+        chunk_kl = 0.0
 
         for _ in range(self.num_learning_epochs):
             self.student.reset(hidden_state=self.last_hidden_states[0])
@@ -188,6 +215,16 @@ class DistillationPPO(Distillation):
                 else:
                     behavior_loss = self.loss_fn(self.student.output_mean, batch.privileged_actions)
                 step_loss = bc_weight * behavior_loss
+
+                with torch.inference_mode():
+                    kl = self.student.get_kl_divergence(
+                        batch.old_distribution_params, self.student.output_distribution_params
+                    ).mean()
+                    if self.is_multi_gpu:
+                        torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
+                        kl /= self.gpu_world_size
+                    chunk_kl += kl.item()
+                    sums["kl"] += kl.item()
 
                 log_prob = self.student.get_output_log_prob(batch.actions)
                 ratio = torch.exp(log_prob - torch.squeeze(batch.old_actions_log_prob))
@@ -225,6 +262,9 @@ class DistillationPPO(Distillation):
                     sums["clip_fraction"] += ((ratio - 1.0).abs() > self.clip_param).float().mean().item()
 
                 if cnt % self.gradient_length == 0:
+                    if rl_on:
+                        self._adapt_learning_rate(chunk_kl / self.gradient_length)
+                    chunk_kl = 0.0
                     self._step(loss)
                     loss = 0
 
@@ -242,9 +282,20 @@ class DistillationPPO(Distillation):
 
         loss_dict = {key: value / max(cnt, 1) for key, value in sums.items()}
         loss_dict["bc_weight"] = bc_weight
+        loss_dict["learning_rate"] = self.learning_rate
         if self.aux_obs_group is None:
             loss_dict.pop("aux")
         return loss_dict
+
+    def _adapt_learning_rate(self, kl: float) -> None:
+        """Move the student's learning rate toward the KL target, as PPO's adaptive schedule does."""
+        if self.schedule != "adaptive" or self.desired_kl is None:
+            return
+        if kl > self.desired_kl * 2.0:
+            self.learning_rate = max(self.min_learning_rate, self.learning_rate / 1.5)
+        elif 0.0 < kl < self.desired_kl / 2.0:
+            self.learning_rate = min(self.max_learning_rate, self.learning_rate * 1.5)
+        self.optimizer.param_groups[0]["lr"] = self.learning_rate
 
     def _step(self, loss: torch.Tensor) -> None:
         """Apply one gradient step of the summed loss to the student and the critic."""

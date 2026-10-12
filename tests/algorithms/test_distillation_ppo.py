@@ -112,7 +112,7 @@ class TestDistillationPPO:
         before_c = [p.detach().clone() for p in alg.critic.parameters()]
         _rollout(alg, env)
         losses = alg.update()
-        for key in ("behavior", "surrogate", "value", "entropy", "clip_fraction", "bc_weight"):
+        for key in ("behavior", "surrogate", "value", "entropy", "clip_fraction", "kl", "bc_weight", "learning_rate"):
             assert key in losses and torch.isfinite(torch.tensor(losses[key])), key
         assert abs(losses["bc_weight"] - 1.0) < 1e-9
         assert any(not torch.equal(b, p) for b, p in zip(before_s, alg.student.parameters(), strict=True))
@@ -148,6 +148,24 @@ class TestDistillationPPO:
             _rollout(alg, env)
             weights.append(alg.update()["bc_weight"])
         assert torch.allclose(torch.tensor(weights), torch.tensor([1.0, 0.775, 0.55, 0.325, 0.1, 0.1]))
+
+    def test_adaptive_schedule_moves_only_the_student_rate(self) -> None:
+        """An unreachable KL target shrinks the student's learning rate while the critic keeps its own."""
+        torch.manual_seed(0)
+        alg, env = _build(
+            schedule="adaptive", desired_kl=1e-12, critic_learning_rate=5e-3, min_learning_rate=1e-6, learning_rate=1e-3
+        )
+        assert alg.optimizer.param_groups[1]["lr"] == 5e-3
+        for _ in range(3):
+            _rollout(alg, env)
+            losses = alg.update()
+        assert losses["kl"] > 0.0
+        assert losses["learning_rate"] < 1e-3
+        assert alg.optimizer.param_groups[0]["lr"] == losses["learning_rate"]
+        assert alg.optimizer.param_groups[1]["lr"] == 5e-3
+        fixed, env = _build(learning_rate=1e-3)
+        _rollout(fixed, env)
+        assert fixed.update()["learning_rate"] == 1e-3
 
     def test_critic_warmup_keeps_the_surrogate_out_of_the_loss(self) -> None:
         """During warm-up the student's parameters only move by the cloning and entropy-free losses."""

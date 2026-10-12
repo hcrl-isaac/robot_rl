@@ -37,7 +37,7 @@ class DistillationSAC(SAC):
         replay_buffer: ReplayBuffer,
         num_actions: int,
         teacher: MLPModel | None = None,
-        loss_type: str = "nll",
+        loss_type: str = "cosine",
         bc_weight: float = 1.0,
         bc_weight_final: float = 0.0,
         bc_anneal_updates: int = 1,
@@ -55,8 +55,9 @@ class DistillationSAC(SAC):
             replay_buffer: Replay buffer storing every observation group, the teacher's included.
             num_actions: Action width.
             teacher: The frozen privileged policy whose deterministic action labels each replayed step.
-            loss_type: Cloning loss: ``"nll"`` is the teacher action's negative log-likelihood under the student;
-                ``"mse"`` acts on the student's mean.
+            loss_type: Cloning loss: ``"cosine"`` is ``1 - cos`` between the student's mean and the teacher's action,
+                leaving the width to the entropy term; ``"nll"`` is the teacher action's negative log-likelihood under
+                the student; ``"mse"`` acts on the student's mean.
             bc_weight: Cloning weight at the first update.
             bc_weight_final: Cloning weight reached after ``bc_anneal_updates`` updates and held.
             bc_anneal_updates: Updates (``update()`` calls) over which the weight moves linearly.
@@ -71,7 +72,7 @@ class DistillationSAC(SAC):
             raise ValueError("DistillationSAC bootstraps one step through the recurrent actor; set n_steps=1.")
         if teacher is None:
             raise ValueError("DistillationSAC needs a teacher model.")
-        if loss_type not in ("nll", "mse"):
+        if loss_type not in ("cosine", "nll", "mse"):
             raise ValueError(f"Unknown cloning loss: {loss_type}")
         super().__init__(actor, critic_1, critic_2, replay_buffer, num_actions, **kwargs)
         self.teacher = teacher.to(self.device)
@@ -124,14 +125,16 @@ class DistillationSAC(SAC):
         """Return the weighted cloning loss against the teacher's action on the same replayed steps."""
         with torch.no_grad():
             teacher_actions = self.teacher(obs)
-        if self.loss_type == "nll":
+        cos = nn.functional.cosine_similarity(self.actor.output_mean, teacher_actions, dim=-1)
+        if self.loss_type == "cosine":
+            behavior = (1.0 - cos).mean()
+        elif self.loss_type == "nll":
             behavior = -self.actor.get_output_log_prob(teacher_actions).mean()
         else:
             behavior = nn.functional.mse_loss(self.actor.output_mean, teacher_actions)
         with torch.no_grad():
             acc("Distill/behavior", behavior)
-            student_mean = self.actor.output_mean
-            acc("Distill/teacher_cos", nn.functional.cosine_similarity(student_mean, teacher_actions, dim=-1).mean())
+            acc("Distill/teacher_cos", cos.mean())
         return self._bc_now * behavior
 
     def train_mode(self) -> None:

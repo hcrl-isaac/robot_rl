@@ -98,7 +98,6 @@ def _cfg(**algorithm: object) -> dict:
             **_SAC_ALG,
             "seq_len": 4,
             "burn_in": 2,
-            "loss_type": "nll",
             "bc_weight": 1.0,
             "bc_weight_final": 0.1,
             "bc_anneal_updates": 4,
@@ -206,7 +205,7 @@ class TestDistillationSAC:
     def test_cloning_raises_the_teacher_action_likelihood(self) -> None:
         """Cloning alone makes the teacher's action more likely under the student on the replayed steps."""
         torch.manual_seed(0)
-        alg, env, _ = _build(bc_weight=1.0, bc_weight_final=1.0, critic_warmup_updates=100)
+        alg, env, _ = _build(loss_type="nll", bc_weight=1.0, bc_weight_final=1.0, critic_warmup_updates=100)
         _collect(alg, env, 16)
 
         def teacher_log_prob() -> float:
@@ -222,6 +221,18 @@ class TestDistillationSAC:
             alg.update()
         torch.manual_seed(1)
         assert teacher_log_prob() > before
+
+    def test_cosine_cloning_aligns_the_mean_and_leaves_the_width_alone(self) -> None:
+        """Cosine cloning turns the student's mean toward the teacher without touching the concentration."""
+        torch.manual_seed(0)
+        alg, env, _ = _build(bc_weight=1.0, bc_weight_final=1.0, critic_warmup_updates=100)
+        log_kappa = alg.actor.distribution.log_kappa.detach().clone()
+        _collect(alg, env, 16)
+        first = alg.update()[1]["Distill/teacher_cos"]
+        for _ in range(15):
+            last = alg.update()[1]["Distill/teacher_cos"]
+        assert last > first
+        assert torch.equal(alg.actor.distribution.log_kappa.detach(), log_kappa)
 
     def test_teacher_checkpoint_fills_the_teacher_and_optionally_the_critics(self) -> None:
         """An RL checkpoint loads only the teacher by default, and also the critics and temperature on request."""

@@ -32,8 +32,10 @@ class DistillationPPO(Distillation):
         critic: MLPModel,
         storage: RolloutStorage,
         num_learning_epochs: int = 1,
+        rl_epochs: int = 1,
         gradient_length: int = 15,
         learning_rate: float = 1e-3,
+        bc_learning_rate: float | None = None,
         critic_learning_rate: float | None = None,
         schedule: str = "fixed",
         desired_kl: float | None = 0.01,
@@ -65,9 +67,12 @@ class DistillationPPO(Distillation):
             teacher: The privileged policy whose actions label the student's rollouts.
             critic: State-value model over the privileged critic observation set.
             storage: Rollout storage in ``distillation_rl`` mode.
-            num_learning_epochs: Replays of each rollout per update.
+            num_learning_epochs: Cloning replays of each rollout per update, after the PPO replays.
+            rl_epochs: PPO replays of each rollout per update, against the rollout's own policy.
             gradient_length: Timesteps accumulated before each gradient step.
-            learning_rate: Student learning rate; the starting value under the adaptive schedule.
+            learning_rate: Student learning rate in the PPO replays; the starting value under the adaptive schedule.
+            bc_learning_rate: Student learning rate in the cloning replays before the ``bc_weight`` scale, or None
+                to share ``learning_rate``.
             critic_learning_rate: Critic learning rate, or None to share ``learning_rate``.
             schedule: ``"adaptive"`` rescales the student's rate by 1.5 whenever the rollout-to-replay KL leaves
                 ``[desired_kl / 2, 2 * desired_kl]``; ``"fixed"`` keeps it.
@@ -86,8 +91,9 @@ class DistillationPPO(Distillation):
             entropy_coef: Entropy bonus weight.
             value_loss_coef: Value loss weight.
             use_clipped_value_loss: Clip the value estimate against the rollout's, as in PPO.
-            bc_weight: Behavior-cloning weight at the first update.
-            bc_weight_final: Behavior-cloning weight reached after ``bc_anneal_updates`` updates and held.
+            bc_weight: Scale of the cloning replays' learning rate at the first update (Adam ignores a lone loss's
+                scale, so the rate is what anneals the cloning out).
+            bc_weight_final: Scale reached after ``bc_anneal_updates`` updates and held.
             bc_anneal_updates: Updates over which the weight moves linearly from ``bc_weight`` to ``bc_weight_final``.
             critic_warmup_updates: Leading updates that train the critic and the cloning loss only, so the
                 surrogate never acts on an untrained value estimate.
@@ -114,7 +120,9 @@ class DistillationPPO(Distillation):
         self.critic = critic.to(self.device)
         self._raw_critic = self.critic
         self.learning_rate = learning_rate
+        self.bc_learning_rate = learning_rate if bc_learning_rate is None else bc_learning_rate
         self.critic_learning_rate = learning_rate if critic_learning_rate is None else critic_learning_rate
+        self.rl_epochs = rl_epochs
         self.optimizer = resolve_optimizer(optimizer)([
             {"params": list(self.student.parameters()), "lr": self.learning_rate},
             {"params": list(self.critic.parameters()), "lr": self.critic_learning_rate},
@@ -186,7 +194,7 @@ class DistillationPPO(Distillation):
         st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
-        """Replay the rollout in time order and step on the summed cloning, surrogate, value and entropy losses."""
+        """Replay the rollout for PPO first, while the student still is the policy that collected it, then clone."""
         bc_weight = self.current_bc_weight
         rl_on = self.num_updates >= self.critic_warmup_updates
         self.num_updates += 1
@@ -199,23 +207,62 @@ class DistillationPPO(Distillation):
             "kl": 0.0,
             "aux": 0.0,
         }
+        counts = {"rl": 0, "bc": 0}
+        if rl_on:
+            for _ in range(self.rl_epochs):
+                counts["rl"] += self._replay("rl", bc_weight, sums)
+        for _ in range(self.num_learning_epochs):
+            counts["bc"] += self._replay("bc", bc_weight, sums)
+
+        self.storage.clear()
+        self.last_hidden_states = (self.student.get_hidden_state(), self.teacher.get_hidden_state())
+        self.student.detach_hidden_state()
+
+        rl_keys = ("surrogate", "entropy", "clip_fraction", "kl")
+        loss_dict = {
+            key: value / max(counts["rl"] if key in rl_keys else counts["bc"] + counts["rl"], 1)
+            for key, value in sums.items()
+        }
+        loss_dict["behavior"] = sums["behavior"] / max(counts["bc"], 1)
+        loss_dict["aux"] = sums["aux"] / max(counts["bc"], 1)
+        loss_dict["bc_weight"] = bc_weight
+        loss_dict["learning_rate"] = self.learning_rate
+        loss_dict["bc_learning_rate"] = self.bc_learning_rate * bc_weight
+        if self.aux_obs_group is None:
+            loss_dict.pop("aux")
+        return loss_dict
+
+    def _replay(self, phase: str, bc_weight: float, sums: dict[str, float]) -> int:
+        """Replay the rollout once in time order for one phase and return the number of batches seen.
+
+        Args:
+            phase: ``"rl"`` steps on the clipped surrogate, entropy and value losses at the adaptive rate;
+                ``"bc"`` steps on the cloning (and auxiliary) and value losses at the scaled cloning rate.
+            bc_weight: Scale of the cloning rate for this update.
+            sums: Running loss sums this replay adds to.
+        """
+        rl = phase == "rl"
+        self.optimizer.param_groups[0]["lr"] = self.learning_rate if rl else self.bc_learning_rate * bc_weight
+        self.student.reset(hidden_state=self.last_hidden_states[0])
+        self.teacher.reset(hidden_state=self.last_hidden_states[1])
+        self.student.detach_hidden_state()
         loss = 0
         cnt = 0
         chunk_kl = 0.0
+        for batch in self.storage.generator():
+            latent = self.student.get_latent(batch.observations)
+            self.student.forward_from_latent(latent, stochastic_output=True)
 
-        for _ in range(self.num_learning_epochs):
-            self.student.reset(hidden_state=self.last_hidden_states[0])
-            self.teacher.reset(hidden_state=self.last_hidden_states[1])
-            self.student.detach_hidden_state()
-            for batch in self.storage.generator():
-                latent = self.student.get_latent(batch.observations)
-                self.student.forward_from_latent(latent, stochastic_output=True)
-                if self.nll_cloning:
-                    behavior_loss = -self.student.get_output_log_prob(batch.privileged_actions).mean()
-                else:
-                    behavior_loss = self.loss_fn(self.student.output_mean, batch.privileged_actions)
-                step_loss = bc_weight * behavior_loss
+            values = self.critic(batch.observations)
+            if self.use_clipped_value_loss:
+                value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
+                value_loss = torch.max((values - batch.returns).pow(2), (value_clipped - batch.returns).pow(2)).mean()
+            else:
+                value_loss = (batch.returns - values).pow(2).mean()
+            step_loss = self.value_loss_coef * value_loss
+            sums["value"] += value_loss.item()
 
+            if rl:
                 with torch.inference_mode():
                     kl = self.student.get_kl_divergence(
                         batch.old_distribution_params, self.student.output_distribution_params
@@ -225,7 +272,6 @@ class DistillationPPO(Distillation):
                         kl /= self.gpu_world_size
                     chunk_kl += kl.item()
                     sums["kl"] += kl.item()
-
                 log_prob = self.student.get_output_log_prob(batch.actions)
                 ratio = torch.exp(log_prob - torch.squeeze(batch.old_actions_log_prob))
                 advantages = torch.squeeze(batch.advantages)
@@ -233,59 +279,41 @@ class DistillationPPO(Distillation):
                 surrogate_clipped = -advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
                 surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
                 entropy = self.student.output_entropy.mean()
-
-                values = self.critic(batch.observations)
-                if self.use_clipped_value_loss:
-                    value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
-                    value_loss = torch.max(
-                        (values - batch.returns).pow(2), (value_clipped - batch.returns).pow(2)
-                    ).mean()
+                step_loss = step_loss + surrogate_loss - self.entropy_coef * entropy
+                with torch.no_grad():
+                    sums["surrogate"] += surrogate_loss.item()
+                    sums["entropy"] += entropy.item()
+                    sums["clip_fraction"] += ((ratio - 1.0).abs() > self.clip_param).float().mean().item()
+            else:
+                if self.nll_cloning:
+                    behavior_loss = -self.student.get_output_log_prob(batch.privileged_actions).mean()
                 else:
-                    value_loss = (batch.returns - values).pow(2).mean()
-
-                step_loss = step_loss + self.value_loss_coef * value_loss
-                if rl_on:
-                    step_loss = step_loss + surrogate_loss - self.entropy_coef * entropy
+                    behavior_loss = self.loss_fn(self.student.output_mean, batch.privileged_actions)
+                step_loss = step_loss + behavior_loss
+                sums["behavior"] += behavior_loss.item()
                 if self.aux_obs_group is not None:
                     aux_pred = self.student.aux_prediction(latent)  # type: ignore[attr-defined]
                     aux_loss = nn.functional.mse_loss(aux_pred, batch.observations[self.aux_obs_group])
                     step_loss = step_loss + self.aux_loss_weight * aux_loss
                     sums["aux"] += aux_loss.item()
-                loss = loss + step_loss
-                cnt += 1
+            loss = loss + step_loss
+            cnt += 1
 
-                with torch.no_grad():
-                    sums["behavior"] += behavior_loss.item()
-                    sums["surrogate"] += surrogate_loss.item()
-                    sums["value"] += value_loss.item()
-                    sums["entropy"] += entropy.item()
-                    sums["clip_fraction"] += ((ratio - 1.0).abs() > self.clip_param).float().mean().item()
-
-                if cnt % self.gradient_length == 0:
-                    if rl_on:
-                        self._adapt_learning_rate(chunk_kl / self.gradient_length)
+            if cnt % self.gradient_length == 0:
+                if rl:
+                    self._adapt_learning_rate(chunk_kl / self.gradient_length)
                     chunk_kl = 0.0
-                    self._step(loss)
-                    loss = 0
+                self._step(loss)
+                loss = 0
 
-                self.student.reset(batch.dones.view(-1))
-                self.teacher.reset(batch.dones.view(-1))
-                self.critic.reset(batch.dones.view(-1))
-                self.student.detach_hidden_state(batch.dones.view(-1))
+            self.student.reset(batch.dones.view(-1))
+            self.teacher.reset(batch.dones.view(-1))
+            self.critic.reset(batch.dones.view(-1))
+            self.student.detach_hidden_state(batch.dones.view(-1))
 
         if cnt % self.gradient_length != 0:
             self._step(loss)
-
-        self.storage.clear()
-        self.last_hidden_states = (self.student.get_hidden_state(), self.teacher.get_hidden_state())
-        self.student.detach_hidden_state()
-
-        loss_dict = {key: value / max(cnt, 1) for key, value in sums.items()}
-        loss_dict["bc_weight"] = bc_weight
-        loss_dict["learning_rate"] = self.learning_rate
-        if self.aux_obs_group is None:
-            loss_dict.pop("aux")
-        return loss_dict
+        return cnt
 
     def _adapt_learning_rate(self, kl: float) -> None:
         """Move the student's learning rate toward the KL target, as PPO's adaptive schedule does."""

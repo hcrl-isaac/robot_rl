@@ -1,8 +1,9 @@
 """CPU tests for Distillation-PPO: a CNN+GRU student cloning a privileged MLP teacher under a PPO term."""
 
-import pytest
 import torch
 from tensordict import TensorDict
+
+import pytest
 
 from robot_rl.algorithms import DistillationPPO
 

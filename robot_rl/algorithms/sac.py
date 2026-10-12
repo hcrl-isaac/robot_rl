@@ -393,7 +393,10 @@ class SAC:
                 q2_pi = self.critic_2(flat_obs, new_actions).view(-1)
                 min_q_pi = torch.min(q1_pi, q2_pi)
                 rl_term = (self.log_alpha.exp().detach() * logp - min_q_pi).mean()
-                actor_loss = rl_term
+                actor_loss = self._actor_rl_scale(min_q_pi, _acc) * rl_term
+                extra_loss = self._extra_actor_loss(flat_obs, _acc)
+                if extra_loss is not None:
+                    actor_loss = actor_loss + extra_loss
                 if self.aux_obs_group is not None:
                     target = train_obs[self.aux_obs_group].reshape(flat, -1)
                     pred = self.actor.aux_prediction(latent)  # type: ignore[attr-defined]
@@ -447,6 +450,34 @@ class SAC:
             "alpha_value": self.alpha,
         }
         return losses, {k: v / counts[k] for k, v in diag.items()}
+
+    def _actor_rl_scale(
+        self, min_q_pi: torch.Tensor, acc: Callable[[str, torch.Tensor | float], None]
+    ) -> torch.Tensor | float:
+        """Weight of the soft-Q term in the recurrent actor loss.
+
+        Args:
+            min_q_pi: Twin-critic minimum at the sampled policy actions, ``(N,)``.
+            acc: Diagnostics accumulator.
+
+        Returns:
+            The multiplier; plain SAC uses the term as is.
+        """
+        return 1.0
+
+    def _extra_actor_loss(
+        self, obs: TensorDict, acc: Callable[[str, torch.Tensor | float], None]
+    ) -> torch.Tensor | None:
+        """Additional recurrent actor loss, evaluated while the actor's distribution holds the window's steps.
+
+        Args:
+            obs: The window's loss-carrying observations, flattened to ``(N,)``.
+            acc: Diagnostics accumulator.
+
+        Returns:
+            A scalar loss to add, or None.
+        """
+        return None
 
     def _update_critics_recurrent(self, acc: Callable[[str, torch.Tensor | float], None]) -> None:
         """One twin-critic step on independent transitions, bootstrapping through the recurrent actor.
@@ -757,6 +788,47 @@ class SAC:
                 offset += numel
 
     @staticmethod
+    def build_replay_buffer(
+        obs: TensorDict, env: VecEnv, cfg: dict, actor: MLPModel, device: str, inference: bool
+    ) -> ReplayBuffer:
+        """Build the SAC replay buffer, sized from ``cfg`` and storing the actor's recurrent state if it has one.
+
+        Args:
+            obs: A representative observation, sizing every stored group.
+            env: The environment, for the env count and action width.
+            cfg: The resolved runner config.
+            actor: The acting model.
+            device: Fallback storage device when the cfg sets none.
+            inference: Build a one-transition-per-env buffer for play and eval.
+
+        Returns:
+            The replay buffer.
+        """
+        buffer_size = int(cfg["algorithm"].get("replay_buffer_size", 1_000_000))
+        capacity_per_env = 1 if inference else max(buffer_size // env.num_envs, 1)
+        hidden_kwargs: dict = {}
+        if actor.is_recurrent:
+            rnn = actor.rnn.rnn  # type: ignore[attr-defined]
+            hidden_kwargs = {
+                "hidden_dim": rnn.hidden_size,
+                "hidden_layers": rnn.num_layers,
+                "hidden_is_lstm": actor.rnn.is_lstm,  # type: ignore[attr-defined]
+            }
+        return ReplayBuffer(
+            env.num_envs,
+            capacity_per_env,
+            obs,
+            [env.num_actions],
+            z_dim=0,
+            batch_size=cfg["algorithm"].get("mini_batch_size", 256),
+            device=cfg.get("storage_device") or device,
+            keep_terminal=True,
+            n_steps=cfg["algorithm"].get("n_steps", 1),
+            gamma=cfg["algorithm"].get("gamma", 0.99),
+            **hidden_kwargs,
+        )
+
+    @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str, inference: bool = False) -> SAC:
         """Build the SAC algorithm from a config dict.
 
@@ -795,30 +867,7 @@ class SAC:
             input_dim = sum(obs[g].shape[-1] for g in actor.obs_groups if obs[g].dim() == 2)
             estimator = SequenceEstimator(input_dim, obs[estimator_group].shape[-1], estimator_hidden_dim)
 
-        buffer_size = int(cfg["algorithm"].get("replay_buffer_size", 1_000_000))
-        capacity_per_env = 1 if inference else max(buffer_size // env.num_envs, 1)
-        storage_device = cfg.get("storage_device") or device
-        hidden_kwargs: dict = {}
-        if actor.is_recurrent:
-            rnn = actor.rnn.rnn  # type: ignore[attr-defined]
-            hidden_kwargs = {
-                "hidden_dim": rnn.hidden_size,
-                "hidden_layers": rnn.num_layers,
-                "hidden_is_lstm": actor.rnn.is_lstm,  # type: ignore[attr-defined]
-            }
-        replay_buffer = ReplayBuffer(
-            env.num_envs,
-            capacity_per_env,
-            obs,
-            [num_actions],
-            z_dim=0,
-            batch_size=cfg["algorithm"].get("mini_batch_size", 256),
-            device=storage_device,
-            keep_terminal=True,
-            n_steps=cfg["algorithm"].get("n_steps", 1),
-            gamma=cfg["algorithm"].get("gamma", 0.99),
-            **hidden_kwargs,
-        )
+        replay_buffer = SAC.build_replay_buffer(obs, env, cfg, actor, device, inference)
 
         return alg_class(
             actor,

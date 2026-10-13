@@ -354,7 +354,14 @@ class ReplayBuffer:
         )
 
     def sample_sequences(
-        self, seq_len: int, burn_in: int = 0, device: str | None = None, num_windows: int | None = None
+        self,
+        seq_len: int,
+        burn_in: int = 0,
+        device: str | None = None,
+        num_windows: int | None = None,
+        priority_group: str | None = None,
+        priority: float = 1.0,
+        oversample: int = 4,
     ) -> SequenceBatch | None:
         """Sample contiguous per-env windows for a recurrent update.
 
@@ -371,6 +378,11 @@ class ReplayBuffer:
             num_windows: Windows per batch. Defaults to ``batch_size // (burn_in + seq_len)`` so the
                 flattened steps match the configured mini-batch; a window batch otherwise multiplies
                 the mini-batch by the window length, which with image observations is an easy OOM.
+            priority_group: Observation group whose last column is a 0/1 seen flag; windows whose loss
+                segment contains a seen-to-unseen step within one episode are drawn ``priority`` times as often.
+            priority: Relative weight of those windows; 1 samples uniformly.
+            oversample: Candidate windows drawn per kept window when weighting; it caps how far the weight can
+                raise the share of those windows.
 
         Returns:
             A :class:`SequenceBatch` of ``L = burn_in + seq_len`` steps, or ``None`` while no window of
@@ -395,9 +407,20 @@ class ReplayBuffer:
         if valid_rows.numel() == 0:
             return None
 
-        start_rows = valid_rows[torch.randint(valid_rows.numel(), (batch_size,), device=self.device)]
-        envs = torch.randint(self.num_envs, (batch_size,), device=self.device)
+        weighted = priority_group is not None and priority != 1.0
+        draws = batch_size * max(oversample, 1) if weighted else batch_size
+        start_rows = valid_rows[torch.randint(valid_rows.numel(), (draws,), device=self.device)]
+        envs = torch.randint(self.num_envs, (draws,), device=self.device)
         offsets = torch.arange(total_len, device=self.device)
+        if weighted:
+            rows_c = (start_rows.unsqueeze(-1) + offsets) % cap_rows
+            flat_c = (rows_c * self.num_envs + envs.unsqueeze(-1)).reshape(-1)
+            seen = (self.observations[priority_group][flat_c][..., -1] > 0.5).reshape(draws, total_len)
+            done = self.dones[flat_c].reshape(draws, total_len).bool()
+            lost = seen[:, :-1] & ~seen[:, 1:] & ~done[:, :-1]
+            has = lost[:, max(burn_in - 1, 0) :].any(dim=1)
+            keep = torch.multinomial(1.0 + (priority - 1.0) * has.float(), batch_size, replacement=False)
+            start_rows, envs = start_rows[keep], envs[keep]
         step_rows = (start_rows.unsqueeze(-1) + offsets) % cap_rows  # [B, L]
         step_flat = (step_rows * self.num_envs + envs.unsqueeze(-1)).reshape(-1)  # [B*L]
 

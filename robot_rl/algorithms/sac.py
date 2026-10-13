@@ -75,6 +75,9 @@ class SAC:
         estimator: SequenceEstimator | None = None,
         estimator_obs_group: str | None = None,
         estimator_view_group: str | None = None,
+        window_priority_group: str | None = None,
+        window_priority: float = 1.0,
+        window_priority_anneal_updates: int = 0,
         estimator_learning_rate: float = 1e-3,
         compile_mode: str | None = None,
         device: str = "cpu",
@@ -138,6 +141,12 @@ class SAC:
         self.estimator = estimator.to(device) if estimator is not None else None
         self.estimator_obs_group = estimator_obs_group
         self.estimator_view_group = estimator_view_group
+        # recurrent windows where the seen flag in this group drops are drawn `window_priority` times as often,
+        # annealed linearly to uniform over `window_priority_anneal_updates` updates (0 keeps it fixed)
+        self.window_priority_group = window_priority_group
+        self.window_priority = window_priority
+        self.window_priority_anneal_updates = window_priority_anneal_updates
+        self._num_recurrent_updates = 0
         if self.estimator is not None and self.is_multi_gpu:
             raise ValueError("The supervised estimator is single-GPU only.")
         self.estimator_optimizer = (
@@ -344,7 +353,13 @@ class SAC:
         num_updates = 0
         num_actor_updates = 0
         for _ in range(self.num_learning_epochs * self.num_mini_batches):
-            batch = self.replay_buffer.sample_sequences(self.seq_len, self.burn_in, self.device)
+            batch = self.replay_buffer.sample_sequences(
+                self.seq_len,
+                self.burn_in,
+                self.device,
+                priority_group=self.window_priority_group,
+                priority=self._current_window_priority(),
+            )
             if batch is None:
                 break
             self._update_critics_recurrent(_acc)
@@ -353,6 +368,10 @@ class SAC:
 
             burn = batch.burn_in
             obs, resets = batch.observations, batch.resets
+            if self.window_priority_group is not None:
+                seen = obs[self.window_priority_group][..., -1] > 0.5
+                lost = seen[:-1] & ~seen[1:] & ~(resets[1:] > 0)
+                _acc("Recurrent/window_loses_view", lost[max(burn - 1, 0) :].any(dim=0).float().mean())
             train_obs, train_resets = obs[burn:], resets[burn:]
             seq_len, batch_size = train_obs.batch_size
             flat = seq_len * batch_size
@@ -434,6 +453,9 @@ class SAC:
             sums["critic_2"] += self._last_critic_losses[1]
             self.update_step += 1
             num_updates += 1
+        if self.window_priority_group is not None:
+            _acc("Recurrent/window_priority", self._current_window_priority())
+            self._num_recurrent_updates += 1
         if self._rollout_hidden_steps > 0:
             _acc("Recurrent/hidden_abs_rollout", self._rollout_hidden_abs / self._rollout_hidden_steps)
             self._rollout_hidden_abs.zero_()
@@ -447,6 +469,13 @@ class SAC:
             "alpha_value": self.alpha,
         }
         return losses, {k: v / counts[k] for k, v in diag.items()}
+
+    def _current_window_priority(self) -> float:
+        """Return the window-priority weight for this update, annealed linearly to 1."""
+        if self.window_priority_group is None or self.window_priority_anneal_updates <= 0:
+            return self.window_priority
+        frac = min(1.0, self._num_recurrent_updates / self.window_priority_anneal_updates)
+        return self.window_priority + frac * (1.0 - self.window_priority)
 
     def _update_critics_recurrent(self, acc: Callable[[str, torch.Tensor | float], None]) -> None:
         """One twin-critic step on independent transitions, bootstrapping through the recurrent actor.

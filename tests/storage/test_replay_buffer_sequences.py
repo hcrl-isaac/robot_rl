@@ -136,3 +136,37 @@ def test_mini_batch_carries_stored_hidden() -> None:
     assert batch.hidden is not None and batch.hidden.shape == (LAYERS, 16, HIDDEN)
     steps = batch.observations["policy"][:, 1]
     assert torch.allclose(batch.hidden[0, :, 0], steps)
+
+
+def test_priority_group_oversamples_windows_where_the_flag_drops() -> None:
+    """Windows whose loss segment sees the flag go 1 -> 0 are drawn at least twice as often as uniform."""
+    obs = TensorDict({"policy": torch.zeros(NUM_ENVS, 3), "view": torch.zeros(NUM_ENVS, 1)}, batch_size=NUM_ENVS)
+    buffer = ReplayBuffer(
+        NUM_ENVS, CAPACITY_PER_ENV, obs, [2], z_dim=0, batch_size=64, device="cpu", keep_terminal=True,
+        hidden_dim=HIDDEN, hidden_layers=LAYERS,
+    )  # fmt: skip
+    for step in range(18):
+        transition = ReplayBuffer.Transition()
+        view = torch.full((NUM_ENVS, 1), 1.0 if step < 9 else 0.0)  # seen until step 8, lost at step 9
+        step_obs = torch.stack(
+            [torch.arange(NUM_ENVS).float(), torch.full((NUM_ENVS,), float(step)), torch.zeros(NUM_ENVS)], dim=1
+        )
+        transition.observations = TensorDict({"policy": step_obs, "view": view}, batch_size=NUM_ENVS)
+        transition.next_observations = TensorDict({"policy": step_obs, "view": view}, batch_size=NUM_ENVS)
+        transition.actions = torch.zeros(NUM_ENVS, 2)
+        transition.rewards = torch.zeros(NUM_ENVS)
+        transition.context = torch.zeros(NUM_ENVS, 0)
+        transition.next_terminated = torch.zeros(NUM_ENVS).byte()
+        transition.dones = torch.zeros(NUM_ENVS)
+        transition.hidden_state = torch.zeros(LAYERS, NUM_ENVS, HIDDEN)
+        buffer.add_transitions(transition)
+
+    def frac_with_drop(priority: float) -> float:
+        torch.manual_seed(0)
+        batch = buffer.sample_sequences(seq_len=3, burn_in=1, num_windows=256, priority_group="view", priority=priority)
+        seen = batch.observations["view"][..., -1] > 0.5
+        return float((seen[:-1] & ~seen[1:]).any(dim=0).float().mean())
+
+    uniform, weighted = frac_with_drop(1.0), frac_with_drop(20.0)
+    assert 0.1 < uniform < 0.4
+    assert weighted > 2.0 * uniform

@@ -33,6 +33,17 @@ def _up_axis(quat_wxyz: torch.Tensor) -> torch.Tensor:
     return torch.stack((2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)), dim=-1)
 
 
+def _yaw(quat_wxyz: torch.Tensor) -> torch.Tensor:
+    """Heading [rad] of (w, x, y, z) quaternions: rotation about the world z axis."""
+    w, x, y, z = quat_wxyz.unbind(-1)
+    return torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+
+def _wrap(angle: torch.Tensor) -> torch.Tensor:
+    """Angles wrapped to (-pi, pi]."""
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
 def _expert_storage_device(cfg: dict, device: str) -> str | None:
     """Return the device that holds the expert motions.
 
@@ -457,6 +468,10 @@ class FbCpr:
             root_error: Per-step root displacement error from the clip's start [m], ``(num_motions, bucket_size - 1)``.
             tilt_error: Per-step angle between the root's and the reference's gravity directions [rad], blind to
                 heading, ``(num_motions, bucket_size - 1)``.
+            root_drift: Per-step horizontal root displacement error from the clip's start (x, y) [m], world frame,
+                ``(num_motions, bucket_size - 1, 2)``.
+            heading_error: Per-step heading change since the clip's start minus the reference's [rad], wrapped,
+                ``(num_motions, bucket_size - 1)``.
         """
         print("[INFO] Evaluating motions...")
         self.eval_mode()
@@ -468,6 +483,8 @@ class FbCpr:
         joint_error = torch.full_like(emd, float("nan"))
         root_error = torch.full((buffer.num_motions, rollout_steps), float("nan"), device=self.device)
         tilt_error = torch.full_like(root_error, float("nan"))
+        root_drift = torch.full((buffer.num_motions, rollout_steps, 2), float("nan"), device=self.device)
+        heading_error = torch.full_like(root_error, float("nan"))
         start = 0
         steps_done = 0
         for eval_obs in buffer.get_batch_motions(env.num_envs, device=self.device):
@@ -487,7 +504,9 @@ class FbCpr:
             qpos = torch.zeros((batch, rollout_steps, first["joint_position"].shape[1]), device=self.device)
             root = torch.zeros((batch, rollout_steps, 3), device=self.device)
             up = torch.zeros((batch, rollout_steps, 3), device=self.device)
-            root_start = buffer.get_expert_state(obs)["root_pose"][:batch, :3].to(self.device)
+            yaw = torch.zeros((batch, rollout_steps), device=self.device)
+            start_pose = buffer.get_expert_state(obs)["root_pose"][:batch].to(self.device)
+            root_start, yaw_start = start_pose[:, :3], _yaw(start_pose[:, 3:7])
             steps = rollout_steps
             # a recorder may show the clip being tracked on a ghost twin
             publish_ref = getattr(getattr(env, "unwrapped", env), "write_reference_pose", None)
@@ -506,6 +525,7 @@ class FbCpr:
                 qpos[:, t] = state["joint_position"][:batch].to(self.device)
                 root[:, t] = state["root_pose"][:batch, :3].to(self.device)
                 up[:, t] = _up_axis(state["root_pose"][:batch, 3:7].to(self.device))
+                yaw[:, t] = _yaw(state["root_pose"][:batch, 3:7].to(self.device))
                 steps_done += 1
                 if max_steps is not None and steps_done >= max_steps:
                     steps = t + 1
@@ -516,6 +536,10 @@ class FbCpr:
             act_disp = root[:, :steps] - root_start[:, None]
             ref_disp = ref_root[:, 1:] - ref_root[:, :1]
             root_error[ids, :steps] = (act_disp - ref_disp).norm(dim=-1)
+            root_drift[ids, :steps] = (act_disp - ref_disp)[..., :2]
+            ref_yaw = _yaw(ref["root_pose"][:, : steps + 1, 3:7])
+            ref_turn = _wrap(ref_yaw[:, 1:] - ref_yaw[:, :1])
+            heading_error[ids, :steps] = _wrap(_wrap(yaw[:, :steps] - yaw_start[:, None]) - ref_turn)
             ref_up = _up_axis(ref["root_pose"][:, 1 : steps + 1, 3:7])
             cos = (up[:, :steps] * ref_up).sum(dim=-1).clamp(-1.0, 1.0)
             tilt_error[ids, :steps] = torch.acos(cos)
@@ -527,7 +551,14 @@ class FbCpr:
         self.train_mode()
         env.train_mode()
         print("[INFO] Finished evaluating motions.")
-        return {"emd": emd, "joint_error": joint_error, "root_error": root_error, "tilt_error": tilt_error}
+        return {
+            "emd": emd,
+            "joint_error": joint_error,
+            "root_error": root_error,
+            "tilt_error": tilt_error,
+            "root_drift": root_drift,
+            "heading_error": heading_error,
+        }
 
     @staticmethod
     def motion_priorities(emd: torch.Tensor) -> torch.Tensor:

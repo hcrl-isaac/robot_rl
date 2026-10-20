@@ -76,6 +76,17 @@ class TestDiscriminators:
         assert a_on_a > a_on_b
         assert b_on_b > b_on_a
 
+    def test_rewards_are_bounded_and_favor_expert_states(self, tmp_path: Path) -> None:
+        """Unnormalized rewards stay in [0, 1], and a trained discriminator pays its expert's states more."""
+        style = _make_style(tmp_path, reward_normalization=False, state_normalization=False)
+        style.train()
+        for _ in range(30):
+            style.update(torch.randn(512, STYLE_DIM))
+        on_a = style.compute_rewards(_obs(center=2.0))
+        off = style.compute_rewards(_obs(center=0.0))
+        assert torch.all((on_a >= 0.0) & (on_a <= 1.0)) and torch.all((off >= 0.0) & (off <= 1.0))
+        assert on_a[:, 0].mean() > off[:, 0].mean()
+
     def test_gate_zeroes_unclaimed_transitions(self, tmp_path: Path) -> None:
         """An unreachable gate threshold zeroes every style reward."""
         style = _make_style(tmp_path, reward_normalization=False, state_normalization=False, gate_threshold=1e6)

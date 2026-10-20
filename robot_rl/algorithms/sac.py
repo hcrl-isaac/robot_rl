@@ -16,6 +16,7 @@ from typing import Any
 from robot_rl.env import VecEnv
 from robot_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from robot_rl.models import FuseModel, MLPModel
+from robot_rl.models.sequence_estimator import SequenceEstimator
 from robot_rl.modules import TargetNetwork
 from robot_rl.modules.rnn import HiddenState
 from robot_rl.storage import ReplayBuffer
@@ -71,6 +72,13 @@ class SAC:
         aux_loss_weight: float = 1.0,
         attn_target_group: str | None = None,
         attn_loss_weight: float = 1.0,
+        estimator: SequenceEstimator | None = None,
+        estimator_obs_group: str | None = None,
+        estimator_view_group: str | None = None,
+        window_priority_group: str | None = None,
+        window_priority: float = 1.0,
+        window_priority_anneal_updates: int = 0,
+        estimator_learning_rate: float = 1e-3,
         compile_mode: str | None = None,
         device: str = "cpu",
         rnd_cfg: dict | None = None,
@@ -128,6 +136,24 @@ class SAC:
         # (u, v, visible) target cell for an attention actor's cross-modal attention
         self.attn_target_group = attn_target_group
         self.attn_loss_weight = attn_loss_weight
+        # a separate supervised estimator of a privileged group, fed to no network; the view group's last
+        # column flags the steps where the actor saw the quantity, so masked and visible error log apart
+        self.estimator = estimator.to(device) if estimator is not None else None
+        self.estimator_obs_group = estimator_obs_group
+        self.estimator_view_group = estimator_view_group
+        # recurrent windows where the seen flag in this group drops are drawn `window_priority` times as often,
+        # annealed linearly to uniform over `window_priority_anneal_updates` updates (0 keeps it fixed)
+        self.window_priority_group = window_priority_group
+        self.window_priority = window_priority
+        self.window_priority_anneal_updates = window_priority_anneal_updates
+        self._num_recurrent_updates = 0
+        if self.estimator is not None and self.is_multi_gpu:
+            raise ValueError("The supervised estimator is single-GPU only.")
+        self.estimator_optimizer = (
+            torch.optim.Adam(self.estimator.parameters(), lr=estimator_learning_rate)
+            if self.estimator is not None
+            else None
+        )
         # mean |h| over rollout steps since the last update, to compare against the training-side state
         self._rollout_hidden_abs = torch.zeros((), device=device)
         self._rollout_hidden_steps = 0
@@ -329,13 +355,25 @@ class SAC:
         num_updates = 0
         num_actor_updates = 0
         for _ in range(self.num_learning_epochs * self.num_mini_batches):
-            batch = self.replay_buffer.sample_sequences(self.seq_len, self.burn_in, self.device)
+            batch = self.replay_buffer.sample_sequences(
+                self.seq_len,
+                self.burn_in,
+                self.device,
+                priority_group=self.window_priority_group,
+                priority=self._current_window_priority(),
+            )
             if batch is None:
                 break
             self._update_critics_recurrent(_acc)
+            if self.estimator is not None:
+                self._update_estimator(batch, _acc)
 
             burn = batch.burn_in
             obs, resets = batch.observations, batch.resets
+            if self.window_priority_group is not None:
+                seen = obs[self.window_priority_group][..., -1] > 0.5
+                lost = seen[:-1] & ~seen[1:] & ~(resets[1:] > 0)
+                _acc("Recurrent/window_loses_view", lost[max(burn - 1, 0) :].any(dim=0).float().mean())
             train_obs, train_resets = obs[burn:], resets[burn:]
             seq_len, batch_size = train_obs.batch_size
             flat = seq_len * batch_size
@@ -400,7 +438,8 @@ class SAC:
                     self.reduce_parameters(self.actor_parameters)
                 _acc("Actor/grad_norm", nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm))
                 _acc("Actor/grad_norm_rnn", _param_grad_norm(self.actor.rnn.parameters()))  # type: ignore[attr-defined]
-                _acc("Actor/grad_norm_cnn", _param_grad_norm(self.actor.cnns.parameters()))  # type: ignore[attr-defined]
+                if hasattr(self.actor, "cnns"):
+                    _acc("Actor/grad_norm_cnn", _param_grad_norm(self.actor.cnns.parameters()))
                 self.actor_optimizer.step()
                 for p in self.critic_parameters:
                     p.requires_grad_(True)
@@ -416,6 +455,9 @@ class SAC:
             sums["critic_2"] += self._last_critic_losses[1]
             self.update_step += 1
             num_updates += 1
+        if self.window_priority_group is not None:
+            _acc("Recurrent/window_priority", self._current_window_priority())
+            self._num_recurrent_updates += 1
         if self._rollout_hidden_steps > 0:
             _acc("Recurrent/hidden_abs_rollout", self._rollout_hidden_abs / self._rollout_hidden_steps)
             self._rollout_hidden_abs.zero_()
@@ -429,6 +471,13 @@ class SAC:
             "alpha_value": self.alpha,
         }
         return losses, {k: v / counts[k] for k, v in diag.items()}
+
+    def _current_window_priority(self) -> float:
+        """Return the window-priority weight for this update, annealed linearly to 1."""
+        if self.window_priority_group is None or self.window_priority_anneal_updates <= 0:
+            return self.window_priority
+        frac = min(1.0, self._num_recurrent_updates / self.window_priority_anneal_updates)
+        return self.window_priority + frac * (1.0 - self.window_priority)
 
     def _update_critics_recurrent(self, acc: Callable[[str, torch.Tensor | float], None]) -> None:
         """One twin-critic step on independent transitions, bootstrapping through the recurrent actor.
@@ -643,6 +692,32 @@ class SAC:
         if self.recurrent:
             self.actor.reset()
 
+    def _update_estimator(
+        self, batch: ReplayBuffer.SequenceBatch, acc: Callable[[str, torch.Tensor | float], None]
+    ) -> None:
+        """Fit the estimator on a sampled window and log its error on all, masked and visible steps."""
+        obs, burn = batch.observations, batch.burn_in
+        x = torch.cat([obs[g] for g in self.actor.obs_groups if obs[g].dim() == 3], dim=-1)
+        pred = self.estimator(x, batch.resets)[burn:]  # type: ignore[misc]
+        target = obs[self.estimator_obs_group][burn:]
+        loss = nn.functional.mse_loss(pred, target)
+        self.estimator_optimizer.zero_grad()  # type: ignore[union-attr]
+        loss.backward()
+        self.estimator_optimizer.step()  # type: ignore[union-attr]
+        with torch.no_grad():
+            err = (pred - target).abs().mean(-1)
+            acc("Estimator/loss", loss.detach())
+            acc("Estimator/abs_err", err.mean())
+            # what predicting the window's mean target would score, as a no-information floor
+            acc("Estimator/abs_err_mean_guess", (target - target.mean(dim=(0, 1))).abs().mean())
+            if self.estimator_view_group is not None:
+                seen = obs[self.estimator_view_group][burn:, :, -1] > 0.5
+                acc("Estimator/masked_frac", (~seen).float().mean())
+                if (~seen).any():
+                    acc("Estimator/abs_err_masked", err[~seen].mean())
+                if seen.any():
+                    acc("Estimator/abs_err_visible", err[seen].mean())
+
     def save(self) -> dict:
         """Return a dict of model/optimizer/temperature states for checkpointing."""
         saved = {
@@ -657,6 +732,8 @@ class SAC:
             saved["alpha_optimizer_state_dict"] = self.alpha_optimizer.state_dict()
         if self.rnd:
             saved["rnd_state_dict"] = self.rnd.state_dict()
+        if self.estimator is not None:
+            saved["estimator_state_dict"] = self.estimator.state_dict()
         return saved
 
     def load(self, loaded_dict: dict, load_cfg: dict | None = None, strict: bool = True) -> bool:
@@ -681,6 +758,8 @@ class SAC:
                 self.alpha = self.log_alpha.exp().item()
         if load_cfg.get("rnd") and self.rnd and "rnd_state_dict" in loaded_dict:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
+        if self.estimator is not None and "estimator_state_dict" in loaded_dict:
+            self.estimator.load_state_dict(loaded_dict["estimator_state_dict"], strict=strict)
         return load_cfg.get("iteration", False)
 
     def broadcast_parameters(self) -> None:
@@ -728,6 +807,7 @@ class SAC:
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
         num_actions = env.num_actions
+        estimator_hidden_dim = cfg["algorithm"].pop("estimator_hidden_dim", 128)
         aux_group = cfg["algorithm"].get("aux_obs_group")
         if aux_group is not None:
             cfg["actor"]["aux_target_dim"] = obs[aux_group].shape[-1]
@@ -739,6 +819,12 @@ class SAC:
         critic_2: FuseModel = critic_class(
             obs, cfg["obs_groups"], "critic", input_dims=[num_actions], output_dim=1, **cfg["critic"]
         ).to(device)
+
+        estimator = None
+        estimator_group = cfg["algorithm"].get("estimator_obs_group")
+        if estimator_group is not None:
+            input_dim = sum(obs[g].shape[-1] for g in actor.obs_groups if obs[g].dim() == 2)
+            estimator = SequenceEstimator(input_dim, obs[estimator_group].shape[-1], estimator_hidden_dim)
 
         buffer_size = int(cfg["algorithm"].get("replay_buffer_size", 1_000_000))
         capacity_per_env = 1 if inference else max(buffer_size // env.num_envs, 1)
@@ -772,6 +858,7 @@ class SAC:
             replay_buffer,
             num_actions,
             device=device,
+            estimator=estimator,
             **cfg["algorithm"],
             multi_gpu_cfg=cfg.get("multi_gpu"),
         )

@@ -389,8 +389,11 @@ def test_a_vmf_actor_rebuilds_with_its_unit_mean_direction() -> None:
 
 @pytest.mark.parametrize("rnn_type", ["gru", "lstm"])
 def test_a_recurrent_actor_rebuilds_and_exports_to_onnx_with_its_state(tmp_path: Path, rnn_type: str) -> None:
-    """An off-policy recurrent actor (observation 8 wide, recurrent state 16) rebuilds from its checkpoint, and its
-    ONNX export, fed back its own state each step, acts as the trained actor does."""
+    """A recurrent actor's ONNX export, fed back its own state each step, acts as the trained actor does.
+
+    The observation (8 wide) and the recurrent state (16) differ, so the rebuild must size the observation from the
+    recurrent input, not from the MLP head.
+    """
     from tensordict import TensorDict
 
     import onnxruntime as ort

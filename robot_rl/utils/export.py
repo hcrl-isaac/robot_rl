@@ -12,6 +12,7 @@ import re
 import torch
 import torch.nn as nn
 
+from robot_rl.models.cnn_rnn_model import CNNRNNModel
 from robot_rl.models.inference import EncoderInferencePolicy
 from robot_rl.models.rnn_model import RNNModel
 from robot_rl.modules.distribution import Distribution, bound_by_clip_actions
@@ -130,7 +131,11 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
     ) -> nn.Module:
         model_cfg = dict(model_cfg)
         model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
-        obs_dim = _first_mlp_input_dim(sd) - sum(other_dims)
+        if issubclass(model_class, RNNModel) and not issubclass(model_class, CNNRNNModel):
+            # the MLP head reads the recurrent output; the recurrent input is the observation
+            obs_dim = sd["rnn.rnn.weight_ih_l0"].shape[-1]
+        else:
+            obs_dim = _first_mlp_input_dim(sd) - sum(other_dims)
         groups = cfg["obs_groups"][obs_set]
         # only the concatenated dim matters for layer sizes; put it all on the first group
         obs = {g: torch.zeros(1, obs_dim if i == 0 else 0) for i, g in enumerate(groups)}

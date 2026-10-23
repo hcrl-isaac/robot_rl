@@ -202,3 +202,24 @@ class TestPostResetTransitionIsDropped:
         assert sorted(markers.tolist()) == [1.0, 1.0, 2.0, 3.0, 3.0]
         # the new episode's first transition survived
         assert (markers == 3.0).sum() == 2
+
+
+def test_a_group_stored_in_half_precision_samples_back_in_its_own_dtype() -> None:
+    """A group stored as float16 is written from float32 and sampled back as float32, to its precision."""
+    num_envs = 6
+    obs = TensorDict(
+        {"policy": torch.zeros(num_envs, OBS_DIM), "history": torch.zeros(num_envs, 7)}, batch_size=num_envs
+    )
+    buf = ReplayBuffer(num_envs, 4, obs, (ACT_DIM,), Z_DIM, 8, "cpu", obs_dtypes={"history": torch.float16})
+    assert buf.observations["history"].dtype == torch.float16 and buf.observations["policy"].dtype == torch.float32
+    tr = _make_transition(num_envs, torch.zeros(num_envs, dtype=torch.bool))
+    history = torch.randn(num_envs, 7)
+    tr.observations["history"] = history
+    tr.next_observations["history"] = history + 1.0
+    buf.add_transitions(tr)
+    batch = buf.sample_mini_batch()
+    assert batch.observations["history"].dtype == torch.float32
+    assert batch.next_observations["history"].dtype == torch.float32
+    rows = [int(torch.nonzero((history - h).abs().max(-1).values < 1e-2)[0]) for h in batch.observations["history"]]
+    torch.testing.assert_close(batch.observations["history"], history[rows], atol=2e-3, rtol=1e-3)
+    torch.testing.assert_close(batch.next_observations["history"], history[rows] + 1.0, atol=2e-3, rtol=1e-3)

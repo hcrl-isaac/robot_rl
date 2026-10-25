@@ -69,6 +69,7 @@ class SAC:
         seq_len: int = 16,
         burn_in: int = 8,
         num_windows: int | None = None,
+        critic_sees_hidden: bool = False,
         aux_obs_group: str | None = None,
         aux_loss_weight: float = 1.0,
         attn_target_group: str | None = None,
@@ -133,6 +134,9 @@ class SAC:
         self.burn_in = burn_in
         # windows per actor update; None sizes them so the loss steps add up to one minibatch
         self.num_windows = num_windows
+        # the critics also read the actor's (detached) recurrent latent, so an action's value depends on the memory
+        # that produced it and the actor cannot exploit a critic blind to that memory through BPTT
+        self.critic_sees_hidden = bool(critic_sees_hidden) and self.recurrent
         # supervised target for the recurrent actor's aux head (e.g. privileged ball position)
         self.aux_obs_group = aux_obs_group
         self.aux_loss_weight = aux_loss_weight
@@ -414,8 +418,9 @@ class SAC:
             if self.update_step % self.policy_frequency == 0:
                 for p in self.critic_parameters:
                     p.requires_grad_(False)
-                q1_pi = self.critic_1(flat_obs, new_actions).view(-1)
-                q2_pi = self.critic_2(flat_obs, new_actions).view(-1)
+                pi_in = self._critic_input(new_actions, latent)
+                q1_pi = self.critic_1(flat_obs, pi_in).view(-1)
+                q2_pi = self.critic_2(flat_obs, pi_in).view(-1)
                 min_q_pi = torch.min(q1_pi, q2_pi)
                 rl_term = (self.log_alpha.exp().detach() * logp - min_q_pi).mean()
                 actor_loss = rl_term
@@ -449,7 +454,8 @@ class SAC:
                     p.requires_grad_(True)
                 with torch.no_grad():
                     # policy-action Q minus data-action Q: a growing gap is the actor exploiting critic error
-                    q_data = torch.min(self.critic_1(flat_obs, actions_b), self.critic_2(flat_obs, actions_b)).view(-1)
+                    data_in = self._critic_input(actions_b, latent)
+                    q_data = torch.min(self.critic_1(flat_obs, data_in), self.critic_2(flat_obs, data_in)).view(-1)
                     _acc("Critic/q_pi_gap", (min_q_pi - q_data).mean())
                 sums["actor"] += actor_loss.item()
                 num_actor_updates += 1
@@ -483,6 +489,12 @@ class SAC:
         frac = min(1.0, self._num_recurrent_updates / self.window_priority_anneal_updates)
         return self.window_priority + frac * (1.0 - self.window_priority)
 
+    def _critic_input(self, actions: torch.Tensor, latent: torch.Tensor | None) -> torch.Tensor:
+        """The critics' fused input: the action, plus the actor's detached latent when the critics read it."""
+        if not self.critic_sees_hidden:
+            return actions
+        return torch.cat([actions, latent.detach()], dim=-1)
+
     def _update_critics_recurrent(self, acc: Callable[[str, torch.Tensor | float], None]) -> None:
         """One twin-critic step on independent transitions, bootstrapping through the recurrent actor.
 
@@ -497,12 +509,15 @@ class SAC:
             h_next = self.actor.step_state(obs_b, batch.hidden)
             next_latent = self.actor.encode_step(next_obs_b, h_next)
             next_actions, next_logp = self.actor.act_and_log_prob_from_latent(next_latent)
-            q1_t = self.critic_1_target(next_obs_b, next_actions).view(-1)
-            q2_t = self.critic_2_target(next_obs_b, next_actions).view(-1)
+            next_in = self._critic_input(next_actions, next_latent)
+            q1_t = self.critic_1_target(next_obs_b, next_in).view(-1)
+            q2_t = self.critic_2_target(next_obs_b, next_in).view(-1)
             min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
             target_q = rewards_b + self.gamma * not_terminated * min_q_t
-        q1 = self.critic_1(obs_b, actions_b).view(-1)
-        q2 = self.critic_2(obs_b, actions_b).view(-1)
+            latent_b = self.actor.encode_step(obs_b, batch.hidden) if self.critic_sees_hidden else None
+        data_in = self._critic_input(actions_b, latent_b)
+        q1 = self.critic_1(obs_b, data_in).view(-1)
+        q2 = self.critic_2(obs_b, data_in).view(-1)
         critic_1_loss = nn.functional.mse_loss(q1, target_q)
         critic_2_loss = nn.functional.mse_loss(q2, target_q)
         self.critic_optimizer.zero_grad()
@@ -816,12 +831,15 @@ class SAC:
         if aux_group is not None:
             cfg["actor"]["aux_target_dim"] = obs[aux_group].shape[-1]
         actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", num_actions, **cfg["actor"]).to(device)
-        # Twin Q-critics: generic FuseModel fusing obs + action -> scalar Q.
+        # Twin Q-critics: generic FuseModel fusing obs + action (+ the recurrent actor's latent) -> scalar Q.
+        critic_in = num_actions
+        if cfg["algorithm"].get("critic_sees_hidden", False) and actor.is_recurrent:
+            critic_in += actor.latent_dim  # type: ignore[attr-defined]
         critic_1: FuseModel = critic_class(
-            obs, cfg["obs_groups"], "critic", input_dims=[num_actions], output_dim=1, **cfg["critic"]
+            obs, cfg["obs_groups"], "critic", input_dims=[critic_in], output_dim=1, **cfg["critic"]
         ).to(device)
         critic_2: FuseModel = critic_class(
-            obs, cfg["obs_groups"], "critic", input_dims=[num_actions], output_dim=1, **cfg["critic"]
+            obs, cfg["obs_groups"], "critic", input_dims=[critic_in], output_dim=1, **cfg["critic"]
         ).to(device)
 
         estimator = None

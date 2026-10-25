@@ -68,6 +68,7 @@ class SAC:
         n_steps: int = 1,
         seq_len: int = 16,
         burn_in: int = 8,
+        num_windows: int | None = None,
         aux_obs_group: str | None = None,
         aux_loss_weight: float = 1.0,
         attn_target_group: str | None = None,
@@ -130,6 +131,8 @@ class SAC:
         self.recurrent = actor.is_recurrent
         self.seq_len = seq_len
         self.burn_in = burn_in
+        # windows per actor update; None sizes them so the loss steps add up to one minibatch
+        self.num_windows = num_windows
         # supervised target for the recurrent actor's aux head (e.g. privileged ball position)
         self.aux_obs_group = aux_obs_group
         self.aux_loss_weight = aux_loss_weight
@@ -359,6 +362,7 @@ class SAC:
                 self.seq_len,
                 self.burn_in,
                 self.device,
+                num_windows=self.num_windows,
                 priority_group=self.window_priority_group,
                 priority=self._current_window_priority(),
             )

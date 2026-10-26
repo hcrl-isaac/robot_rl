@@ -471,6 +471,14 @@ class SAC:
         if self.window_priority_group is not None:
             _acc("Recurrent/window_priority", self._current_window_priority())
             self._num_recurrent_updates += 1
+        with torch.no_grad():
+            # the flat and window samplers must agree with the buffer on the mean reward; a gap is a sampling bug
+            n = len(self.replay_buffer)
+            _acc("Buffer/reward_all", self.replay_buffer.rewards[:n].float().mean())
+            _acc("Buffer/reward_flat_sample", self.replay_buffer.sample_mini_batch(self.device).rewards.float().mean())
+            win = self.replay_buffer.sample_sequences(self.seq_len, self.burn_in, self.device)
+            if win is not None:
+                _acc("Buffer/reward_window_sample", win.rewards.float().mean())
         if self._rollout_hidden_steps > 0:
             _acc("Recurrent/hidden_abs_rollout", self._rollout_hidden_abs / self._rollout_hidden_steps)
             self._rollout_hidden_abs.zero_()

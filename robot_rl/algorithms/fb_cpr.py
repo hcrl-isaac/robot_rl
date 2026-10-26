@@ -86,6 +86,9 @@ class FbCpr:
     discriminator: MLPModel
     """The discriminator model"""
 
+    replay_keep_terminal: bool = False
+    """Store every transition, so the replay holds each env's steps in time order (see :class:`ReplayBuffer`)."""
+
     def __init__(
         self,
         actor: FuseModel,
@@ -373,7 +376,7 @@ class FbCpr:
 
     def update(self) -> tuple[dict[str, torch.Tensor], dict]:
         """Run optimization epochs over stored batches and return mean losses."""
-        batch = self.replay_buffer.sample_mini_batch(self.device)
+        batch = self._sample_replay()
         expert_obs, expert_next_obs = self.expert_buffer.sample(
             self.batch_size, self.device, seq_length=self.expert_sequence_length
         )
@@ -434,6 +437,10 @@ class FbCpr:
             extras = {k: v.clone() for k, v in extras.items()}
 
         return loss_dict, extras
+
+    def _sample_replay(self) -> ReplayBuffer.Batch:
+        """Draw the update's mini-batch of transitions from the replay buffer."""
+        return self.replay_buffer.sample_mini_batch(self.device)
 
     def eval(self, env: URLVecEnv, max_steps: int | None = None, **kwargs: Any) -> list[dict[str, torch.Tensor]]:
         """Track every expert motion and re-weight the expert buffer by how badly each one was tracked.
@@ -774,6 +781,7 @@ class FbCpr:
             z_dim,
             cfg["algorithm"]["batch_size"],
             cfg["storage_device"],
+            keep_terminal=alg_class.replay_keep_terminal,
             obs_dtypes={k: getattr(torch, v) for k, v in (cfg["algorithm"].get("replay_obs_dtypes") or {}).items()},
         )
         # A large corpus can exceed VRAM on its own, so it is placed independently of the replay buffer.
@@ -783,6 +791,8 @@ class FbCpr:
             if not inference
             else None
         )
+        if expert_buffer is not None:
+            alg_class.prepare_expert_motions(expert_buffer, obs, cfg["obs_groups"], cfg["algorithm"])
         z_buffer = ZBuffer(cfg["algorithm"]["z_buffer_capacity"], z_dim, cfg["storage_device"])
 
         # Initialize the algorithm
@@ -805,6 +815,19 @@ class FbCpr:
         )
 
         return alg
+
+    @staticmethod
+    def prepare_expert_motions(
+        expert_buffer: TrajectoryBuffer, obs: TensorDict, obs_groups: dict[str, list[str]], cfg: dict
+    ) -> None:
+        """Adapt the loaded expert motions to the env's observation groups before training; FB-CPR uses them as stored.
+
+        Args:
+            expert_buffer: The loaded expert motions.
+            obs: A representative env observation.
+            obs_groups: The resolved observation sets.
+            cfg: The algorithm cfg.
+        """
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""
@@ -1093,58 +1116,66 @@ class FbCpr:
 
         return loss_dict, extras_dict
 
-    def _update_actor(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict]:
-        with torch.autocast(device_type=self.device, dtype=self.dtype):
-            actions = self.actor(
-                batch.observations, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
-            )
-            # Compute discriminator value loss
-            Qs_discriminator = self.disc_critic(batch.observations, batch.context, actions)
-            Q_discriminator = (
-                -self.discriminator_reg_coef * compute_td_targets(Qs_discriminator, self.actor_pessimism).mean()
-            )
-            # Compute auxiliary value loss
-            Qs_aux = self.aux_critic(batch.observations, batch.context, actions)
-            Q_aux = -self.aux_reg_coef * compute_td_targets(Qs_aux, self.actor_pessimism).mean()
-            # Compute forward value loss
-            Fs = self.forward_map(batch.observations, batch.context, actions)
-            Qs_fb = (Fs * batch.context).sum(dim=-1)
-            Q_fb = compute_td_targets(Qs_fb, self.actor_pessimism)
-            # Weigh auxiliary and discriminator values by forward value
-            reg_weight = Q_fb.abs().mean().detach()
-            Q_fb = -Q_fb.mean()
-            # Compute the actor loss
-            actor_loss = Q_fb + Q_discriminator * reg_weight + Q_aux * reg_weight
+    def _actor_objective(
+        self, obs: TensorDict, command: torch.Tensor, z: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Score actions sampled under ``command`` with the critics for latent ``z``, as the actor loss.
 
-        # Compute the gradients
+        Args:
+            obs: Normalized observations.
+            command: The actor's latent input.
+            z: The latent the forward map and critics score the actions for.
+
+        Returns:
+            The loss and its forward, discriminator and auxiliary parts with the regularizer weight.
+        """
+        actions = self.actor(obs, command, stochastic_output=True, std_clip=self.clip_actor_std)
+        Qs_discriminator = self.disc_critic(obs, z, actions)
+        Q_discriminator = (
+            -self.discriminator_reg_coef * compute_td_targets(Qs_discriminator, self.actor_pessimism).mean()
+        )
+        Qs_aux = self.aux_critic(obs, z, actions)
+        Q_aux = -self.aux_reg_coef * compute_td_targets(Qs_aux, self.actor_pessimism).mean()
+        Fs = self.forward_map(obs, z, actions)
+        Q_fb = compute_td_targets((Fs * z).sum(dim=-1), self.actor_pessimism)
+        # the discriminator and auxiliary values are weighed by the forward value
+        reg_weight = Q_fb.abs().mean().detach()
+        Q_fb = -Q_fb.mean()
+        loss = Q_fb + Q_discriminator * reg_weight + Q_aux * reg_weight
+        parts = {"fb": Q_fb, "discriminator": Q_discriminator, "aux": Q_aux, "reg_weight": reg_weight, "F1": Fs[0]}
+        return loss, parts
+
+    def _step_actor(self, actor_loss: torch.Tensor) -> None:
+        """Apply one optimizer step to the actor for ``actor_loss``."""
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-
-        # Collect gradients from all GPUs
         if self.is_multi_gpu:
             self.reduce_parameters(self.actor)
-
-        # Clip gradients if enabled
         if self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-
-        # Apply the gradients
         self.actor_optimizer.step()
 
+    @staticmethod
+    def _actor_logs(actor_loss: torch.Tensor, parts: dict[str, torch.Tensor]) -> tuple[dict, dict]:
+        """Build the actor update's loss and extras logging dicts."""
         with torch.no_grad():
             loss_dict = {
                 "Actor_Loss/total_loss": actor_loss.mean().detach(),
-                "Actor_Loss/discriminator_loss": Q_discriminator.mean().detach(),
-                "Actor_Loss/aux_loss": Q_aux.mean().detach(),
-                "Actor_Loss/fb_loss": Q_fb.mean().detach(),
+                "Actor_Loss/discriminator_loss": parts["discriminator"].mean().detach(),
+                "Actor_Loss/aux_loss": parts["aux"].mean().detach(),
+                "Actor_Loss/fb_loss": parts["fb"].mean().detach(),
             }
-
             extras_dict = {
-                "actor_reg_weight": reg_weight.mean().detach(),
-                "actor_F1": Fs[0].mean().detach(),
+                "actor_reg_weight": parts["reg_weight"].mean().detach(),
+                "actor_F1": parts["F1"].mean().detach(),
             }
-
         return loss_dict, extras_dict
+
+    def _update_actor(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict]:
+        with torch.autocast(device_type=self.device, dtype=self.dtype):
+            actor_loss, parts = self._actor_objective(batch.observations, batch.context, batch.context)
+        self._step_actor(actor_loss)
+        return self._actor_logs(actor_loss, parts)
 
     @torch.compiler.disable
     def _gradient_wgan_penalty(

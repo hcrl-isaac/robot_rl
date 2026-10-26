@@ -447,7 +447,7 @@ class SAC:
             q1_t = self.critic_1_target(next_obs_b, next_actions).view(-1)
             q2_t = self.critic_2_target(next_obs_b, next_actions).view(-1)
             min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
-            target_q = rewards_b + self.gamma * not_terminated * min_q_t
+            target_q = rewards_b + self._bootstrap_discount(batch) * not_terminated * min_q_t
         q1 = self.critic_1(obs_b, actions_b).view(-1)
         q2 = self.critic_2(obs_b, actions_b).view(-1)
         critic_1_loss = nn.functional.mse_loss(q1, target_q)
@@ -521,6 +521,12 @@ class SAC:
         self.critic_optimizer.step()
         return critic_1_loss, critic_2_loss
 
+    def _bootstrap_discount(self, batch: ReplayBuffer.Batch) -> torch.Tensor | float:
+        """Discount on the bootstrap: gamma to the per-sample horizon the batch aggregated (gamma^1 single-step)."""
+        if batch.effective_n_steps is not None:
+            return self.gamma ** batch.effective_n_steps.view(-1).float()
+        return self.gamma**self.n_steps
+
     def _critic_losses_and_backward(
         self,
         batch: ReplayBuffer.Batch,
@@ -536,13 +542,7 @@ class SAC:
             q1_t = self.critic_1_target(next_obs_b, next_actions).view(-1)
             q2_t = self.critic_2_target(next_obs_b, next_actions).view(-1)
             min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
-            # n-step: discount by the per-sample horizon actually aggregated (capped at episode ends);
-            # single-step: gamma^1. The buffer sets effective_n_steps only when n_steps > 1.
-            if batch.effective_n_steps is not None:
-                discount = self.gamma ** batch.effective_n_steps.view(-1).float()
-            else:
-                discount = self.gamma**self.n_steps
-            target_q = rewards_b + discount * not_terminated * min_q_t
+            target_q = rewards_b + self._bootstrap_discount(batch) * not_terminated * min_q_t
 
         q1 = self.critic_1(obs_b, actions_b).view(-1)
         q2 = self.critic_2(obs_b, actions_b).view(-1)

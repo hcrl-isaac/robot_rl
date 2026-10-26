@@ -289,6 +289,29 @@ class TestRecurrentSAC:
             torch.tensor(diag["Critic/q_target"])
         )
 
+    def test_nstep_bootstrap_state_is_the_last_steps_stored_state(self) -> None:
+        """An n-step sample bootstraps from the pre-step state stored at its n-th step, not its first."""
+        torch.manual_seed(0)
+        alg, env = _build(done_prob=0.0, obs_normalization=False, n_steps=3)
+        _collect(alg, env, 12)
+        buf = alg.replay_buffer
+        n = env.num_envs
+        batch = buf.sample_mini_batch()
+        assert batch.hidden is not None and batch.bootstrap_hidden is not None
+        obs_all = buf.observations["policy"][: len(buf)]
+        for i in range(8):
+            row = (obs_all == batch.bootstrap_observations["policy"][i]).all(dim=-1).nonzero()[0].item()
+            start = row - 2 * n
+            assert torch.allclose(batch.observations["policy"][i], obs_all[start])
+            assert torch.allclose(batch.hidden[:, i], buf.hidden[start, 0])
+            assert torch.allclose(batch.bootstrap_hidden[:, i], buf.hidden[row, 0])
+            with torch.no_grad():
+                h_next = alg.actor.step_state(
+                    batch.bootstrap_observations[i : i + 1], batch.bootstrap_hidden[:, i : i + 1]
+                )
+            if row + n < len(buf):
+                assert torch.allclose(h_next[:, 0], buf.hidden[row + n, 0], atol=1e-6)
+
     def test_episode_start_windows_begin_at_resets(self) -> None:
         """Episode-start windows open on a step whose predecessor was a done, so they start from a zero state."""
         torch.manual_seed(0)

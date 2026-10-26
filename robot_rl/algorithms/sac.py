@@ -563,15 +563,18 @@ class SAC:
     def _update_critics_recurrent(self, acc: Callable[[str, torch.Tensor | float], None]) -> None:
         """One twin-critic step on independent transitions, bootstrapping through the recurrent actor.
 
-        The next-state action is sampled with the state the actor reaches from the stored pre-step
-        state through the step's observation, which is the rollout state up to staleness.
+        The next-state action is sampled with the state the actor reaches from the pre-step state stored at
+        the bootstrap step (the n-th step of an n-step sample) through that step's observation, which is the
+        rollout state up to staleness.
         """
         batch = self.replay_buffer.sample_mini_batch(self.device)
         obs_b, next_obs_b, actions_b = batch.observations, batch.next_observations, batch.actions
         rewards_b = batch.rewards.view(-1)
         not_terminated = 1.0 - batch.next_terminated.view(-1).float()
+        boot_obs = batch.bootstrap_observations if batch.bootstrap_observations is not None else obs_b
+        boot_hidden = batch.bootstrap_hidden if batch.bootstrap_hidden is not None else batch.hidden
         with torch.no_grad():
-            h_next = self.actor.step_state(obs_b, batch.hidden)
+            h_next = self.actor.step_state(boot_obs, boot_hidden)
             next_latent = self.actor.encode_step(next_obs_b, h_next)
             next_actions, next_logp = self.actor.act_and_log_prob_from_latent(next_latent)
             next_in = self._critic_input(next_actions, next_latent)

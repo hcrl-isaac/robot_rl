@@ -69,6 +69,8 @@ class ReplayBuffer:
             next_terminated: torch.Tensor | None = None,
             effective_n_steps: torch.Tensor | None = None,
             hidden: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
+            bootstrap_observations: TensorDict | None = None,
+            bootstrap_hidden: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict = observations
@@ -96,6 +98,10 @@ class ReplayBuffer:
             """Per-sample number of steps actually aggregated (<= n_steps; 1-step or capped at an episode end)."""
             self.hidden = hidden
             """Stored recurrent state before each step, ``(layers, N, hidden)``; ``None`` if the buffer stores none."""
+            self.bootstrap_observations = bootstrap_observations
+            """Observation of the step whose next observation is bootstrapped from (n-step); ``None`` = this step's."""
+            self.bootstrap_hidden = bootstrap_hidden
+            """Stored recurrent state before that bootstrap step; ``None`` = ``hidden``."""
 
     class SequenceBatch:
         """A time-major batch of contiguous per-env windows, for recurrent updates.
@@ -372,6 +378,9 @@ class ReplayBuffer:
             self.context[start_flat].to(device),
             self.next_terminated[final_flat].to(device),
             effective_n.to(device),
+            hidden=self._gather_hidden(start_flat, device) if self.hidden is not None else None,
+            bootstrap_observations=self._read(self.observations, final_flat, device),
+            bootstrap_hidden=self._gather_hidden(final_flat, device) if self.hidden is not None else None,
         )
 
     def sample_sequences(

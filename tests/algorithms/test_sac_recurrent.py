@@ -46,7 +46,7 @@ class _DummyImageVecEnv:
         return next_obs, rewards, dones, extras
 
 
-def _make_cfg(obs_normalization: bool = True, aux_obs_group: str | None = None) -> dict:
+def _make_cfg(obs_normalization: bool = True, aux_obs_group: str | None = None, n_steps: int = 1) -> dict:
     return {
         "num_steps_per_env": 4,
         "obs_groups": {"actor": ["policy", "image"], "critic": ["critic"]},
@@ -83,7 +83,7 @@ def _make_cfg(obs_normalization: bool = True, aux_obs_group: str | None = None) 
             "target_entropy_scale": 1.0,
             "max_grad_norm": 1.0,
             "policy_frequency": 1,
-            "n_steps": 1,
+            "n_steps": n_steps,
             "seq_len": 4,
             "burn_in": 2,
             "aux_obs_group": aux_obs_group,
@@ -94,10 +94,10 @@ def _make_cfg(obs_normalization: bool = True, aux_obs_group: str | None = None) 
 
 
 def _build(
-    done_prob: float = 0.1, obs_normalization: bool = True, aux_obs_group: str | None = None
+    done_prob: float = 0.1, obs_normalization: bool = True, aux_obs_group: str | None = None, n_steps: int = 1
 ) -> tuple[SAC, _DummyImageVecEnv]:
     env = _DummyImageVecEnv(done_prob=done_prob)
-    cfg = _make_cfg(obs_normalization, aux_obs_group)
+    cfg = _make_cfg(obs_normalization, aux_obs_group, n_steps)
     alg = SAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu")
     return alg, env
 
@@ -270,6 +270,21 @@ class TestRecurrentSAC:
             if row + n >= len(buf):
                 continue
             assert torch.allclose(h_next[:, i], buf.hidden[row + n, 0], atol=1e-6)
+
+    def test_nstep_batch_discounts_by_aggregated_horizon(self) -> None:
+        """An n-step mini-batch bootstraps with gamma^k, k the steps summed into each sample (1..n_steps)."""
+        torch.manual_seed(0)
+        alg, env = _build(done_prob=0.1, n_steps=5)
+        _collect(alg, env, 12)
+        batch = alg.replay_buffer.sample_mini_batch(alg.device)
+        assert batch.effective_n_steps is not None
+        k = batch.effective_n_steps.view(-1).float()
+        assert torch.all(k >= 1) and torch.all(k <= 5) and k.max() > 1
+        assert torch.allclose(alg._bootstrap_discount(batch), alg.gamma**k)
+        losses, diag = alg.update()
+        assert torch.isfinite(torch.tensor(losses["critic_1"])) and torch.isfinite(
+            torch.tensor(diag["Critic/q_target"])
+        )
 
     def test_aux_head_trains_on_privileged_target(self) -> None:
         """With an aux group the actor grows a head sized to it and the update reports its loss."""

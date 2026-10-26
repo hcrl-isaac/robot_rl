@@ -38,6 +38,7 @@ class RNNModel(MLPModel):
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
         aux_target_dim: int = 0,
+        head_reads_features: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the RNN-based model.
@@ -52,10 +53,13 @@ class RNNModel(MLPModel):
             rnn_num_layers: Number of RNN layers.
             aux_target_dim: Width of an auxiliary linear head on the head input, for a supervised
                 prediction target (e.g. a privileged object position); ``0`` adds none.
+            head_reads_features: Feed the head the current features beside the recurrent output, so the
+                recurrent state only has to carry what the current observation lacks.
             **kwargs: Forwarded to the base model (``hidden_dims``, ``distribution_cfg``, ``memory_only``, ...).
         """
-        # read by the head construction in the base __init__, so it must exist first
+        # read by the head construction in the base __init__, so they must exist first
         self.rnn_hidden_dim = rnn_hidden_dim
+        self.head_reads_features = head_reads_features
         super().__init__(obs, obs_groups, obs_set, output_dim, **kwargs)
         self.rnn = RNN(self._feature_dim(), rnn_hidden_dim, rnn_num_layers, rnn_type)
         self.aux_head = nn.Linear(self._aux_input_dim(), aux_target_dim) if aux_target_dim > 0 else None
@@ -184,8 +188,8 @@ class RNNModel(MLPModel):
         return self._features(obs.reshape(seq_len * batch)).view(seq_len, batch, -1)
 
     def _head_input(self, feats: torch.Tensor, rnn_out: torch.Tensor) -> torch.Tensor:
-        """Combine the current features and the recurrent output into the head input (the recurrent output)."""
-        return rnn_out
+        """Combine the current features and the recurrent output into the head input."""
+        return torch.cat([feats, rnn_out], dim=-1) if self.head_reads_features else rnn_out
 
     def _aux_input_dim(self) -> int:
         """Width of the head input the auxiliary head reads (the full head input by default)."""
@@ -193,7 +197,7 @@ class RNNModel(MLPModel):
 
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""
-        return self.rnn_hidden_dim
+        return self.rnn_hidden_dim + (self._feature_dim() if self.head_reads_features else 0)
 
 
 class _TorchGRUModel(nn.Module):
@@ -210,15 +214,18 @@ class _TorchGRUModel(nn.Module):
         else:
             self.deterministic_output = nn.Identity()
         self.rnn.cpu()
+        self.head_reads_features = model.head_reads_features
         self.register_buffer("hidden_state", torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run one GRU inference step and update hidden states."""
         x = self.obs_normalizer(x)
-        x, h = self.rnn(x.unsqueeze(0), self.hidden_state)
+        out, h = self.rnn(x.unsqueeze(0), self.hidden_state)
         self.hidden_state[:] = h  # type: ignore
-        x = x.squeeze(0)
-        out = self.mlp(x)
+        out = out.squeeze(0)
+        if self.head_reads_features:
+            out = torch.cat([x, out], dim=-1)
+        out = self.mlp(out)
         return self.deterministic_output(out)
 
     @torch.jit.export
@@ -240,17 +247,20 @@ class _TorchLSTMModel(nn.Module):
             self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
             self.deterministic_output = nn.Identity()
+        self.head_reads_features = model.head_reads_features
         self.register_buffer("hidden_state", torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size))
         self.register_buffer("cell_state", torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run one LSTM inference step and update hidden and cell states."""
         x = self.obs_normalizer(x)
-        x, (h, c) = self.rnn(x.unsqueeze(0), (self.hidden_state, self.cell_state))
+        out, (h, c) = self.rnn(x.unsqueeze(0), (self.hidden_state, self.cell_state))
         self.hidden_state[:] = h  # type: ignore
         self.cell_state[:] = c  # type: ignore
-        x = x.squeeze(0)
-        out = self.mlp(x)
+        out = out.squeeze(0)
+        if self.head_reads_features:
+            out = torch.cat([x, out], dim=-1)
+        out = self.mlp(out)
         return self.deterministic_output(out)
 
     @torch.jit.export
@@ -288,6 +298,7 @@ class _OnnxRNNModel(nn.Module):
         self.input_size = model.obs_dim
         self.hidden_size = self.rnn.hidden_size
         self.num_layers = self.rnn.num_layers
+        self.head_reads_features = model.head_reads_features
 
     def forward(
         self, obs: torch.Tensor, h_in: torch.Tensor, c_in: torch.Tensor | None = None
@@ -296,17 +307,14 @@ class _OnnxRNNModel(nn.Module):
         x = self.obs_normalizer(obs)
 
         if self.rnn_type == "lstm":
-            x, (h, c) = self.rnn(x.unsqueeze(0), (h_in, c_in))
-            x = x.squeeze(0)
-            out = self.mlp(x)
-            out = self.deterministic_output(out)
-            return out, h, c
+            out, (h, c) = self.rnn(x.unsqueeze(0), (h_in, c_in))
         else:
-            x, h = self.rnn(x.unsqueeze(0), h_in)
-            x = x.squeeze(0)
-            out = self.mlp(x)
-            out = self.deterministic_output(out)
-            return out, h, None
+            out, h = self.rnn(x.unsqueeze(0), h_in)
+            c = None
+        out = out.squeeze(0)
+        if self.head_reads_features:
+            out = torch.cat([x, out], dim=-1)
+        return self.deterministic_output(self.mlp(out)), h, c
 
     def get_dummy_inputs(self) -> tuple[torch.Tensor, ...]:
         """Return representative dummy inputs for ONNX tracing."""

@@ -134,8 +134,8 @@ class SAC:
         self.burn_in = burn_in
         # windows per actor update; None sizes them so the loss steps add up to one minibatch
         self.num_windows = num_windows
-        # the critics also read the actor's (detached) recurrent latent, so an action's value depends on the memory
-        # that produced it and the actor cannot exploit a critic blind to that memory through BPTT
+        # the critics read the actor's (detached) recurrent latent and train on the actor's own windows, so an
+        # action is valued given the memory that produced it, at the latents the actor update queries
         self.critic_sees_hidden = bool(critic_sees_hidden) and self.recurrent
         # supervised target for the recurrent actor's aux head (e.g. privileged ball position)
         self.aux_obs_group = aux_obs_group
@@ -372,7 +372,8 @@ class SAC:
             )
             if batch is None:
                 break
-            self._update_critics_recurrent(_acc)
+            if not self.critic_sees_hidden:
+                self._update_critics_recurrent(_acc)
             if self.estimator is not None:
                 self._update_estimator(batch, _acc)
 
@@ -392,6 +393,8 @@ class SAC:
                 if burn > 0:
                     _, h0 = self.actor.encode_sequence(obs[:burn], h0, resets[:burn])
                 self._recurrent_state_diagnostics(batch, h0, _acc)
+            if self.critic_sees_hidden:
+                self._update_critics_on_windows(batch, h0, _acc)
 
             # Alpha and actor on the window; gradients stop at the burn-in boundary.
             latent, _ = self.actor.encode_sequence(train_obs, h0, train_resets)
@@ -490,10 +493,59 @@ class SAC:
         return self.window_priority + frac * (1.0 - self.window_priority)
 
     def _critic_input(self, actions: torch.Tensor, latent: torch.Tensor | None) -> torch.Tensor:
-        """The critics' fused input: the action, plus the actor's detached latent when the critics read it."""
+        """Fuse the critics' input: the action, plus the actor's detached latent when the critics read it."""
         if not self.critic_sees_hidden:
             return actions
         return torch.cat([actions, latent.detach()], dim=-1)
+
+    def _update_critics_on_windows(
+        self, batch: ReplayBuffer.SequenceBatch, h0: HiddenState, acc: Callable[[str, torch.Tensor | float], None]
+    ) -> None:
+        """One twin-critic step on the loss steps of the actor's windows, with the actor's latents as input.
+
+        The latent at each step comes from the same window unroll the actor trains on; the bootstrap latent is one
+        more recurrent step through the stored next observation, so a timeout bootstraps through its true next state.
+        """
+        burn = batch.burn_in
+        obs, next_obs, resets = batch.observations[burn:], batch.next_observations[burn:], batch.resets[burn:]
+        seq_len, batch_size = obs.batch_size
+        flat = seq_len * batch_size
+        with torch.no_grad():
+            latent, _, states = self.actor.encode_sequence_with_states(obs, h0, resets)  # type: ignore[attr-defined]
+            latent = latent.reshape(flat, -1)
+            # (L, layers, B, H) -> (layers, L*B, H): each step's post-step state, flat like the observations
+            if isinstance(states, tuple):
+                state_flat = tuple(st.permute(1, 0, 2, 3).reshape(st.shape[1], flat, -1) for st in states)
+            else:
+                state_flat = states.permute(1, 0, 2, 3).reshape(states.shape[1], flat, -1)
+            flat_next_obs = next_obs.reshape(flat)
+            next_latent = self.actor.encode_step(flat_next_obs, state_flat)
+            next_actions, next_logp = self.actor.act_and_log_prob_from_latent(next_latent)
+            next_in = self._critic_input(next_actions, next_latent)
+            q1_t = self.critic_1_target(flat_next_obs, next_in).view(-1)
+            q2_t = self.critic_2_target(flat_next_obs, next_in).view(-1)
+            min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
+            rewards = batch.rewards[burn:].reshape(-1)
+            not_terminated = 1.0 - batch.next_terminated[burn:].reshape(-1).float()
+            target_q = rewards + self.gamma * not_terminated * min_q_t
+        flat_obs = obs.reshape(flat)
+        data_in = self._critic_input(batch.actions[burn:].reshape(flat, -1), latent)
+        q1 = self.critic_1(flat_obs, data_in).view(-1)
+        q2 = self.critic_2(flat_obs, data_in).view(-1)
+        critic_1_loss = nn.functional.mse_loss(q1, target_q)
+        critic_2_loss = nn.functional.mse_loss(q2, target_q)
+        self.critic_optimizer.zero_grad()
+        (critic_1_loss + critic_2_loss).backward()
+        if self.is_multi_gpu:
+            self.reduce_parameters(self.critic_parameters)
+        acc("Critic/grad_norm", nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm))
+        self.critic_optimizer.step()
+        self._last_critic_losses = (critic_1_loss.item(), critic_2_loss.item())
+        with torch.no_grad():
+            acc("Critic/q_data", q1.mean())
+            acc("Critic/q_target", target_q.mean())
+            acc("Critic/td_abs", (q1 - target_q).abs().mean())
+            acc("Critic/reward", rewards.mean())
 
     def _update_critics_recurrent(self, acc: Callable[[str, torch.Tensor | float], None]) -> None:
         """One twin-critic step on independent transitions, bootstrapping through the recurrent actor.

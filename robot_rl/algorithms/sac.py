@@ -70,6 +70,7 @@ class SAC:
         burn_in: int = 8,
         num_windows: int | None = None,
         critic_sees_hidden: bool = False,
+        window_episode_start: bool = False,
         aux_obs_group: str | None = None,
         aux_loss_weight: float = 1.0,
         attn_target_group: str | None = None,
@@ -137,6 +138,7 @@ class SAC:
         # the critics read the actor's (detached) recurrent latent and train on the actor's own windows, so an
         # action is valued given the memory that produced it, at the latents the actor update queries
         self.critic_sees_hidden = bool(critic_sees_hidden) and self.recurrent
+        self.window_episode_start = window_episode_start
         # supervised target for the recurrent actor's aux head (e.g. privileged ball position)
         self.aux_obs_group = aux_obs_group
         self.aux_loss_weight = aux_loss_weight
@@ -369,6 +371,7 @@ class SAC:
                 num_windows=self.num_windows,
                 priority_group=self.window_priority_group,
                 priority=self._current_window_priority(),
+                episode_start=self.window_episode_start,
             )
             if batch is None:
                 break
@@ -476,7 +479,9 @@ class SAC:
             n = len(self.replay_buffer)
             _acc("Buffer/reward_all", self.replay_buffer.rewards[:n].float().mean())
             _acc("Buffer/reward_flat_sample", self.replay_buffer.sample_mini_batch(self.device).rewards.float().mean())
-            win = self.replay_buffer.sample_sequences(self.seq_len, self.burn_in, self.device)
+            win = self.replay_buffer.sample_sequences(
+                self.seq_len, self.burn_in, self.device, episode_start=self.window_episode_start
+            )
             if win is not None:
                 _acc("Buffer/reward_window_sample", win.rewards.float().mean())
         if self._rollout_hidden_steps > 0:

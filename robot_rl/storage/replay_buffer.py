@@ -382,6 +382,7 @@ class ReplayBuffer:
         num_windows: int | None = None,
         priority_group: str | None = None,
         priority: float = 1.0,
+        episode_start: bool = False,
         oversample: int = 4,
     ) -> SequenceBatch | None:
         """Sample contiguous per-env windows for a recurrent update.
@@ -402,6 +403,8 @@ class ReplayBuffer:
             priority_group: Observation group whose last column is a 0/1 seen flag; windows whose loss
                 segment contains a seen-to-unseen step within one episode are drawn ``priority`` times as often.
             priority: Relative weight of those windows; 1 samples uniformly.
+            episode_start: Start every window on an episode's first step, whose stored state is zero, so the
+                window's recurrent state is exact instead of re-derived from a stored (stale) state.
             oversample: Candidate windows drawn per kept window when weighting; it caps how far the weight can
                 raise the share of those windows.
 
@@ -430,8 +433,19 @@ class ReplayBuffer:
 
         weighted = priority_group is not None and priority != 1.0
         draws = batch_size * max(oversample, 1) if weighted else batch_size
-        start_rows = valid_rows[torch.randint(valid_rows.numel(), (draws,), device=self.device)]
-        envs = torch.randint(self.num_envs, (draws,), device=self.device)
+        if episode_start:
+            # keep the candidates whose previous stored step ended an episode; redraw from them to fill the batch
+            cand = valid_rows[torch.randint(valid_rows.numel(), (draws * 16,), device=self.device)]
+            cand_envs = torch.randint(self.num_envs, (draws * 16,), device=self.device)
+            prev_flat = ((cand - 1) % cap_rows) * self.num_envs + cand_envs
+            starts = self.dones[prev_flat].view(-1).bool()  # an unfilled predecessor row reads as no done
+            if not starts.any():
+                return None
+            pick = torch.randint(int(starts.sum()), (draws,), device=self.device)
+            start_rows, envs = cand[starts][pick], cand_envs[starts][pick]
+        else:
+            start_rows = valid_rows[torch.randint(valid_rows.numel(), (draws,), device=self.device)]
+            envs = torch.randint(self.num_envs, (draws,), device=self.device)
         offsets = torch.arange(total_len, device=self.device)
         if weighted:
             rows_c = (start_rows.unsqueeze(-1) + offsets) % cap_rows

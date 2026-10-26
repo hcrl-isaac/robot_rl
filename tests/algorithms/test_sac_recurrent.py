@@ -289,6 +289,15 @@ class TestRecurrentSAC:
             torch.tensor(diag["Critic/q_target"])
         )
 
+    def test_episode_start_windows_begin_at_resets(self) -> None:
+        """Episode-start windows open on a step whose predecessor was a done, so they start from a zero state."""
+        torch.manual_seed(0)
+        alg, env = _build(done_prob=0.2)
+        _collect(alg, env, 24)
+        batch = alg.replay_buffer.sample_sequences(alg.seq_len, 0, alg.device, episode_start=True)
+        assert batch is not None
+        assert torch.all(batch.init_hidden == 0)
+
     def test_aux_head_trains_on_privileged_target(self) -> None:
         """With an aux group the actor grows a head sized to it and the update reports its loss."""
         torch.manual_seed(0)

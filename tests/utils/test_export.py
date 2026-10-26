@@ -387,6 +387,42 @@ def test_a_vmf_actor_rebuilds_with_its_unit_mean_direction() -> None:
     torch.testing.assert_close(actual.norm(dim=-1), torch.ones(4))
 
 
+@pytest.mark.parametrize("rnn_type", ["gru", "lstm"])
+def test_a_recurrent_actor_rebuilds_and_exports_to_onnx_with_its_state(tmp_path: Path, rnn_type: str) -> None:
+    """A recurrent actor's ONNX export, fed back its own state each step, acts as the trained actor does.
+
+    The observation (8 wide) and the recurrent state (16) differ, so the rebuild must size the observation from the
+    recurrent input, not from the MLP head.
+    """
+    from tensordict import TensorDict
+
+    import onnxruntime as ort
+
+    from robot_rl.models import RNNModel
+    from tests.conftest import make_obs
+
+    vmf = {"class_name": "VonMisesFisherDistribution", "init_std": 0.05}
+    model_cfg = {"hidden_dims": [32, 32], "rnn_type": rnn_type, "rnn_hidden_dim": 16, "distribution_cfg": vmf}
+    actor = RNNModel(make_obs(1, 8), {"actor": ["policy"]}, "actor", 6, **model_cfg).eval()
+    train_cfg = {"actor": {"class_name": "RNNModel", **model_cfg}, "obs_groups": {"actor": ["policy"]}, "algorithm": {}}
+    policy = rebuild_models(train_cfg, {"actor_state_dict": actor.state_dict()})["policy"]
+
+    path = save_onnx(policy.as_onnx(), str(tmp_path), "actor.onnx")
+    session = ort.InferenceSession(path)
+    names = [i.name for i in session.get_inputs()]
+    assert names == ["obs", "h_in", *(["c_in"] if rnn_type == "lstm" else [])]
+    state = {name: np.zeros((1, 1, 16), dtype=np.float32) for name in names[1:]}
+    generator = torch.Generator().manual_seed(0)
+    actor.reset()
+    with torch.inference_mode():
+        for _ in range(4):
+            obs = torch.randn(1, 8, generator=generator)
+            expected = actor(TensorDict({"policy": obs}, batch_size=[1]), stochastic_output=False)
+            outputs = session.run(None, {"obs": obs.numpy(), **state})
+            torch.testing.assert_close(torch.from_numpy(outputs[0]), expected, rtol=1e-4, atol=1e-5)
+            state = dict(zip(names[1:], outputs[1:], strict=True))
+
+
 def test_all_models_says_so_for_a_checkpoint_without_a_single_critic() -> None:
     """An off-policy checkpoint has no single critic to rebuild, and asking for it names the limit."""
     _, train_cfg, ckpt = _vmf_actor_checkpoint()

@@ -24,6 +24,7 @@ NUM_ENVS = 16
 NUM_STEPS = 8
 OBS_DIM = 6
 STYLE_DIM = 5
+EXTRA_DIM = 2
 NUM_ACTIONS = 3
 
 
@@ -76,6 +77,36 @@ class TestDiscriminators:
         assert a_on_a > a_on_b
         assert b_on_b > b_on_a
 
+    def test_expert_reads_its_own_groups(self, tmp_path: Path) -> None:
+        """An expert naming extra groups gets a discriminator over its columns only, in its listed order."""
+        torch.save({"states": torch.randn(500, STYLE_DIM + EXTRA_DIM)}, tmp_path / "wide.pt")
+        experts = [
+            {"name": "a", "data_path": _write_expert(tmp_path / "a.pt", 2.0)},
+            {"name": "w", "data_path": str(tmp_path / "wide.pt"), "obs_groups": ["style", "extra"]},
+        ]
+        dims = {"style": STYLE_DIM, "extra": EXTRA_DIM}
+        style = StyleDiscriminators(
+            STYLE_DIM + EXTRA_DIM, {"style": ["style"]}, experts, group_dims=dims, hidden_dims=[16], batch_size=32
+        )
+        style.train()
+        obs = _obs()
+        obs["extra"] = torch.randn(NUM_ENVS, EXTRA_DIM)
+        assert style.get_style_state(obs).shape == (NUM_ENVS, STYLE_DIM + EXTRA_DIM)
+        assert style.discriminators[0][0].in_features == STYLE_DIM
+        assert style.discriminators[1][0].in_features == STYLE_DIM + EXTRA_DIM
+        assert style.compute_rewards(obs).shape == (NUM_ENVS, 2)
+        assert set(style.update(style.get_style_state(obs))) >= {"Style/a_expert", "Style/w_expert"}
+
+    def test_resolve_config_fills_group_dims(self) -> None:
+        """The resolver widens the style state by every group an expert names."""
+        obs = _obs()
+        obs["extra"] = torch.randn(NUM_ENVS, EXTRA_DIM)
+        cfg = resolve_style_config(
+            {"style_cfg": {"experts": [{"name": "w", "obs_groups": ["style", "extra"]}]}}, obs, {"style": ["style"]}
+        )
+        assert cfg["style_cfg"]["group_dims"] == {"style": STYLE_DIM, "extra": EXTRA_DIM}
+        assert cfg["style_cfg"]["num_states"] == STYLE_DIM + EXTRA_DIM
+
     def test_rewards_are_bounded_and_favor_expert_states(self, tmp_path: Path) -> None:
         """Unnormalized rewards stay in [0, 1], and a trained discriminator pays its expert's states more."""
         style = _make_style(tmp_path, reward_normalization=False, state_normalization=False)
@@ -127,23 +158,25 @@ class TestDiscriminators:
         assert resolve_style_config({}, obs, {})["style_cfg"] is None
 
 
-def _build_style_ppo(tmp_path: Path) -> tuple[PPO, TensorDict]:
+def _build_style_ppo(tmp_path: Path, extra: bool = False) -> tuple[PPO, TensorDict]:
     obs = _obs()
+    if extra:
+        obs["extra"] = torch.randn(NUM_ENVS, EXTRA_DIM)
     obs_groups = {"actor": ["policy"], "critic": ["policy"], "style": ["style"]}
     dist = {"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"}
     actor = MLPModel(obs, obs_groups, "actor", NUM_ACTIONS, hidden_dims=[32], activation="elu", distribution_cfg=dist)
     critic = MLPModel(obs, obs_groups, "critic", 3, hidden_dims=[32], activation="elu")
     storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS], num_reward_streams=3)
-    style_cfg = {
-        "num_states": STYLE_DIM,
-        "obs_groups": obs_groups,
-        "experts": [
-            {"name": "a", "data_path": _write_expert(tmp_path / "a.pt", 2.0), "weight": 1.0},
-            {"name": "b", "data_path": _write_expert(tmp_path / "b.pt", -2.0), "weight": 0.5},
-        ],
-        "hidden_dims": [32],
-        "batch_size": 32,
-    }
+    experts = [
+        {"name": "a", "data_path": _write_expert(tmp_path / "a.pt", 2.0), "weight": 1.0},
+        {"name": "b", "data_path": _write_expert(tmp_path / "b.pt", -2.0), "weight": 0.5},
+    ]
+    if extra:
+        torch.save({"states": torch.randn(500, STYLE_DIM + EXTRA_DIM)}, tmp_path / "wide.pt")
+        experts[1] = {"name": "b", "data_path": str(tmp_path / "wide.pt"), "obs_groups": ["style", "extra"]}
+    style_cfg = resolve_style_config(
+        {"style_cfg": {"experts": experts, "hidden_dims": [32], "batch_size": 32}}, obs, obs_groups
+    )["style_cfg"]
     ppo = PPO(
         actor,
         critic,
@@ -183,6 +216,18 @@ class TestMultiStreamPPO:
         ppo2.load(saved, None, strict=True)
         for p1, p2 in zip(ppo.style.discriminators.parameters(), ppo2.style.discriminators.parameters(), strict=True):
             assert torch.equal(p1, p2)
+
+    def test_rollout_with_an_expert_reading_extra_groups(self, tmp_path: Path) -> None:
+        """An expert's extra style group flows from storage into its discriminator update."""
+        ppo, obs = _build_style_ppo(tmp_path, extra=True)
+        ppo.train_mode()
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            nxt = _obs()
+            nxt["extra"] = torch.randn(NUM_ENVS, EXTRA_DIM)
+            ppo.process_env_step(nxt, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS, dtype=torch.uint8), {})
+        ppo.compute_returns(obs)
+        assert "Style/b_expert" in ppo.update()
 
     def test_stream_advantages_are_standardized_and_weighted(self, tmp_path: Path) -> None:
         """A stream with zero weight must not move the combined advantage."""
@@ -298,8 +343,16 @@ class TestActorWarmup:
         self._rollout(ppo, obs)
         ppo.update()
         restored, _ = self._warmup_ppo(tmp_path, warmup=10)
-        restored.load(ppo.save(), {"actor": True, "critic": True, "iteration": True}, strict=True)
+        restored.load(ppo.save(), {"actor": True, "critic": True, "iteration": True, "style": True}, strict=True)
         assert restored.num_updates_done == ppo.num_updates_done == 1
+        # a resume asks for the style state by name, so it comes back with the rest
+        assert restored.style.reward_steps == ppo.style.reward_steps
+        assert all(
+            torch.equal(a, b)
+            for a, b in zip(
+                ppo.style.discriminators.parameters(), restored.style.discriminators.parameters(), strict=True
+            )
+        )
 
 
 class TestActInference:
@@ -491,3 +544,64 @@ class TestCheckpointCompat:
         restored = TestGating._gated_style(tmp_path)
         restored.load_state_dict(state)
         assert restored.reward_steps == 7
+
+
+class TestLoadDefaults:
+    """Which loads restore the discriminators."""
+
+    @staticmethod
+    def _diverged(a: PPO, b: PPO) -> bool:
+        return not all(
+            torch.equal(x, y)
+            for x, y in zip(a.style.discriminators.parameters(), b.style.discriminators.parameters(), strict=True)
+        )
+
+    def test_a_full_load_restores_them(self, tmp_path: Path) -> None:
+        """A resume takes the discriminators back, so training continues against the same critics."""
+        trained, _ = _build_style_ppo(tmp_path)
+        trained.style.train()
+        trained.style.update(torch.randn(64, STYLE_DIM))
+        saved = trained.save()
+
+        fresh, _ = _build_style_ppo(tmp_path)
+        assert self._diverged(trained, fresh)
+        fresh.load(saved, load_cfg=None, strict=True)
+        assert not self._diverged(trained, fresh)
+
+    def test_a_partial_load_leaves_them_alone(self, tmp_path: Path) -> None:
+        """A cfg that does not name the key leaves the style modules as they are."""
+        trained, _ = _build_style_ppo(tmp_path)
+        trained.style.train()
+        trained.style.update(torch.randn(64, STYLE_DIM))
+        saved = trained.save()
+
+        fresh, _ = _build_style_ppo(tmp_path)
+        before = [p.clone() for p in fresh.style.discriminators.parameters()]
+        fresh.load(saved, load_cfg={"actor": True, "memory": True}, strict=True)
+        assert all(torch.equal(p, q) for p, q in zip(fresh.style.discriminators.parameters(), before, strict=True))
+
+    def test_a_partial_resume_restores_them(self, tmp_path: Path) -> None:
+        """A resume names the key, so it keeps the discriminators and their optimizer."""
+        trained, _ = _build_style_ppo(tmp_path)
+        trained.style.train()
+        trained.style.update(torch.randn(64, STYLE_DIM))
+        saved = trained.save()
+
+        fresh, _ = _build_style_ppo(tmp_path)
+        cfg = {"actor": True, "critic": True, "memory": True, "optimizer": True, "iteration": True, "style": True}
+        fresh.load(saved, load_cfg=cfg, strict=True)
+        assert not self._diverged(trained, fresh)
+        assert (
+            fresh.style.optimizer.state_dict()["state"].keys() == trained.style.optimizer.state_dict()["state"].keys()
+        )
+
+    def test_a_partial_load_can_ask_for_them(self, tmp_path: Path) -> None:
+        """Naming the key overrides the default, for a caller that does want them."""
+        trained, _ = _build_style_ppo(tmp_path)
+        trained.style.train()
+        trained.style.update(torch.randn(64, STYLE_DIM))
+        saved = trained.save()
+
+        fresh, _ = _build_style_ppo(tmp_path)
+        fresh.load(saved, load_cfg={"actor": True, "style": True}, strict=True)
+        assert not self._diverged(trained, fresh)

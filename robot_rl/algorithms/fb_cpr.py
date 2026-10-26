@@ -774,6 +774,7 @@ class FbCpr:
             z_dim,
             cfg["algorithm"]["batch_size"],
             cfg["storage_device"],
+            obs_dtypes={k: getattr(torch, v) for k, v in (cfg["algorithm"].get("replay_obs_dtypes") or {}).items()},
         )
         # A large corpus can exceed VRAM on its own, so it is placed independently of the replay buffer.
         expert_device = _expert_storage_device(cfg, device)

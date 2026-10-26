@@ -155,6 +155,7 @@ class ReplayBuffer:
         hidden_dim: int = 0,
         hidden_layers: int = 1,
         hidden_is_lstm: bool = False,
+        obs_dtypes: dict[str, torch.dtype] | None = None,
     ) -> None:
         """Initialize the buffer storage.
 
@@ -175,6 +176,8 @@ class ReplayBuffer:
             hidden_dim: Recurrent hidden size stored per transition; ``0`` (default) stores none.
             hidden_layers: Number of recurrent layers, for sizing the stored state.
             hidden_is_lstm: Store two slots per step (``h`` and ``c``) instead of one.
+            obs_dtypes: Storage dtype of the named observation groups (e.g. ``float16`` for a long history); each is
+                sampled back in the group's own dtype. Groups not named are stored as given.
         """
         # store inputs
         self.num_envs = num_envs
@@ -189,9 +192,11 @@ class ReplayBuffer:
 
         # Core
         # We only take value.shape[1:] to ignore num_envs dimension
+        self._obs_dtypes = {key: value.dtype for key, value in obs.items()}
+        stored = obs_dtypes or {}
         self.observations = TensorDict(
             {
-                key: torch.zeros(self.capacity, *value.shape[1:], dtype=value.dtype, device=device)
+                key: torch.zeros(self.capacity, *value.shape[1:], dtype=stored.get(key, value.dtype), device=device)
                 for key, value in obs.items()
             },
             batch_size=self.capacity,
@@ -246,8 +251,8 @@ class ReplayBuffer:
             )
 
         buf_idxs = (torch.arange(0, num_valid, device=self.device) + self._curr_idx) % self.capacity
-        self.observations.update_at_(transition.observations[valid_idxs].to(self.device), buf_idxs)  # type: ignore
-        self.next_observations.update_at_(transition.next_observations[valid_idxs].to(self.device), buf_idxs)  # type: ignore
+        self.observations.update_at_(self._stored(transition.observations[valid_idxs]), buf_idxs)  # type: ignore
+        self.next_observations.update_at_(self._stored(transition.next_observations[valid_idxs]), buf_idxs)  # type: ignore
         self.actions.index_copy_(0, buf_idxs, transition.actions[valid_idxs].to(self.device))  # type: ignore
         self.rewards.index_copy_(0, buf_idxs, transition.rewards[valid_idxs].to(self.device))  # type: ignore
         self.context.index_copy_(0, buf_idxs, transition.context[valid_idxs].to(self.device))  # type: ignore
@@ -271,6 +276,22 @@ class ReplayBuffer:
             self._is_full = True
             self._curr_idx -= self.capacity
 
+    def _stored(self, observations: TensorDict) -> TensorDict:
+        """``observations`` on the storage device, each group in its storage dtype."""
+        out = observations.to(self.device)
+        for key, value in self.observations.items():
+            if out[key].dtype != value.dtype:
+                out[key] = out[key].to(value.dtype)
+        return out
+
+    def _read(self, observations: TensorDict, idx: torch.Tensor, device: str | None) -> TensorDict:
+        """``observations[idx]`` on ``device``, each group back in its own dtype."""
+        out = observations[idx].to(device)
+        for key, dtype in self._obs_dtypes.items():
+            if out[key].dtype != dtype:
+                out[key] = out[key].to(dtype)
+        return out
+
     def sample_mini_batch(self, device: str | None = None) -> Batch:
         """Randomly sample a mini-batch from the replay buffer (with n-step aggregation when ``n_steps > 1``)."""
         if self.n_steps > 1:
@@ -283,8 +304,8 @@ class ReplayBuffer:
         self._indices.random_(0, len(self))
 
         return ReplayBuffer.Batch(
-            self.observations[self._indices].to(device),
-            self.next_observations[self._indices].to(device),
+            self._read(self.observations, self._indices, device),
+            self._read(self.next_observations, self._indices, device),
             self.actions[self._indices].to(device),
             self.rewards[self._indices].to(device),
             self.gammas[self._indices].to(device),
@@ -343,8 +364,8 @@ class ReplayBuffer:
         final_flat = step_flat.gather(1, first_done.unsqueeze(-1)).squeeze(-1)  # [B]
 
         return ReplayBuffer.Batch(
-            self.observations[start_flat].to(device),
-            self.next_observations[final_flat].to(device),
+            self._read(self.observations, start_flat, device),
+            self._read(self.next_observations, final_flat, device),
             self.actions[start_flat].to(device),
             n_step_rewards.to(device),
             self.gammas[start_flat].to(device),
@@ -439,8 +460,8 @@ class ReplayBuffer:
             burn_hidden = self._gather_hidden(step_rows[:, min(burn_in, max_offset)] * self.num_envs + envs, device)
         ages = ((write_row - start_rows) % cap_rows).float() / cap_rows
 
-        obs = self.observations[step_flat].reshape(batch_size, total_len).transpose(0, 1).to(device)
-        next_obs = self.next_observations[step_flat].reshape(batch_size, total_len).transpose(0, 1).to(device)
+        obs = self._read(self.observations, step_flat, device).reshape(batch_size, total_len).transpose(0, 1)
+        next_obs = self._read(self.next_observations, step_flat, device).reshape(batch_size, total_len).transpose(0, 1)
         return ReplayBuffer.SequenceBatch(
             obs,
             next_obs,

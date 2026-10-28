@@ -42,6 +42,8 @@ class Distillation:
         loss_type: str = "mse",
         aux_obs_group: str | None = None,
         aux_loss_weight: float = 1.0,
+        teacher_action_prob: float = 0.0,
+        teacher_action_decay_updates: int = 0,
         optimizer: str = "adam",
         device: str = "cpu",
         # Distributed training parameters
@@ -66,6 +68,12 @@ class Distillation:
         # privileged supervision of the student's encoder (e.g. ball position), as in the SAC actor's aux head
         self.aux_obs_group = aux_obs_group
         self.aux_loss_weight = aux_loss_weight
+        # DAgger mixing: envs drawn at each reset execute the teacher's action, so early rollouts visit the states
+        # the teacher would reach (e.g. the ball kept in view); the labels are always the teacher's
+        self.teacher_action_prob_init = teacher_action_prob
+        self.teacher_action_decay_updates = teacher_action_decay_updates
+        self.teacher_action_prob = teacher_action_prob
+        self._teacher_driven: torch.Tensor | None = None
         self.teacher = teacher.to(self.device)
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
@@ -107,7 +115,16 @@ class Distillation:
         self.transition.privileged_actions = self.teacher(obs).detach()
         # Record the observations
         self.transition.observations = obs
+        if self.teacher_action_prob > 0.0 or self._teacher_driven is not None:
+            if self._teacher_driven is None:
+                self._teacher_driven = self._draw_teacher_driven(self.transition.actions.shape[0])  # type: ignore
+            driven = self._teacher_driven.unsqueeze(-1)
+            return torch.where(driven, self.transition.privileged_actions, self.transition.actions)  # type: ignore
         return self.transition.actions  # type: ignore
+
+    def _draw_teacher_driven(self, n: int) -> torch.Tensor:
+        """Draw which of ``n`` envs execute the teacher's action this episode."""
+        return torch.rand(n, device=self.device) < self.teacher_action_prob
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
@@ -123,6 +140,9 @@ class Distillation:
         self.transition.clear()
         self.student.reset(dones)
         self.teacher.reset(dones)
+        if self._teacher_driven is not None:
+            done = dones.view(-1).bool().to(self.device)
+            self._teacher_driven[done] = self._draw_teacher_driven(int(done.sum()))
 
     def compute_returns(self, obs: TensorDict) -> None:
         """No-op since distillation does not use return targets."""
@@ -132,6 +152,9 @@ class Distillation:
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
         self.num_updates += 1
+        if self.teacher_action_decay_updates > 0:
+            frac = min(self.num_updates / self.teacher_action_decay_updates, 1.0)
+            self.teacher_action_prob = self.teacher_action_prob_init * (1.0 - frac)
         mean_behavior_loss = 0
         mean_aux_loss = 0
         loss = 0
@@ -185,6 +208,8 @@ class Distillation:
         loss_dict = {"behavior": mean_behavior_loss}
         if self.aux_obs_group is not None:
             loss_dict["aux"] = mean_aux_loss
+        if self.teacher_action_prob_init > 0.0:
+            loss_dict["teacher_action_prob"] = self.teacher_action_prob
 
         return loss_dict
 

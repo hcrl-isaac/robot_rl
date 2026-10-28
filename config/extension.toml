@@ -13,9 +13,8 @@ readme  = "README.md"
 title = "HCRL fork of rsl_rl"
 author = "Kyle Morgenstein"
 maintainer = "Emily Sturman"
-maintainer_email = "sturman@utexas.edu"
 license = { text = "BSD-3-Clause" }
-repository = "https://github.com/Creampelt/robot_rl.git"
+repository = "https://github.com/hcrl-isaac/robot_rl.git"
 category = "robotics"
 
 requires-python = ">=3.8"

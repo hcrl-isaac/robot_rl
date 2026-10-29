@@ -110,7 +110,7 @@ class Logger:
                 self.logger_type = "WandbLogWriter"
                 logger_cfg = {
                     "project_name": self.cfg.get("wandb_project"),
-                    "run_name": self.cfg.get("wandb_run_name"),
+                    "run_name": self.cfg.get("wandb_run_name") or self.cfg.get("run_name"),
                     "group": self.cfg.get("wandb_group"),
                     "entity": self.cfg.get("wandb_entity"),
                     "shared": self.cfg.get("shared", False),

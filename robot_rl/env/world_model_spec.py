@@ -35,13 +35,19 @@ class WorldModelSpec:
     """Group predicted autoregressively by the dynamics model."""
 
     obs_group: str | None = None
-    """Noise-free single-frame copies of the actor's proprioceptive terms, predicted by the observation head."""
+    """Noise-free single-frame copies of the policy's noisy terms (same names and widths, substep stacks included),
+    predicted by the observation head."""
 
     context_group: str | None = None
     """Per-episode simulation context (domain-randomization parameters), constant along a rollout."""
 
     goal_groups: list[str] = field(default_factory=list)
-    """Exogenous groups (e.g. the reference window): never predicted, read along the logged trajectory."""
+    """Exogenous groups (e.g. the reference window): never predicted. Read from the env's goal provider when
+    ``goal_key_group`` is set, otherwise along the logged trajectory."""
+
+    goal_key_group: str | None = None
+    """Group holding each row's goal key (e.g. clip and frame); the env's ``world_model_goals(keys, steps)`` returns
+    the goal groups ``steps`` env steps after that key, so imagination needs no logged future."""
 
     action_terms: list[str] = field(default_factory=list)
     """Actor-observation terms equal to the previous action; imagination fills them with the imagined action."""

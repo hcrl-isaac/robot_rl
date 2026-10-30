@@ -23,10 +23,11 @@ class _TrackingEnv:
     """A 2-D point mass with a per-episode actuator gain, tracking a sinusoid it reads ``FUTURE`` frames ahead.
 
     Groups mirror a tracking task: a noisy ``policy`` history, its noise-free single-frame copy ``obs_bar``, the
-    ``state``, the exogenous ``goal`` window and the ``context`` (the gain).
+    ``state``, the exogenous ``goal`` window, the ``context`` (the gain) and the ``goal_key`` (time and phase) from
+    which :meth:`world_model_goals` recomputes the goal.
     """
 
-    def __init__(self, num_envs: int = 32, noise: float = 0.05, seed: int = 0) -> None:
+    def __init__(self, num_envs: int = 32, noise: float = 0.05, seed: int = 0, provide_goals: bool = True) -> None:
         self.num_envs, self.num_actions, self.noise = num_envs, 2, noise
         self.max_episode_length = MAX_EP_LEN
         self.device = "cpu"
@@ -44,6 +45,7 @@ class _TrackingEnv:
             obs_group="obs_bar",
             context_group="context",
             goal_groups=["goal"],
+            goal_key_group="goal_key" if provide_goals else None,
             action_terms=["last_action"],
             layouts={
                 "policy": [
@@ -55,6 +57,14 @@ class _TrackingEnv:
             },
         )
         self._reset(torch.arange(n))
+
+    @staticmethod
+    def _goal(t: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        return torch.cat([torch.sin(DT * (t.float()[:, None] + i) + phase) for i in range(1, FUTURE + 1)], dim=-1)
+
+    def world_model_goals(self, keys: torch.Tensor, steps: torch.Tensor) -> TensorDict:
+        goal = self._goal(keys[:, 0] + steps, keys[:, 1:])
+        return TensorDict({"goal": goal}, batch_size=[keys.shape[0]])
 
     def _ref(self, t: torch.Tensor) -> torch.Tensor:
         return torch.sin(DT * t.float()[:, None] + self.phase)
@@ -78,9 +88,15 @@ class _TrackingEnv:
         h = self.history
         policy = torch.cat([h[:, :, 0:2].flatten(1), h[:, :, 2:4].flatten(1), h[:, :, 4:6].flatten(1)], dim=-1)
         t = self.episode_length_buf
-        goal = torch.cat([self._ref(t + i) for i in range(1, FUTURE + 1)], dim=-1)
         state = torch.cat([self.pos, self.vel], dim=-1)
-        groups = {"policy": policy, "obs_bar": state.clone(), "state": state, "goal": goal, "context": self.gain}
+        groups = {
+            "policy": policy,
+            "obs_bar": state.clone(),
+            "state": state,
+            "goal": self._goal(t, self.phase),
+            "goal_key": torch.cat([t.float()[:, None], self.phase], dim=-1),
+            "context": self.gain,
+        }
         return TensorDict(groups, batch_size=[self.num_envs])
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
@@ -108,13 +124,13 @@ class _TrackingEnv:
         return self
 
 
-def _make_cfg(critic_mode: str = "replay") -> dict:
+def _make_cfg(critic_mode: str = "replay", critic_obs: list[str] | None = None) -> dict:
     return {
         "num_steps_per_env": 4,
         "save_interval": 1000,
         "log_interval": 1000,
         "num_seed_steps_per_env": 4,
-        "obs_groups": {"actor": ["policy", "goal"], "critic": ["state", "goal", "context"]},
+        "obs_groups": {"actor": ["policy", "goal"], "critic": critic_obs or ["state", "goal", "context"]},
         "actor": {"class_name": "MLPModel", "hidden_dims": [64, 64], "obs_normalization": True},
         "critic": {"class_name": "MLPModel", "hidden_dims": [64, 64], "obs_normalization": True},
         "algorithm": {
@@ -139,6 +155,16 @@ def _make_cfg(critic_mode: str = "replay") -> dict:
     }
 
 
+def _collect(alg: WorldModelAC, env: _TrackingEnv, steps: int) -> TensorDict:
+    obs = env.get_observations()
+    for _ in range(steps):
+        with torch.inference_mode():
+            actions = alg.act(obs)
+            obs, rewards, dones, extras = env.step(actions)
+            alg.process_env_step(obs, rewards, dones, extras)
+    return obs
+
+
 def _evaluate(policy: torch.nn.Module | None, steps: int = MAX_EP_LEN) -> float:
     """Mean per-step reward of a deterministic policy (``None`` = zero action) on fresh episodes."""
     env = _TrackingEnv(num_envs=64, seed=123)
@@ -152,55 +178,91 @@ def _evaluate(policy: torch.nn.Module | None, steps: int = MAX_EP_LEN) -> float:
 
 
 def test_replay_windows_stay_inside_one_episode() -> None:
-    """Sampled windows never cross a reset, and ``require_next`` keeps the row after the window in-episode."""
-    env = _TrackingEnv(num_envs=8)
-    obs = env.get_observations()
-    buf = SequenceReplayBuffer(8, 40, obs, ["state"], 2)
-    for _ in range(120):  # wraps the ring three times
-        buf.add(
-            env.get_observations(), torch.zeros(8, 2), torch.zeros(8), torch.zeros(8), env.step(torch.zeros(8, 2))[2]
-        )
+    """Under random terminations and time-outs, a window never crosses a reset; ``require_next`` also holds row L."""
+    torch.manual_seed(0)
+    num_envs, capacity = 6, 37
+    obs = TensorDict({"t": torch.zeros(num_envs, 2)}, batch_size=[num_envs])
+    buf = SequenceReplayBuffer(num_envs, capacity, obs, ["t"], 1)
+    episode, step = torch.zeros(num_envs), torch.zeros(num_envs)
+    for _ in range(300):  # wraps the ring several times
+        terminated = torch.rand(num_envs) < 0.08
+        dones = terminated | (torch.rand(num_envs) < 0.05)
+        row = TensorDict({"t": torch.stack([episode, step], dim=-1)}, batch_size=[num_envs])
+        buf.add(row, torch.zeros(num_envs, 1), torch.zeros(num_envs), terminated, dones)
+        episode, step = torch.where(dones, episode + 1, episode), torch.where(dones, 0.0, step + 1)
     for require_next in (False, True):
-        win = buf.sample_windows(64, 6, require_next=require_next)
-        steps = win.obs["state"]  # positions only rise smoothly within an episode
-        assert steps.shape == (7, 64, 4)
+        win = buf.sample_windows(2000, 5, require_next=require_next)
+        assert win is not None
+        ep, st = win.obs["t"][..., 0], win.obs["t"][..., 1]
+        assert (ep[:5] == ep[:1]).all() and (st[:5] - st[:1] == torch.arange(5)[:, None]).all()
+        same_next = (ep[5] == ep[0]) & (st[5] - st[0] == 5)
+        assert (same_next == win.next_valid).all()
+        assert (win.next_valid | (win.terminated[-1] > 0)).all()
+        assert (win.terminated[:-1] == 0).all()
         if require_next:
             assert win.next_valid.all()
-        assert (win.terminated[:-1] == 0).all()
+    buf.mark_episode_start()
+    buf.add(row, torch.zeros(num_envs, 1), torch.zeros(num_envs), torch.zeros(num_envs), torch.zeros(num_envs))
+    assert (buf.episode_step[(buf.pos - 1) % capacity] == 0).all()
+    assert SequenceReplayBuffer(num_envs, capacity, obs, ["t"], 1).sample_windows(4, 5) is None
 
 
 def test_imagined_observation_rolls_history_and_reproduces_noise() -> None:
     """History terms shift by one frame, the action term takes the action, and the bank holds the sensor noise."""
     env = _TrackingEnv(num_envs=4)
     obs = env.get_observations()
-    io = ImaginedObservation(env.world_model_spec, obs, ["policy", "goal"])
+    io = ImaginedObservation(env.world_model_spec, obs, ["policy", "goal", "state", "context"])
     bank = io.noise_bank(obs)
     # newest noisy frame minus the noise-free copy is exactly the env's sensor noise
     newest = torch.cat([obs["policy"][:, 2:4], obs["policy"][:, 6:8]], dim=-1)
     assert torch.allclose(bank["policy"], newest - obs["obs_bar"])
     action = torch.ones(4, 2)
-    nxt = io.step(obs.select("policy", "goal"), obs["obs_bar"], action, obs.select("goal"), bank)
+    current = obs.select(*io.groups)
+    nxt = io.step(current, obs["state"], obs["context"], obs["obs_bar"], action, obs.select("goal"), bank)
     assert torch.allclose(nxt["policy"][:, 0:2], obs["policy"][:, 2:4])  # oldest pos frame <- previous newest
     assert torch.allclose(nxt["policy"][:, 2:4], newest[:, 0:2])
     assert torch.allclose(nxt["policy"][:, 10:12], action)
+    assert torch.equal(nxt["state"], obs["state"]) and torch.equal(nxt["context"], obs["context"])
 
 
-@pytest.mark.parametrize("critic_mode", ["replay", "imagination"])
-def test_update_runs_and_logs(critic_mode: str) -> None:
-    """One update in each critic mode logs finite losses, and a checkpoint round-trips."""
-    env = _TrackingEnv()
-    obs = env.get_observations()
-    alg = WorldModelAC.construct_algorithm(obs, env, _make_cfg(critic_mode), device="cpu")
-    for _ in range(40):
-        with torch.inference_mode():
-            actions = alg.act(obs)
-            obs, rewards, dones, extras = env.step(actions)
-            alg.process_env_step(obs, rewards, dones, extras)
+@pytest.mark.parametrize(
+    "critic_mode,provide_goals,critic_obs",
+    [
+        ("replay", True, None),
+        ("imagination", True, None),
+        ("replay", False, None),
+        ("imagination", False, ["policy", "state", "goal"]),  # a critic over a history group, as FB-CPR's
+    ],
+)
+def test_update_runs_and_logs(critic_mode: str, provide_goals: bool, critic_obs: list[str] | None) -> None:
+    """One update logs finite losses for each critic mode and goal source, and a checkpoint round-trips."""
+    env = _TrackingEnv(provide_goals=provide_goals)
+    cfg = _make_cfg(critic_mode, critic_obs)
+    alg = WorldModelAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu")
+    assert ("goal" in alg.replay_buffer.groups) != provide_goals
+    obs = _collect(alg, env, 40)
     logs = alg.update()
     for key in ("world_model/state", "world_model/k_step_error", "actor/imagined_return", "critic/loss"):
-        assert key in logs and torch.isfinite(torch.tensor(logs[key]))
-    restored = WorldModelAC.construct_algorithm(obs, env, _make_cfg(critic_mode), device="cpu")
+        assert key in logs and torch.isfinite(torch.tensor(logs[key])), (key, logs)
+    restored = WorldModelAC.construct_algorithm(obs, env, cfg, device="cpu")
     assert restored.load(copy.deepcopy(alg.save()))
+
+
+def test_updates_skip_until_windows_exist() -> None:
+    """With fewer rows than any window, an update is skipped and logged instead of raising."""
+    env = _TrackingEnv(provide_goals=False)
+    alg = WorldModelAC.construct_algorithm(env.get_observations(), env, _make_cfg("replay"), device="cpu")
+    _collect(alg, env, 3)
+    logs = alg.update()
+    assert logs["world_model/skipped"] == 1.0 and logs["actor/skipped"] == 1.0 and logs["critic/skipped"] == 1.0
+
+
+def test_provider_must_match_the_goal_observation() -> None:
+    """A goal provider that disagrees with the env's goal observation is caught at construction."""
+    env = _TrackingEnv()
+    env.world_model_goals = lambda keys, steps: TensorDict({"goal": torch.zeros(len(keys), 2 * FUTURE)}, [len(keys)])
+    with pytest.raises(ValueError, match="disagrees"):
+        WorldModelAC.construct_algorithm(env.get_observations(), env, _make_cfg(), device="cpu")
 
 
 @pytest.mark.parametrize("critic_mode", ["replay", "imagination"])

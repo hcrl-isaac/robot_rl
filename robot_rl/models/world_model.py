@@ -11,7 +11,7 @@ from robot_rl.utils import resolve_nn_activation
 
 
 def _mlp(input_dim: int, output_dim: int, hidden_dims: Sequence[int], activation: str, layer_norm: bool) -> nn.Module:
-    """Return an MLP with an optional LayerNorm before each hidden activation."""
+    """Return an MLP with an optional LayerNorm before each hidden activation (``modules.MLP`` norms only the first)."""
     layers: list[nn.Module] = []
     dim = input_dim
     for hidden in hidden_dims:
@@ -110,7 +110,7 @@ class WorldModel(nn.Module):
         """Normalize raw state, context and goal (absent inputs become zero-width tensors)."""
         empty = state.new_zeros(*state.shape[:-1], 0)
         ctx = self.context_normalizer(context) if self.context_dim else empty
-        g = self.goal_normalizer(goal) if self.goal_dim else empty
+        g = self.goal_normalizer(goal) if self.goal_dim and goal is not None else empty
         return self.state_normalizer(state), ctx, g
 
     def denormalize_state(self, state_n: torch.Tensor) -> torch.Tensor:

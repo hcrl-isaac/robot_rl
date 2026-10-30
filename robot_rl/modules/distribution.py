@@ -601,6 +601,8 @@ def _vmf_bessel_terms(kappa: torch.Tensor, half: int, cf_extra: int) -> tuple[to
 
 
 _vmf_bessel_terms_fused = torch.compile(_vmf_bessel_terms, fullgraph=True, dynamic=False)
+# per-state concentrations: one fused kernel over a batch whose size varies between rollout and update
+_vmf_bessel_terms_fused_rows = torch.compile(_vmf_bessel_terms, fullgraph=True, dynamic=None)
 
 
 @functools.cache
@@ -702,14 +704,24 @@ class VonMisesFisherDistribution(Distribution):
         fn = _vmf_bessel_terms_fused if fused else _vmf_bessel_terms
         return fn(kappa, self.output_dim // 2, self._cf_extra)
 
+    def _bessel_terms_rows(self, kappa: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """:meth:`_bessel_terms` for a tensor of per-state concentrations, fused over the batch on CUDA."""
+        fused = not torch.compiler.is_compiling() and kappa.is_cuda and _has_triton()
+        if not fused:
+            return _vmf_bessel_terms(kappa, self.output_dim // 2, self._cf_extra)
+        kappa = kappa.reshape(-1)
+        torch._dynamo.mark_dynamic(kappa, 0)  # only the batch varies; the Bessel order stays a constant
+        log_norm, a_ratio = _vmf_bessel_terms_fused_rows(kappa, self.output_dim // 2, self._cf_extra)
+        return log_norm.reshape(self._kappa_shape), a_ratio.reshape(self._kappa_shape)
+
     def update(self, mlp_output: torch.Tensor) -> None:
         """Update the distribution: mean direction = normalized MLP output, concentration = kappa param or output."""
         if self.state_dependent_kappa:
             self._mu = torch.nn.functional.normalize(mlp_output[..., : self.output_dim], dim=-1)
             log_kappa = mlp_output[..., self.output_dim].clamp(*self.log_kappa_range)
             self._kappa = torch.exp(log_kappa)
-            # the fused kernel is compiled for static shapes; per-state concentrations vary in batch size
-            self._log_norm, self._a_ratio = _vmf_bessel_terms(self._kappa, self.output_dim // 2, self._cf_extra)
+            self._kappa_shape = self._kappa.shape
+            self._log_norm, self._a_ratio = self._bessel_terms_rows(self._kappa)
             return
         self._mu = torch.nn.functional.normalize(mlp_output, dim=-1)
         self._kappa = torch.exp(self.log_kappa).clamp(self.kappa_range[0], self.kappa_range[1])
@@ -841,8 +853,9 @@ class VonMisesFisherDistribution(Distribution):
         mu1, kappa1_b = new_params
         if self.state_dependent_kappa:
             kappa0, kappa1 = kappa0_b.squeeze(-1), kappa1_b.squeeze(-1)
-            log_norm0, a0 = _vmf_bessel_terms(kappa0, self.output_dim // 2, self._cf_extra)
-            log_norm1, _ = _vmf_bessel_terms(kappa1, self.output_dim // 2, self._cf_extra)
+            self._kappa_shape = kappa0.shape
+            log_norm0, a0 = self._bessel_terms_rows(kappa0)
+            log_norm1, _ = self._bessel_terms_rows(kappa1)
         else:
             kappa0 = kappa0_b.reshape(-1)[0]
             kappa1 = kappa1_b.reshape(-1)[0]

@@ -257,6 +257,17 @@ def test_updates_skip_until_windows_exist() -> None:
     assert logs["world_model/skipped"] == 1.0 and logs["actor/skipped"] == 1.0 and logs["critic/skipped"] == 1.0
 
 
+def test_eval_rolls_out_and_restores_training_mode() -> None:
+    """The recorder's rollout steps the env max_steps times and leaves the models training."""
+    env = _TrackingEnv()
+    alg = WorldModelAC.construct_algorithm(env.get_observations(), env, _make_cfg(), device="cpu")
+    steps = []
+    step = env.step
+    env.step = lambda actions: (steps.append(actions), step(actions))[1]
+    assert alg.eval(env, max_steps=6, stochastic=True, action_repeat=2) == []
+    assert len(steps) == 6 and torch.equal(steps[0], steps[1]) and alg.actor.training
+
+
 def test_provider_must_match_the_goal_observation() -> None:
     """A goal provider that disagrees with the env's goal observation is caught at construction."""
     env = _TrackingEnv()

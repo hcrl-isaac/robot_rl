@@ -520,6 +520,43 @@ class WorldModelAC:
         self.critic.eval()
         self.world_model.eval()
 
+    def eval(self, env: VecEnv, max_steps: int = 200, stochastic: bool = False, action_repeat: int = 1) -> list[dict]:
+        """Roll out the policy for ``max_steps`` env steps (each ``env.step`` renders a frame for a video wrapper).
+
+        Args:
+            env: Vectorized environment to roll out in.
+            max_steps: Number of environment steps to run.
+            stochastic: Add the collection noise to the deterministic actor, as during training.
+            action_repeat: Hold each queried action for this many ``env.step`` calls before re-querying the actor.
+
+        Returns:
+            An empty list (this rollout collects no eval metrics).
+        """
+        was_training = self.actor.training
+        self.eval_mode()
+        if hasattr(env, "eval_mode"):
+            env.eval_mode()
+        obs = env.get_observations() if hasattr(env, "get_observations") else env.reset()[0]
+        action_repeat = max(1, action_repeat)
+
+        def query_actions() -> torch.Tensor:
+            actions = self.actor(obs)
+            if stochastic and self.action_noise_std > 0:
+                actions = actions + self.action_noise_std * torch.randn_like(actions)
+            return actions
+
+        with torch.inference_mode():
+            actions = query_actions()
+            for step in range(max_steps):
+                if step > 0 and step % action_repeat == 0:
+                    actions = query_actions()
+                obs, _, _, _ = env.step(actions)
+        if was_training:
+            self.train_mode()
+            if hasattr(env, "train_mode"):
+                env.train_mode()
+        return []
+
     def get_policy(self) -> MLPModel:
         """Return the actor."""
         return self.actor

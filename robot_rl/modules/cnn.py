@@ -34,6 +34,7 @@ class CNN(nn.Sequential):
         max_pool: bool | tuple[bool] | list[bool] = False,
         global_pool: str = "none",
         flatten: bool = True,
+        activation_checkpointing: bool = False,
     ) -> None:
         """Initialize the CNN.
 
@@ -52,8 +53,11 @@ class CNN(nn.Sequential):
                 single boolean for all layers.
             global_pool: Global pooling type to apply at the end. Either 'none', 'max', or 'avg'.
             flatten: Whether to flatten the output tensor.
+            activation_checkpointing: Whether training recomputes the layer activations in the backward pass
+                instead of storing them (same gradients, less memory, one extra forward).
         """
         super().__init__()
+        self.activation_checkpointing = activation_checkpointing
 
         # Resolve activation function
         activation_function = resolve_nn_activation(activation)
@@ -156,6 +160,19 @@ class CNN(nn.Sequential):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the CNN."""
+        if self.activation_checkpointing and torch.is_grad_enabled() and not torch.jit.is_scripting():
+            return self._checkpointed_forward(x)
+        for layer in self:
+            x = layer(x)
+        return x
+
+    @torch.jit.unused
+    def _checkpointed_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass that keeps only the input and output, recomputing the layers in the backward pass."""
+        return torch.utils.checkpoint.checkpoint(self._layers_forward, x, use_reentrant=False)
+
+    @torch.jit.unused
+    def _layers_forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self:
             x = layer(x)
         return x

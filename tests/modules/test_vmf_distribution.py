@@ -96,3 +96,28 @@ def test_sampling_compiles_without_a_graph_break() -> None:
         return (x.sum(dim=-1) + logp).mean()
 
     torch.compile(step, backend="eager", fullgraph=True)(torch.randn(256, P, device="cuda"))
+
+
+def test_state_dependent_kappa_matches_the_shared_one_at_equal_concentration() -> None:
+    """A per-state concentration equal to the shared one gives the same log-probabilities and entropy."""
+    shared = VonMisesFisherDistribution(P, init_std=0.5)
+    per_state = VonMisesFisherDistribution(P, init_std=0.5, state_dependent_kappa=True)
+    assert per_state.input_dim == P + 1 and VonMisesFisherDistribution.output_dim_for_input_width(P + 1) == P
+    mu = torch.randn(8, P)
+    shared.update(mu)
+    per_state.update(torch.cat([mu, torch.full((8, 1), torch.log(torch.tensor(4.0)).item())], dim=-1))
+    x = torch.nn.functional.normalize(torch.randn(8, P), dim=-1)
+    torch.testing.assert_close(per_state.log_prob(x), shared.log_prob(x))
+    torch.testing.assert_close(per_state.entropy, shared.entropy)
+
+
+def test_state_dependent_kappa_varies_by_row_and_trains() -> None:
+    """Each row keeps its own concentration, and the entropy's gradient reaches the per-state log-kappa."""
+    dist = VonMisesFisherDistribution(P, init_std=1.0, state_dependent_kappa=True)
+    log_kappa = torch.tensor([[0.0], [4.0]], requires_grad=True)
+    dist.update(torch.cat([torch.randn(2, P), log_kappa], dim=-1))
+    sample, logp = dist.sample_and_log_prob()
+    assert sample.shape == (2, P) and logp.shape == (2,)
+    assert dist.entropy[0] > dist.entropy[1]  # the more concentrated row has less entropy
+    dist.entropy.sum().backward()
+    assert log_kappa.grad is not None and bool((log_kappa.grad < 0).all())

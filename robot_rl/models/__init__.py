@@ -16,6 +16,7 @@ from .mlp_model import MLPModel
 from .rnn_model import RNNModel
 from .tcn_model import TCNModel
 from .txl_model import TXLModel
+from .world_model import WorldModel
 
 __all__ = [
     "BackwardModel",
@@ -31,4 +32,5 @@ __all__ = [
     "SharedMemoryInferencePolicy",
     "TCNModel",
     "TXLModel",
+    "WorldModel",
 ]

@@ -10,5 +10,6 @@ from .distillation import Distillation
 from .fb_cpr import FbCpr
 from .ppo import PPO
 from .sac import SAC
+from .world_model_ac import WorldModelAC
 
-__all__ = ["PPO", "SAC", "CvaeDistillation", "Distillation", "FbCpr"]
+__all__ = ["PPO", "SAC", "CvaeDistillation", "Distillation", "FbCpr", "WorldModelAC"]

@@ -18,6 +18,13 @@ from robot_rl.storage import RolloutStorage
 from robot_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
 
+def _to_float(state: Any) -> Any:
+    """Cast a recurrent state (a tensor, a tuple of them, or None) to float32."""
+    if isinstance(state, tuple):
+        return tuple(s.float() for s in state)
+    return state.float() if isinstance(state, torch.Tensor) else state
+
+
 class Distillation:
     """Distillation algorithm for training a student model to mimic a teacher model."""
 
@@ -45,6 +52,7 @@ class Distillation:
         teacher_action_prob: float = 0.0,
         teacher_action_decay_updates: int = 0,
         optimizer: str = "adam",
+        update_precision: str = "fp32",
         device: str = "cpu",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
@@ -53,6 +61,13 @@ class Distillation:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
         self.device = device
+        # "tf32" lets float32 matmuls use TF32 tensor cores; "bf16" runs the update's forward under bf16 autocast
+        if update_precision not in ("fp32", "tf32", "bf16"):
+            raise ValueError(f"update_precision must be 'fp32', 'tf32' or 'bf16', got {update_precision!r}")
+        self.update_precision = update_precision
+        if update_precision == "tf32":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         self.is_multi_gpu = multi_gpu_cfg is not None
 
         # Multi-GPU parameters
@@ -165,18 +180,23 @@ class Distillation:
             self.student.detach_hidden_state()
             for batch in self.storage.generator():
                 # Inference of the student for gradient computation
-                latent = self.student.get_latent(batch.observations)
-                actions = self.student.forward_from_latent(latent)
+                with torch.autocast(
+                    device_type=torch.device(self.device).type,
+                    dtype=torch.bfloat16,
+                    enabled=self.update_precision == "bf16",
+                ):
+                    latent = self.student.get_latent(batch.observations)
+                    actions = self.student.forward_from_latent(latent)
 
                 # Behavior cloning loss
-                behavior_loss = self.loss_fn(actions, batch.privileged_actions)
+                behavior_loss = self.loss_fn(actions.float(), batch.privileged_actions)
 
                 # Total loss
                 loss = loss + behavior_loss
                 mean_behavior_loss += behavior_loss.item()
                 if self.aux_obs_group is not None:
                     aux_pred = self.student.aux_prediction(latent)  # type: ignore[attr-defined]
-                    aux_loss = nn.functional.mse_loss(aux_pred, batch.observations[self.aux_obs_group])
+                    aux_loss = nn.functional.mse_loss(aux_pred.float(), batch.observations[self.aux_obs_group])
                     loss = loss + self.aux_loss_weight * aux_loss
                     mean_aux_loss += aux_loss.item()
                 cnt += 1
@@ -201,6 +221,8 @@ class Distillation:
         mean_aux_loss /= cnt
         self.storage.clear()
         # the teacher never replays the batch, so its recurrent state stays where the rollout left it
+        if self.update_precision == "bf16":  # the rollout runs in float32
+            self.student.reset(hidden_state=_to_float(self.student.get_hidden_state()))
         self.last_student_hidden_state = self.student.get_hidden_state()
         self.student.detach_hidden_state()
 

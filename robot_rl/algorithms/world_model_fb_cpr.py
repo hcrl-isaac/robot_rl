@@ -42,7 +42,7 @@ class WorldModelFbCpr(FbCpr):
         actor_max_grad_norm: float | None = 1.0,
         actor_grad_clip_value: float | None = 0.1,
         tf32: bool = True,
-        imagination_compile_mode: str | None = "max-autotune-no-cudagraphs",
+        imagination_compile_mode: str | None = "max-autotune",
         **kwargs: Any,
     ) -> None:
         """Initialize the algorithm.
@@ -177,9 +177,11 @@ class WorldModelFbCpr(FbCpr):
             if horizon > 0:
                 goals, bank = self.learner.start_goals(starts), self.learner.noise_bank()
                 reward_z = self._implicit_reward_weights(cov_obs, z)
-                actor_loss, extras = self._compiled_imagined_loss(starts, z, reward_z, goals, bank, horizon)
+                # an input, not the normalizer's buffers, whose storage it reallocates each update
+                aux_scale = self.aux_reward_normalizer.S.sqrt().reciprocal().detach()
+                actor_loss, extras = self._compiled_imagined_loss(starts, z, reward_z, aux_scale, goals, bank, horizon)
             else:
-                actor_loss, extras = self._imagined_loss(starts, z, z, None, {}, 0)
+                actor_loss, extras = self._imagined_loss(starts, z, z, z.new_ones(1), None, {}, 0)
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -203,6 +205,7 @@ class WorldModelFbCpr(FbCpr):
         starts: TensorDict,
         z: torch.Tensor,
         reward_z: torch.Tensor,
+        aux_scale: torch.Tensor,
         goals: TensorDict | None,
         noise_bank: dict[str, torch.Tensor],
         horizon: int,
@@ -213,6 +216,7 @@ class WorldModelFbCpr(FbCpr):
             starts: Raw replay rows to start from, ``(B, ...)``.
             z: Each rollout's latent, ``(B, z_dim)``.
             reward_z: ``Cov(B)^-1 z``, so FB's implicit reward is ``B(s')^T reward_z``.
+            aux_scale: Scale of the world model's aux reward, as the aux critic's targets are normalized.
             goals: The goal groups at steps ``0 .. H`` (None without goals).
             noise_bank: Sensor-noise rows per group.
             horizon: Imagined steps; 0 is FB-CPR's one-step loss.
@@ -228,13 +232,19 @@ class WorldModelFbCpr(FbCpr):
             rollout = self.learner.imagine(policy, starts, goals, noise_bank, freeze_model=False)
         else:
             rollout = self._empty_rollout(starts)
-        ret, terms = self._imagined_return(rollout, policy, z, reward_z, horizon)
+        ret, terms = self._imagined_return(rollout, policy, z, reward_z, aux_scale, horizon)
         extras = {f"imagined_{k}": v.detach().mean() for k, v in terms.items()}
         extras["imagined_survival"] = rollout.survival[-1].detach().mean()
         return -ret.mean(), extras
 
     def _imagined_return(
-        self, rollout: Rollout, policy: Any, z: torch.Tensor, reward_z: torch.Tensor, horizon: int
+        self,
+        rollout: Rollout,
+        policy: Any,
+        z: torch.Tensor,
+        reward_z: torch.Tensor,
+        aux_scale: torch.Tensor,
+        horizon: int,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Return each rollout's survival-weighted imagined return and its per-step reward terms (for logging)."""
         # every step normalized and scored in one batched call per network, steps flattened into the batch
@@ -259,7 +269,7 @@ class WorldModelFbCpr(FbCpr):
         logits = self.discriminator(norm[:horizon].reshape(-1), z.repeat(horizon, 1)).view(horizon, n)
         logits = logits.clamp(eps, 1 - eps)
         r_disc = torch.log(logits) - torch.log(1 - logits)
-        r_aux = rollout.rewards / self.aux_reward_normalizer.S.sqrt()
+        r_aux = rollout.rewards * aux_scale
         rewards = r_fb + reg_weight * (self.discriminator_reg_coef * r_disc + self.aux_reg_coef * r_aux)
         discounts = self.gamma ** torch.arange(horizon, device=self.device, dtype=torch.float32)
         ret = ret + (discounts[:, None] * rollout.survival[:horizon] * rewards).sum(dim=0)

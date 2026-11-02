@@ -70,6 +70,7 @@ def _cfg(horizon: int, actor_start_update: int = 0) -> dict:
             "storage_scale": 2,
             "batch_size": BATCH,
             "compile_mode": None,
+            "imagination_compile_mode": None,
             "forward_map": dict(fuse),
             "backward_map": {**mlp, "last_activation": "ball_norm"},
             "disc_critic": dict(fuse),

@@ -41,6 +41,8 @@ class WorldModelFbCpr(FbCpr):
         actor_start_update: int = 0,
         actor_max_grad_norm: float | None = 1.0,
         actor_grad_clip_value: float | None = 0.1,
+        tf32: bool = True,
+        imagination_compile_mode: str | None = "max-autotune-no-cudagraphs",
         **kwargs: Any,
     ) -> None:
         """Initialize the algorithm.
@@ -53,6 +55,8 @@ class WorldModelFbCpr(FbCpr):
             actor_start_update: Updates that train the actor on FB-CPR's one-step loss while the model is fit.
             actor_max_grad_norm: Global gradient-norm clip of the imagined actor update; None disables it.
             actor_grad_clip_value: Element-wise clip of the imagined actor gradients after the norm clip.
+            tf32: Allow TF32 matmuls (a process-wide torch setting).
+            imagination_compile_mode: ``torch.compile`` mode of the imagined loss; None runs it eagerly.
             **kwargs: :class:`FbCpr` keyword arguments.
         """
         super().__init__(*args, **kwargs)
@@ -64,6 +68,14 @@ class WorldModelFbCpr(FbCpr):
         self.actor_max_grad_norm = actor_max_grad_norm
         self.actor_grad_clip_value = actor_grad_clip_value
         self.update_step = 0
+        if tf32 and torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        self._compiled_imagined_loss = (
+            torch.compile(self._imagined_loss, mode=imagination_compile_mode)
+            if imagination_compile_mode is not None
+            else self._imagined_loss
+        )
 
     """
     Collection.
@@ -157,22 +169,17 @@ class WorldModelFbCpr(FbCpr):
         Returns:
             The loss and extras dicts.
         """
-        critics = (self.forward_map, self.backward_map, self.discriminator, self.disc_critic, self.aux_critic)
-        for net in critics:
+        frozen = (self.forward_map, self.backward_map, self.discriminator, self.disc_critic, self.aux_critic)
+        frozen += (self.world_model,)
+        for net in frozen:
             net.requires_grad_(False)
-
-        def policy(raw: TensorDict) -> torch.Tensor:
-            return self.actor(self._normalize(raw), z, stochastic_output=True, std_clip=self.clip_actor_std)
-
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             if horizon > 0:
-                rollout = self.learner.imagine(
-                    policy, starts, self.learner.start_goals(starts), self.learner.noise_bank()
-                )
+                goals, bank = self.learner.start_goals(starts), self.learner.noise_bank()
+                reward_z = self._implicit_reward_weights(cov_obs, z)
+                actor_loss, extras = self._compiled_imagined_loss(starts, z, reward_z, goals, bank, horizon)
             else:
-                rollout = self._empty_rollout(starts)
-            ret, rewards = self._imagined_return(rollout, policy, z, cov_obs, horizon)
-            actor_loss = -ret.mean()
+                actor_loss, extras = self._imagined_loss(starts, z, z, None, {}, 0)
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -186,17 +193,48 @@ class WorldModelFbCpr(FbCpr):
         elif self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.actor_optimizer.step()
-        for net in critics:
+        for net in frozen:
             net.requires_grad_(True)
+        loss_dict = {"Actor_Loss/total_loss": actor_loss.detach().clone(), "Actor_Loss/horizon": torch.tensor(horizon)}
+        return loss_dict, {k: v.clone() for k, v in extras.items()}
 
-        with torch.no_grad():
-            loss_dict = {"Actor_Loss/total_loss": actor_loss.detach(), "Actor_Loss/horizon": torch.tensor(horizon)}
-            extras = {f"imagined_{k}": v.detach().mean() for k, v in rewards.items()}
-            extras["imagined_survival"] = rollout.survival[-1].detach().mean()
-        return loss_dict, extras
+    def _imagined_loss(
+        self,
+        starts: TensorDict,
+        z: torch.Tensor,
+        reward_z: torch.Tensor,
+        goals: TensorDict | None,
+        noise_bank: dict[str, torch.Tensor],
+        horizon: int,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Roll out and score the actor's imagined return (the compiled region: no module state changes inside).
+
+        Args:
+            starts: Raw replay rows to start from, ``(B, ...)``.
+            z: Each rollout's latent, ``(B, z_dim)``.
+            reward_z: ``Cov(B)^-1 z``, so FB's implicit reward is ``B(s')^T reward_z``.
+            goals: The goal groups at steps ``0 .. H`` (None without goals).
+            noise_bank: Sensor-noise rows per group.
+            horizon: Imagined steps; 0 is FB-CPR's one-step loss.
+
+        Returns:
+            The actor loss and the mean reward terms for logging.
+        """
+
+        def policy(raw: TensorDict) -> torch.Tensor:
+            return self.actor(self._normalize(raw), z, stochastic_output=True, std_clip=self.clip_actor_std)
+
+        if horizon > 0:
+            rollout = self.learner.imagine(policy, starts, goals, noise_bank, freeze_model=False)
+        else:
+            rollout = self._empty_rollout(starts)
+        ret, terms = self._imagined_return(rollout, policy, z, reward_z, horizon)
+        extras = {f"imagined_{k}": v.detach().mean() for k, v in terms.items()}
+        extras["imagined_survival"] = rollout.survival[-1].detach().mean()
+        return -ret.mean(), extras
 
     def _imagined_return(
-        self, rollout: Rollout, policy: Any, z: torch.Tensor, cov_obs: TensorDict, horizon: int
+        self, rollout: Rollout, policy: Any, z: torch.Tensor, reward_z: torch.Tensor, horizon: int
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Return each rollout's survival-weighted imagined return and its per-step reward terms (for logging)."""
         # every step normalized and scored in one batched call per network, steps flattened into the batch
@@ -215,13 +253,8 @@ class WorldModelFbCpr(FbCpr):
         if horizon == 0:
             return ret, terms
 
-        with torch.no_grad():
-            B = self.backward_map(cov_obs)
-            # disable autocast so the covariance solve runs in float32, as FB-CPR's value regularizer does
-            with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=False):
-                cov = torch.matmul(B.T.float(), B.float()) / B.shape[0]
         B_next = self.backward_map(norm[1:].reshape(-1)).float().view(horizon, n, -1)
-        r_fb = (torch.linalg.solve(cov, B_next, left=False) * z).sum(dim=-1)
+        r_fb = (B_next * reward_z).sum(dim=-1)
         eps = self.discriminator_reward_eps
         logits = self.discriminator(norm[:horizon].reshape(-1), z.repeat(horizon, 1)).view(horizon, n)
         logits = logits.clamp(eps, 1 - eps)
@@ -237,10 +270,33 @@ class WorldModelFbCpr(FbCpr):
     Helpers.
     """
 
+    @torch.no_grad()
+    def _implicit_reward_weights(self, cov_obs: TensorDict, z: torch.Tensor) -> torch.Tensor:
+        """Return ``Cov(B)^-1 z``, with the covariance of ``B`` over ``cov_obs`` (FB's implicit reward weights).
+
+        Args:
+            cov_obs: Normalized observations whose ``B`` sets the covariance.
+            z: Latents, ``(N, z_dim)``.
+
+        Returns:
+            The weights, ``(N, z_dim)``, in float32.
+        """
+        B = self.backward_map(cov_obs)
+        # disable autocast so the covariance solve runs in float32, as FB-CPR's value regularizer does
+        with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=False):
+            cov = torch.matmul(B.T.float(), B.float()) / B.shape[0]
+            return torch.linalg.solve(cov, z.float().T).T
+
     def _normalize(self, raw: TensorDict) -> TensorDict:
-        """FB-CPR's observation normalization at its running statistics, differentiable in the observations."""
-        with eval_mode(self.obs_normalizer):
-            return self.obs_normalizer(raw)
+        """FB-CPR's observation normalization at its running statistics, differentiable in the observations.
+
+        The eval-mode BatchNorm formula written out, so no module switches mode inside the compiled region.
+        """
+        out = raw.clone(recurse=False)
+        for key, bn in self.obs_normalizer.modules_dict.items():
+            if key in out:
+                out[key] = (out[key] - bn.running_mean) / torch.sqrt(bn.running_var + bn.eps)
+        return out
 
     def _as_batch(self, win: SequenceReplayBuffer.Window) -> ReplayBuffer.Batch:
         """One-step replay windows as FB-CPR's transition batch (raw observations)."""

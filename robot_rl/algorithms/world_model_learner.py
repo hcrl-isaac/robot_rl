@@ -248,7 +248,12 @@ class WorldModelLearner:
         return self.imagined_obs.noise_bank(bank_rows)
 
     def imagine(
-        self, policy: Policy, starts: TensorDict, goals: TensorDict | None, noise_bank: dict[str, torch.Tensor]
+        self,
+        policy: Policy,
+        starts: TensorDict,
+        goals: TensorDict | None,
+        noise_bank: dict[str, torch.Tensor],
+        freeze_model: bool = True,
     ) -> Rollout:
         """Roll ``policy`` ``H`` steps through the world model (its parameters frozen; the graph reaches the policy).
 
@@ -257,6 +262,7 @@ class WorldModelLearner:
             starts: Logged rows to start from, ``(B, ...)``.
             goals: The goal groups at steps ``0 .. H``, ``(H + 1, B, ...)`` (None without goals).
             noise_bank: Sensor-noise rows per group, from :meth:`noise_bank`.
+            freeze_model: Freeze the model's parameters for the rollout; a compiled caller freezes it outside instead.
 
         Returns:
             The rollout, attached to the policy's graph.
@@ -271,7 +277,8 @@ class WorldModelLearner:
         goal_n = wm.goal_normalizer(goal_all) if goal_all is not None else s.new_zeros(H + 1, B, 0)
         bank_size = next(iter(noise_bank.values())).shape[0] if noise_bank else 1
 
-        wm.requires_grad_(False)
+        if freeze_model:
+            wm.requires_grad_(False)
         obs = starts.select(*self.imagined_obs.groups)
         obs_seq, actions, rewards, dones = [obs], [], [], []
         survival = [torch.ones(B, device=self.device)]
@@ -295,7 +302,8 @@ class WorldModelLearner:
             rewards.append(reward if reward is not None else torch.zeros_like(done))
             dones.append(done)
             survival.append(survival[-1] * (1.0 - done))
-        wm.requires_grad_(True)
+        if freeze_model:
+            wm.requires_grad_(True)
         empty = torch.zeros(0, B, device=self.device)
         return Rollout(
             obs_seq,

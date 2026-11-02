@@ -231,6 +231,10 @@ class ReplayBuffer:
         """Get the total number of transitions currently stored in the buffer."""
         return self.capacity if self._is_full else self._curr_idx
 
+    def stored_observations(self, groups: list[str]) -> TensorDict:
+        """Return the stored observations of ``groups``, filled rows only."""
+        return self.observations[: len(self)].select(*groups)
+
     def add_transitions(self, transition: Transition) -> None:
         """Add a transition to the buffer."""
         # Drop transitions whose next_obs is a post-reset state (dones set), unless keep_terminal is set (SAC,

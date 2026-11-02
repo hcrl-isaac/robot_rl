@@ -230,6 +230,11 @@ class OffPolicyRunner(CheckpointHooks):
             self.save(final)
         if self.current_learning_iteration % self.cfg["save_interval"] != 0:
             self._after_checkpoint(final, self.current_learning_iteration)
+        # the final replay, as a pool of reachable states for zero-shot reward inference (rank 0's only)
+        groups = self.cfg.get("replay_dump_groups")
+        if groups and self.logger.writer is not None:
+            replay = self.alg.replay_buffer.stored_observations(list(groups)).cpu()
+            torch.save(replay, os.path.join(self.logger.log_dir, "replay.pt"))
         if self.logger.writer is not None:
             self.logger.stop_logging_writer()
 

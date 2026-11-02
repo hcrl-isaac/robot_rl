@@ -45,3 +45,20 @@ def test_the_export_module_matches_the_deterministic_output() -> None:
     raw = torch.randn(3, HEAD + TAIL)
     module = torch.jit.script(dist.as_deterministic_output_module())
     torch.testing.assert_close(module(raw), dist.deterministic_output(raw))
+
+
+def test_a_per_state_kappa_is_read_from_its_own_output_and_initialized_alone() -> None:
+    """With per-state kappa the network emits HEAD + 1 + TAIL values; only the kappa row is reinitialized."""
+    dist = VonMisesFisherTanhGaussianDistribution(HEAD + TAIL, tail_dim=TAIL, init_std=0.5, state_dependent_kappa=True)
+    assert dist.input_dim == HEAD + 1 + TAIL
+    mlp = torch.nn.Sequential(torch.nn.Linear(4, dist.input_dim))
+    before = mlp[0].weight.detach().clone()
+    dist.init_mlp_weights(mlp)
+    assert torch.equal(mlp[0].weight[HEAD], torch.zeros(4))
+    assert torch.equal(mlp[0].weight[HEAD + 1 :], before[HEAD + 1 :])
+    raw = torch.randn(3, dist.input_dim)
+    dist.update(raw)
+    action, logp = dist.sample_and_log_prob()
+    assert action.shape == (3, HEAD + TAIL) and logp.shape == (3,)
+    module = torch.jit.script(dist.as_deterministic_output_module())
+    torch.testing.assert_close(module(raw), dist.deterministic_output(raw))

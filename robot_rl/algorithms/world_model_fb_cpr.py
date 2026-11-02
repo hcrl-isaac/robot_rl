@@ -199,12 +199,15 @@ class WorldModelFbCpr(FbCpr):
         self, rollout: Rollout, policy: Any, z: torch.Tensor, cov_obs: TensorDict, horizon: int
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Return each rollout's survival-weighted imagined return and its per-step reward terms (for logging)."""
-        norm = [self._normalize(o) for o in rollout.obs]
+        # every step normalized and scored in one batched call per network, steps flattened into the batch
+        n = z.shape[0]
+        norm = self._normalize(torch.stack(rollout.obs).reshape(-1)).reshape(horizon + 1, n)
+        norm_h = norm[horizon]
         action_h = policy(rollout.obs[horizon])
-        Qs_fb = (self.forward_map(norm[horizon], z, action_h) * z).sum(dim=-1)
+        Qs_fb = (self.forward_map(norm_h, z, action_h) * z).sum(dim=-1)
         Q_fb = compute_td_targets(Qs_fb, self.actor_pessimism)
-        Q_disc = compute_td_targets(self.disc_critic(norm[horizon], z, action_h), self.actor_pessimism).squeeze(-1)
-        Q_aux = compute_td_targets(self.aux_critic(norm[horizon], z, action_h), self.actor_pessimism).squeeze(-1)
+        Q_disc = compute_td_targets(self.disc_critic(norm_h, z, action_h), self.actor_pessimism).squeeze(-1)
+        Q_aux = compute_td_targets(self.aux_critic(norm_h, z, action_h), self.actor_pessimism).squeeze(-1)
         reg_weight = Q_fb.abs().mean().detach()
         value_h = Q_fb + reg_weight * (self.discriminator_reg_coef * Q_disc + self.aux_reg_coef * Q_aux)
         ret = (self.gamma**horizon) * rollout.survival[horizon] * value_h
@@ -217,11 +220,11 @@ class WorldModelFbCpr(FbCpr):
             # disable autocast so the covariance solve runs in float32, as FB-CPR's value regularizer does
             with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=False):
                 cov = torch.matmul(B.T.float(), B.float()) / B.shape[0]
-        steps = range(horizon)
-        B_next = torch.stack([self.backward_map(norm[t + 1]) for t in steps]).float()
+        B_next = self.backward_map(norm[1:].reshape(-1)).float().view(horizon, n, -1)
         r_fb = (torch.linalg.solve(cov, B_next, left=False) * z).sum(dim=-1)
         eps = self.discriminator_reward_eps
-        logits = torch.stack([self.discriminator(norm[t], z).squeeze(-1) for t in steps]).clamp(eps, 1 - eps)
+        logits = self.discriminator(norm[:horizon].reshape(-1), z.repeat(horizon, 1)).view(horizon, n)
+        logits = logits.clamp(eps, 1 - eps)
         r_disc = torch.log(logits) - torch.log(1 - logits)
         r_aux = rollout.rewards / self.aux_reward_normalizer.S.sqrt()
         rewards = r_fb + reg_weight * (self.discriminator_reg_coef * r_disc + self.aux_reg_coef * r_aux)

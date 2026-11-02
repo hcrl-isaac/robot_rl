@@ -760,22 +760,7 @@ class FbCpr:
         }).to(device)
         print(f"Observation Normalizer: {obs_normalizer}")
 
-        # Initialize the storage
-        max_episode_length = env.max_episode_length
-        if isinstance(max_episode_length, torch.Tensor):
-            max_episode_length = int(max_episode_length.max().item())
-        # inference never samples the storage: keep it at one row per env rather than
-        # storage_scale * max_episode_length, which explodes on never-resetting play envs
-        replay_buffer = ReplayBuffer(
-            env.num_envs,
-            cfg["algorithm"]["storage_scale"] * max_episode_length if not inference else 1,
-            obs,
-            [env.num_actions],
-            z_dim,
-            cfg["algorithm"]["batch_size"],
-            cfg["storage_device"],
-            obs_dtypes={k: getattr(torch, v) for k, v in (cfg["algorithm"].get("replay_obs_dtypes") or {}).items()},
-        )
+        storage = alg_class._build_storage(obs, env, cfg, device, inference)
         # A large corpus can exceed VRAM on its own, so it is placed independently of the replay buffer.
         expert_device = _expert_storage_device(cfg, device)
         expert_buffer = (
@@ -794,10 +779,10 @@ class FbCpr:
             aux_critic,
             discriminator,
             obs_normalizer,
-            replay_buffer,
-            expert_buffer,
-            z_buffer,
+            expert_buffer=expert_buffer,
+            z_buffer=z_buffer,
             device=device,
+            **storage,
             **cfg["algorithm"],
             multi_gpu_cfg=cfg["multi_gpu"],
             clip_actions=cfg.get("clip_actions"),
@@ -805,6 +790,37 @@ class FbCpr:
         )
 
         return alg
+
+    @staticmethod
+    def _build_storage(obs: TensorDict, env: URLVecEnv, cfg: dict, device: str, inference: bool) -> dict[str, Any]:
+        """Build the replay storage, returned as constructor kwargs (``replay_buffer``).
+
+        Args:
+            obs: An observation sample.
+            env: The env.
+            cfg: The resolved runner cfg; entries only the storage reads may be popped from ``cfg["algorithm"]``.
+            device: Training device.
+            inference: Keep one row per env, as nothing samples the storage.
+
+        Returns:
+            The storage kwargs of the algorithm constructor.
+        """
+        max_episode_length = env.max_episode_length
+        if isinstance(max_episode_length, torch.Tensor):
+            max_episode_length = int(max_episode_length.max().item())
+        # inference never samples the storage: keep it at one row per env rather than
+        # storage_scale * max_episode_length, which explodes on never-resetting play envs
+        replay_buffer = ReplayBuffer(
+            env.num_envs,
+            cfg["algorithm"]["storage_scale"] * max_episode_length if not inference else 1,
+            obs,
+            [env.num_actions],
+            cfg["algorithm"]["z_dim"],
+            cfg["algorithm"]["batch_size"],
+            cfg["storage_device"],
+            obs_dtypes={k: getattr(torch, v) for k, v in (cfg["algorithm"].get("replay_obs_dtypes") or {}).items()},
+        )
+        return {"replay_buffer": replay_buffer}
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""

@@ -216,12 +216,9 @@ class WorldModelLearner:
             buffer extras.
         """
         H = self.horizon
-        if not self.spec.goal_groups:
+        if not self.spec.goal_groups or self.goal_provider is not None:
             starts, row_extras = self.replay_buffer.sample_rows(num, device=self.device)
-            goals = None
-        elif self.goal_provider is not None:
-            starts, row_extras = self.replay_buffer.sample_rows(num, device=self.device)
-            goals = self.provided_goals(starts[self.spec.goal_key_group], H)
+            goals = self.start_goals(starts)
         else:
             win = self.replay_buffer.sample_windows(num, max(H, 1), device=self.device, require_next=True)
             if win is None:
@@ -229,6 +226,21 @@ class WorldModelLearner:
             starts, row_extras = win.obs[0], {k: v[0] for k, v in win.extras.items()}
             goals = win.obs.select(*self.spec.goal_groups)[: H + 1] if self.spec.goal_groups else None
         return starts, goals, self.noise_bank(), row_extras
+
+    def start_goals(self, starts: TensorDict) -> TensorDict | None:
+        """Return the goal groups at steps ``0 .. H`` after arbitrary start rows (None when the spec has none).
+
+        Args:
+            starts: Logged rows, ``(B, ...)``.
+
+        Returns:
+            The goals, ``(H + 1, B, ...)``, recomputed by the goal provider.
+        """
+        if not self.spec.goal_groups:
+            return None
+        if self.goal_provider is None:
+            raise ValueError("Imagining from arbitrary replay rows needs a goal provider (the spec's goal_key_group).")
+        return self.provided_goals(starts[self.spec.goal_key_group], self.horizon)
 
     def noise_bank(self) -> dict[str, torch.Tensor]:
         """Sensor-noise rows per group, drawn from logged rows (see :meth:`ImaginedObservation.noise_bank`)."""

@@ -27,8 +27,15 @@ class _TrackingEnv:
     which :meth:`world_model_goals` recomputes the goal.
     """
 
-    def __init__(self, num_envs: int = 32, noise: float = 0.05, seed: int = 0, provide_goals: bool = True) -> None:
-        self.num_envs, self.num_actions, self.noise = num_envs, 2, noise
+    def __init__(
+        self,
+        num_envs: int = 32,
+        noise: float = 0.05,
+        seed: int = 0,
+        provide_goals: bool = True,
+        max_error: float = 1.0,
+    ) -> None:
+        self.num_envs, self.num_actions, self.noise, self.max_error = num_envs, 2, noise, max_error
         self.max_episode_length = MAX_EP_LEN
         self.device = "cpu"
         self.cfg = {}
@@ -107,7 +114,7 @@ class _TrackingEnv:
         self.common_step_counter += 1
         err = (self.pos - self._ref(self.episode_length_buf)).norm(dim=-1)
         rewards = torch.exp(-(err**2) / 0.05) - 0.01 * actions.pow(2).sum(-1)
-        terminated = err > 1.0
+        terminated = err > self.max_error
         time_outs = self.episode_length_buf >= MAX_EP_LEN
         dones = terminated | time_outs
         self.last_action = actions

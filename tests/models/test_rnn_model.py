@@ -228,6 +228,43 @@ class TestRNNModelJITExport:
         assert torch.allclose(original_out, jit_out, atol=1e-5), f"JIT sequential mismatch for {rnn_type}"
 
 
+class TestHeadReadsFeatures:
+    """With head_reads_features the head sees the current features beside the recurrent output."""
+
+    @pytest.mark.parametrize("rnn_type", ["gru", "lstm"])
+    def test_head_width_and_exports(self, rnn_type: str) -> None:
+        obs = make_obs(1, OBS_DIM)
+        model = RNNModel(
+            obs,
+            {"actor": ["policy"]},
+            "actor",
+            NUM_ACTIONS,
+            hidden_dims=[32, 32],
+            activation="elu",
+            rnn_type=rnn_type,
+            rnn_hidden_dim=16,
+            rnn_num_layers=1,
+            head_reads_features=True,
+            distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
+        )
+        model.eval()
+        assert model.latent_dim == OBS_DIM + 16
+        assert model.mlp[0].in_features == OBS_DIM + 16
+
+        jit_model = torch.jit.script(model.as_jit())
+        jit_model.reset()
+        onnx_model = model.as_onnx()
+        state = onnx_model.get_dummy_inputs()[1:]
+        obs_concat = torch.cat([obs[g] for g in model.obs_groups], dim=-1)
+        for _ in range(3):
+            original_out = model(obs, stochastic_output=False).detach()
+            jit_out = jit_model(obs_concat)
+            onnx_out, *state = onnx_model(obs_concat, *state)
+            state = [st for st in state if st is not None]
+        assert torch.allclose(original_out, jit_out, atol=1e-5)
+        assert torch.allclose(original_out, onnx_out, atol=1e-5)
+
+
 @pytest.mark.filterwarnings("ignore:.*legacy TorchScript.*:DeprecationWarning")
 @pytest.mark.filterwarnings("ignore:.*will be removed.*:DeprecationWarning")
 @pytest.mark.filterwarnings("ignore::torch.jit.TracerWarning")

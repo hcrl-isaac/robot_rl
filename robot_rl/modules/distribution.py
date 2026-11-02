@@ -1004,7 +1004,7 @@ class VonMisesFisherTanhGaussianDistribution(Distribution):
         return torch.cat([head, tail], dim=-1), head_logp + tail_logp
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
-        """The vMF mean direction joined with the squashed tail mean."""
+        """Return the vMF mean direction joined with the squashed tail mean."""
         head, tail = self._split(mlp_output)
         return torch.cat([self.head.deterministic_output(head), self.tail.deterministic_output(tail)], dim=-1)
 
@@ -1040,12 +1040,12 @@ class VonMisesFisherTanhGaussianDistribution(Distribution):
         return (*self.head.params, *self.tail.params)
 
     def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
-        """The sum of the parts' log-probs."""
+        """Return the sum of the parts' log-probs."""
         head, tail = self._split(outputs)
         return self.head.log_prob(head) + self.tail.log_prob(tail)
 
     def kl_divergence(self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]) -> torch.Tensor:
-        """The sum of the parts' KL divergences."""
+        """Return the sum of the parts' KL divergences."""
         return self.head.kl_divergence(old_params[:2], new_params[:2]) + self.tail.kl_divergence(
             old_params[2:], new_params[2:]
         )

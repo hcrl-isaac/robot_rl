@@ -215,7 +215,8 @@ class DistillationPPO(Distillation):
             counts["bc"] += self._replay("bc", bc_weight, sums)
 
         self.storage.clear()
-        self.last_hidden_states = (self.student.get_hidden_state(), self.teacher.get_hidden_state())
+        # the teacher never replays the batch, so its recurrent state stays where the rollout left it
+        self.last_student_hidden_state = self.student.get_hidden_state()
         self.student.detach_hidden_state()
 
         rl_keys = ("surrogate", "entropy", "clip_fraction", "kl")
@@ -243,8 +244,7 @@ class DistillationPPO(Distillation):
         """
         rl = phase == "rl"
         self.optimizer.param_groups[0]["lr"] = self.learning_rate if rl else self.bc_learning_rate * bc_weight
-        self.student.reset(hidden_state=self.last_hidden_states[0])
-        self.teacher.reset(hidden_state=self.last_hidden_states[1])
+        self.student.reset(hidden_state=self.last_student_hidden_state)
         self.student.detach_hidden_state()
         loss = 0
         cnt = 0
@@ -307,7 +307,6 @@ class DistillationPPO(Distillation):
                 loss = 0
 
             self.student.reset(batch.dones.view(-1))
-            self.teacher.reset(batch.dones.view(-1))
             self.critic.reset(batch.dones.view(-1))
             self.student.detach_hidden_state(batch.dones.view(-1))
 

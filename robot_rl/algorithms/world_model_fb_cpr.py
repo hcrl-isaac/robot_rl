@@ -36,6 +36,8 @@ class WorldModelFbCpr(FbCpr):
         self,
         *args: Any,
         learner: WorldModelLearner,
+        num_imagined: int | None = None,
+        imagined_actor_interval: int = 1,
         actor_start_update: int = 0,
         actor_max_grad_norm: float | None = 1.0,
         actor_grad_clip_value: float | None = 0.1,
@@ -46,6 +48,8 @@ class WorldModelFbCpr(FbCpr):
         Args:
             *args: :class:`FbCpr` positional arguments.
             learner: The world model, its replay (also passed as ``replay_buffer``) and its imagination.
+            num_imagined: Rollouts per imagined update, drawn from the update's batch; None imagines from all of it.
+            imagined_actor_interval: Updates per imagined actor update; the others take FB-CPR's one-step loss.
             actor_start_update: Updates that train the actor on FB-CPR's one-step loss while the model is fit.
             actor_max_grad_norm: Global gradient-norm clip of the imagined actor update; None disables it.
             actor_grad_clip_value: Element-wise clip of the imagined actor gradients after the norm clip.
@@ -54,6 +58,8 @@ class WorldModelFbCpr(FbCpr):
         super().__init__(*args, **kwargs)
         self.learner = learner
         self.world_model = learner.world_model
+        self.num_imagined = num_imagined
+        self.imagined_actor_interval = imagined_actor_interval
         self.actor_start_update = actor_start_update
         self.actor_max_grad_norm = actor_max_grad_norm
         self.actor_grad_clip_value = actor_grad_clip_value
@@ -119,10 +125,13 @@ class WorldModelFbCpr(FbCpr):
         aux_critic_loss, aux_critic_extras = self._update_aux_critic(batch)
 
         wm_logs = self.learner.fit(self._reduce_and_clip_wm)
-        horizon = self.learner.horizon if self.update_step >= self.actor_start_update else 0
-        actor_loss, actor_extras = self._update_imagined_actor(
-            starts, batch.context.clone(), batch.next_observations, horizon
-        )
+        imagined = self.update_step >= self.actor_start_update and self.update_step % self.imagined_actor_interval == 0
+        horizon = self.learner.horizon if imagined else 0
+        z = batch.context.clone()
+        if horizon > 0 and self.num_imagined is not None and self.num_imagined < self.batch_size:
+            rows = torch.randperm(self.batch_size, device=self.device)[: self.num_imagined]
+            starts, z = starts[rows], z[rows]
+        actor_loss, actor_extras = self._update_imagined_actor(starts, z, batch.next_observations, horizon)
         self.update_step += 1
 
         loss_dict = {**disc_loss, **fb_loss, **disc_critic_loss, **aux_critic_loss, **actor_loss}

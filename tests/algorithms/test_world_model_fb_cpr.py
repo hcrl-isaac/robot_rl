@@ -131,11 +131,12 @@ def test_update_trains_every_part_and_round_trips(horizon: int) -> None:
         torch.testing.assert_close(restored.world_model.state_dict()[k], v)
 
 
-def test_actor_trains_one_step_until_the_start_update() -> None:
-    """Before ``actor_start_update`` the actor takes FB-CPR's one-step loss while the world model is fit."""
+def test_actor_imagines_from_the_start_update_at_its_interval() -> None:
+    """The actor takes FB-CPR's one-step loss before ``actor_start_update`` and between imagined updates."""
     alg, _ = _build(horizon=4, actor_start_update=2)
-    horizons = [int(alg.update()[0]["Actor_Loss/horizon"]) for _ in range(3)]
-    assert horizons == [0, 0, 4]
+    alg.imagined_actor_interval, alg.num_imagined = 2, 16
+    horizons = [int(alg.update()[0]["Actor_Loss/horizon"]) for _ in range(5)]
+    assert horizons == [0, 0, 4, 0, 4]
 
 
 def test_horizon_zero_is_fb_cpr_actor_loss() -> None:

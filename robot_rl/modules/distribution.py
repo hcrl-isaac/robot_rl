@@ -945,6 +945,125 @@ class SquashedTanhGaussianDistribution(Distribution):
         return torch.distributions.kl_divergence(Normal(old_mean, old_std), Normal(new_mean, new_std)).sum(dim=-1)
 
 
+class VonMisesFisherTanhGaussianDistribution(Distribution):
+    """A vMF direction over the leading dimensions joined with a squashed-tanh Gaussian over the last ``tail_dim``.
+
+    For an action that is a latent on the sphere plus a few bounded commands (e.g. a gaze target): the two parts
+    are independent, so log-probabilities and entropies add.
+    """
+
+    def __init__(
+        self,
+        output_dim: int,
+        tail_dim: int = 2,
+        init_std: float = 1.0,
+        learn_std: bool = True,
+        kappa_range: tuple[float, float] = (1e-2, 1e5),
+        tail_init_noise_std: float = 0.5,
+        tail_learn_std: bool = True,
+        tail_low: float = -1.0,
+        tail_high: float = 1.0,
+    ) -> None:
+        """Initialize both parts.
+
+        Args:
+            output_dim: Total action dimension; the first ``output_dim - tail_dim`` are the vMF direction.
+            tail_dim: Number of trailing bounded dimensions.
+            init_std: The vMF part's initial tangent std (``kappa = 1 / init_std**2``).
+            learn_std: Whether the vMF concentration is learnable.
+            kappa_range: Clamp on the vMF concentration.
+            tail_init_noise_std: The tail's initial pre-squash std.
+            tail_learn_std: Whether the tail's std is learnable.
+            tail_low: Lower bound of the tail actions.
+            tail_high: Upper bound of the tail actions.
+        """
+        super().__init__(output_dim)
+        self.head_dim = output_dim - tail_dim
+        self.head = VonMisesFisherDistribution(self.head_dim, init_std, learn_std, kappa_range)
+        self.tail = SquashedTanhGaussianDistribution(
+            tail_dim, tail_init_noise_std, learn_std=tail_learn_std, low=tail_low, high=tail_high
+        )
+
+    def _split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return x[..., : self.head_dim], x[..., self.head_dim :]
+
+    def update(self, mlp_output: torch.Tensor) -> None:
+        """Update the vMF part from the leading outputs and the squashed Gaussian from the trailing ones."""
+        head, tail = self._split(mlp_output)
+        self.head.update(head)
+        self.tail.update(tail)
+
+    def sample(self, std_clip: float | None = None) -> torch.Tensor:
+        """Sample both parts and join them."""
+        return torch.cat([self.head.sample(), self.tail.sample()], dim=-1)
+
+    def sample_and_log_prob(self, std_clip: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reparameterized joint sample and its log-prob (the sum of the parts')."""
+        head, head_logp = self.head.sample_and_log_prob()
+        tail, tail_logp = self.tail.sample_and_log_prob()
+        return torch.cat([head, tail], dim=-1), head_logp + tail_logp
+
+    def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        """The vMF mean direction joined with the squashed tail mean."""
+        head, tail = self._split(mlp_output)
+        return torch.cat([self.head.deterministic_output(head), self.tail.deterministic_output(tail)], dim=-1)
+
+    def as_deterministic_output_module(self) -> nn.Module:
+        """Export module applying each part's deterministic output to its slice."""
+        return _SplitDeterministicOutput(
+            self.head_dim, self.head.as_deterministic_output_module(), self.tail.as_deterministic_output_module()
+        )
+
+    @property
+    def input_dim(self) -> int:
+        """The MLP outputs the raw vMF direction then the tail's pre-squash mean."""
+        return self.output_dim
+
+    @property
+    def mean(self) -> torch.Tensor:
+        """The joined means."""
+        return torch.cat([self.head.mean, self.tail.mean], dim=-1)
+
+    @property
+    def std(self) -> torch.Tensor:
+        """The joined spreads (vMF tangent std, tail pre-squash std)."""
+        return torch.cat([self.head.std, self.tail.std], dim=-1)
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        """The sum of the parts' entropies."""
+        return self.head.entropy + self.tail.entropy
+
+    @property
+    def params(self) -> tuple[torch.Tensor, ...]:
+        """The vMF parameters followed by the tail's."""
+        return (*self.head.params, *self.tail.params)
+
+    def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        """The sum of the parts' log-probs."""
+        head, tail = self._split(outputs)
+        return self.head.log_prob(head) + self.tail.log_prob(tail)
+
+    def kl_divergence(self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """The sum of the parts' KL divergences."""
+        return self.head.kl_divergence(old_params[:2], new_params[:2]) + self.tail.kl_divergence(
+            old_params[2:], new_params[2:]
+        )
+
+
+class _SplitDeterministicOutput(nn.Module):
+    """Exportable module applying one deterministic output to the leading slice and another to the rest."""
+
+    def __init__(self, split: int, head: nn.Module, tail: nn.Module) -> None:
+        super().__init__()
+        self.split = split
+        self.head = head
+        self.tail = tail
+
+    def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        return torch.cat([self.head(mlp_output[..., : self.split]), self.tail(mlp_output[..., self.split :])], dim=-1)
+
+
 class _IdentityDeterministicOutput(nn.Module):
     """Exportable module that returns the MLP output as is."""
 

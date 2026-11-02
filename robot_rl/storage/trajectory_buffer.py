@@ -7,13 +7,17 @@ from .expert_buffer import ExpertBuffer
 
 def _get_idxs(
     priorities: torch.Tensor,
+    lengths: torch.Tensor,
     num_slices: int,
     seq_length: int,
-    bucket_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate ``(episode, frame)`` indices for sampling consecutive windows from a trajectory buffer."""
+    """Generate ``(episode, frame)`` indices for sampling consecutive windows from a trajectory buffer.
+
+    Each window and the frame after it lie within its motion's real frames, except in motions too short to hold one.
+    """
     ep_indices = torch.multinomial(priorities, num_slices, replacement=True)
-    starts = torch.randint(0, bucket_size - seq_length, (num_slices,), device=priorities.device)
+    span = (lengths[ep_indices] - seq_length).clamp(min=1)
+    starts = (torch.rand(num_slices, device=priorities.device) * span).long()
     offsets = torch.arange(seq_length, device=priorities.device)
     seq_indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
     ep_flat = ep_indices.unsqueeze(1).expand(num_slices, seq_length).reshape(-1)
@@ -41,6 +45,11 @@ class TrajectoryBuffer(ExpertBuffer):
                 f"{self.motions.shape}."
             )
         self.num_motions, self.bucket_size = self.motions.shape
+        # a padded bundle's `length` counts each row's real frames; the rest repeat the final frame
+        if "length" in self.motions:
+            self.lengths = self.motions["length"][:, 0].long().clamp(1, self.bucket_size)
+        else:
+            self.lengths = torch.full((self.num_motions,), self.bucket_size, device=device, dtype=torch.long)
         self.priorities = torch.ones((self.num_motions,), device=device)
         self._eval_order = torch.arange(0, self.num_motions, device=self.device)
 
@@ -77,7 +86,7 @@ class TrajectoryBuffer(ExpertBuffer):
         if seq_length >= self.bucket_size:
             raise ValueError(f"seq_length ({seq_length}) must be less than bucket_size ({self.bucket_size}).")
         num_slices = batch_size // seq_length
-        ep_flat, seq_indices = self._get_idxs(self.priorities, num_slices, seq_length, self.bucket_size)
+        ep_flat, seq_indices = self._get_idxs(self.priorities, self.lengths, num_slices, seq_length)
         return (
             self.motions[ep_flat, seq_indices].to(device),
             self.motions[ep_flat, seq_indices + 1].to(device),
@@ -89,7 +98,7 @@ class TrajectoryBuffer(ExpertBuffer):
         See :meth:`get_expert_state` for full state dictionary format.
         """
         ep_indices = torch.multinomial(self.priorities, num_envs, replacement=True)
-        motion_indices = torch.randint(0, self.bucket_size, (num_envs,), device=self.device)
+        motion_indices = (torch.rand(num_envs, device=self.device) * self.lengths[ep_indices]).long()
         motions = self.motions[ep_indices, motion_indices]
         return self.get_expert_state(motions, device=device)
 

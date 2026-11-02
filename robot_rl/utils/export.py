@@ -183,10 +183,11 @@ def _rebuild_distillation(
         The student under the ``policy`` export name.
     """
     cfg = copy.deepcopy(train_cfg)
-    sd = ckpt["student_state_dict"]
+    # an auxiliary head only supervises the encoder in training; it is not part of the exported policy
+    sd = {k: v for k, v in ckpt["student_state_dict"].items() if not k.startswith("aux_head.")}
     model_cfg = dict(cfg["student"])
     model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
-    if issubclass(model_class, RNNModel):
+    if issubclass(model_class, RNNModel) and not issubclass(model_class, CNNRNNModel):
         raise NotImplementedError("Export of recurrent (memory-bearing) students is not supported.")
     groups = cfg["obs_groups"]["student"]
     shapes = {g: tuple(obs_shapes[g]) for g in groups if obs_shapes and g in obs_shapes}

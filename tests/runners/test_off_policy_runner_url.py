@@ -142,3 +142,47 @@ class TestOffPolicyRunnerUrlCadence:
         first_update = calls.index("gammas")
         assert calls[first_update - 1] == "step"  # collection precedes the update phase
         assert calls[first_update + 1 : first_update + 4] == ["update", "update", "update"]
+
+
+class TestCheckpointCallbacks:
+    """Checkpoint callbacks fire at every save, feed their outputs to the algorithm and can reset the env."""
+
+    def _runner(self, monkeypatch: Any, save_interval: int) -> OffPolicyRunner:
+        cfg = _make_cfg()
+        cfg["save_interval"] = save_interval
+        runner = OffPolicyRunner(DummyUrlEnv(), cfg, log_dir=None, device="cpu")
+        # a stand-in writer marks this as the main rank without touching disk
+        monkeypatch.setattr(runner, "save", lambda path: None)
+        monkeypatch.setattr("robot_rl.runners.off_policy_runner.demote_old_checkpoint", lambda *a, **k: None)
+        monkeypatch.setattr(runner.logger, "init_logging_writer", lambda: None)
+        monkeypatch.setattr(runner.logger, "log", lambda **k: None)
+        monkeypatch.setattr(runner.logger, "stop_logging_writer", lambda: None)
+        runner.logger.writer = object()
+        return runner
+
+    def test_fires_at_saves_and_applies_outputs(self, monkeypatch: Any) -> None:
+        """Saves at it 0 and 4 plus the final it 7; outputs reach apply_eval_outputs; built-in eval is off."""
+        runner = self._runner(monkeypatch, save_interval=4)
+        runner.builtin_eval = False
+        applied: list[dict] = []
+        runner.alg.apply_eval_outputs = applied.append
+        seen: list[int] = []
+
+        def callback(r: OffPolicyRunner, path: str, it: int) -> dict:
+            seen.append(it)
+            return {"motion_priorities": torch.ones(3)}
+
+        runner.add_checkpoint_callback(callback)
+        runner.learn(num_learning_iterations=8)
+        assert seen == [0, 4, 7]
+        assert len(applied) == 3 and torch.equal(applied[0]["motion_priorities"], torch.ones(3))
+        assert "eval" not in runner.alg.calls
+
+    def test_env_used_resets_rollout(self, monkeypatch: Any) -> None:
+        """A callback that stepped the training env makes the runner reset before collecting again."""
+        runner = self._runner(monkeypatch, save_interval=4)
+        runner.builtin_eval = False
+        runner.add_checkpoint_callback(lambda r, path, it: {"env_used": True})
+        runner.learn(num_learning_iterations=8)
+        # it 0 and 4 reset; the final save has no collection after it
+        assert runner.alg.calls.count("reset_rollout") == 2

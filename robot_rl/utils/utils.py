@@ -536,6 +536,26 @@ def pad_to_size(x: torch.Tensor, size: int, dim: int = 0) -> torch.Tensor:
     return torch.cat([x, torch.zeros(shape, device=x.device)], dim=dim)
 
 
+def pad_to_size_repeat(x: torch.Tensor, size: int, dim: int = 0) -> torch.Tensor:
+    """Pad a tensor up to a provided size by repeating its first slice.
+
+    Padded entries are real data rather than zeros, for callers where zero is not a legal value.
+
+    Args:
+        x: Tensor to pad.
+        size: Size of the padded tensor.
+        dim: Dimension along which to pad.
+
+    Returns:
+        The padded tensor.
+    """
+    pad = max(size - x.shape[dim], 0)
+    if pad == 0:
+        return x
+    first = x.narrow(dim, 0, 1)
+    return torch.cat([x, first.expand(*[pad if i == dim else -1 for i in range(x.dim())])], dim=dim)
+
+
 def forward_sliding_mean(x: torch.Tensor, window_len: int, dim: int = 0) -> torch.Tensor:
     """Smooth x by averaging within window_len.
 

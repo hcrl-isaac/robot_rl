@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.distributions import Beta, Normal
 from typing import Any
+
+from robot_rl.utils.utils import resolve_callable
 
 
 class Distribution(nn.Module):
@@ -82,6 +85,15 @@ class Distribution(nn.Module):
         """Return the input dimension required by the distribution."""
         raise NotImplementedError
 
+    @classmethod
+    def output_dim_for_input_width(cls, width: int) -> int:
+        """Return the ``output_dim`` whose :attr:`input_dim` flattens to ``width`` MLP outputs.
+
+        Args:
+            width: Width of the MLP's last layer.
+        """
+        return width
+
     @property
     def mean(self) -> torch.Tensor:
         """Return the mean of the distribution."""
@@ -131,6 +143,10 @@ class Distribution(nn.Module):
             KL divergence summed over the last dimension.
         """
         raise NotImplementedError
+
+    def export_std(self) -> torch.Tensor | None:
+        """Return the input-independent std of a plain Gaussian for export, or ``None`` for any other distribution."""
+        return None
 
     def init_mlp_weights(self, mlp: nn.Module) -> None:
         """Initialize distribution-specific weights in the MLP.
@@ -195,15 +211,19 @@ class GaussianDistribution(Distribution):
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
 
+    def _clamped_std(self) -> torch.Tensor:
+        """Return the std parameter clamped to its configured range."""
+        if self.std_type == "scalar":
+            return self.std_param.clamp(self.std_range[0], self.std_range[1])
+        return torch.exp(self.log_std_param.clamp(self.log_std_range[0], self.log_std_range[1]))
+
     def update(self, mlp_output: torch.Tensor) -> None:
         """Update the Gaussian distribution from MLP output."""
-        mean = mlp_output
-        if self.std_type == "scalar":
-            std = self.std_param.clamp(self.std_range[0], self.std_range[1])
-        elif self.std_type == "log":
-            log_std = self.log_std_param.clamp(self.log_std_range[0], self.log_std_range[1])
-            std = torch.exp(log_std)
-        self._distribution = Normal(mean, std)
+        self._distribution = Normal(mlp_output, self._clamped_std())
+
+    def export_std(self) -> torch.Tensor | None:
+        """Return the clamped std as a detached constant for export."""
+        return self._clamped_std().detach().clone()
 
     def set_std_(self, value: float, dims: slice) -> None:
         """Set the (initial) standard deviation of ``dims`` to ``value``, in this module's own parameterization."""
@@ -331,6 +351,10 @@ class HeteroscedasticGaussianDistribution(GaussianDistribution):
             std = torch.exp(log_std)
         self._distribution = Normal(mean, std)
 
+    def export_std(self) -> torch.Tensor | None:
+        """Return ``None``: the std is state-dependent, so it cannot be exported as a constant."""
+        return None
+
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Extract the mean from the MLP output (first slice of the second-to-last dimension)."""
         return mlp_output[..., 0, :]
@@ -347,6 +371,11 @@ class HeteroscedasticGaussianDistribution(GaussianDistribution):
         dimension is the mean and the second is the standard deviation (or log standard deviation).
         """
         return [2, self.output_dim]
+
+    @classmethod
+    def output_dim_for_input_width(cls, width: int) -> int:
+        """Return the ``output_dim`` whose ``[2, output_dim]`` input flattens to ``width`` MLP outputs."""
+        return width // 2
 
     def init_mlp_weights(self, mlp: nn.Module) -> None:
         """Initialize the std head weights in the MLP."""
@@ -418,6 +447,10 @@ class TruncatedGaussianDistribution(GaussianDistribution):
         elif self.std_type == "log":
             std = torch.exp(self.log_std_param).expand_as(mean)
         self._distribution = Normal(mean, std)
+
+    def export_std(self) -> torch.Tensor | None:
+        """Return ``None``: a truncated Gaussian is not described by ``(mean, std)`` alone."""
+        return None
 
     def sample(self, std_clip: float | None = None) -> torch.Tensor:
         """Sample from the Gaussian distribution.
@@ -512,6 +545,11 @@ class BetaDistribution(Distribution):
         """
         return [2, self.output_dim]
 
+    @classmethod
+    def output_dim_for_input_width(cls, width: int) -> int:
+        """Return the ``output_dim`` whose ``[2, output_dim]`` input flattens to ``width`` MLP outputs."""
+        return width // 2
+
     @property
     def mean(self) -> torch.Tensor:
         """Return the mean of the Beta distribution, rescaled to ``action_range``."""
@@ -553,6 +591,70 @@ class BetaDistribution(Distribution):
         """Initialize the beta-parameter head weights to zero for a near-uniform initial distribution."""
         torch.nn.init.zeros_(mlp[-2].weight[self.output_dim :])  # type: ignore
         torch.nn.init.zeros_(mlp[-2].bias[self.output_dim :])  # type: ignore
+
+
+def _vmf_bessel_terms(kappa: torch.Tensor, half: int, cf_extra: int) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""``(log C_p(kappa), A_p(kappa))`` for a scalar concentration and ``p = 2 * half``, differentiably.
+
+    Uses a downward recurrence for the Bessel ratios :math:`r_k = I_k(\kappa)/I_{k-1}(\kappa)`, which are bounded
+    in ``(0, 1)`` and hence numerically stable. ``log I_{p/2-1}`` is then accumulated from
+    :math:`\log I_0(\kappa) = \kappa + \log(\text{i0e}(\kappa))` and the log-ratios; everything is plain arithmetic
+    so autograd yields the exact gradients (with :math:`\frac{d}{d\kappa}(-\log C_p) = A_p`).
+    """
+    nu = half - 1  # order of the normalizer's Bessel term, I_{p/2-1}; A_p = r_{p/2} = ratios[half]
+    m = half + cf_extra
+    # Downward recurrence r_k = 1/(2k/kappa + r_{k+1}); seed r_{m+1} at the continued-fraction fixed
+    # point (sqrt(1+s^2)-s, s=(m+1)/kappa) so it converges immediately for large kappa.
+    ratios: list[torch.Tensor | None] = [None] * (half + 1)
+    s = (m + 1) / kappa
+    r = torch.sqrt(1.0 + s * s) - s
+    for k in range(m, 0, -1):
+        r = 1.0 / (2.0 * k / kappa + r)
+        if k <= half:
+            ratios[k] = r
+    a_ratio = ratios[half]  # I_{p/2}/I_{p/2-1}
+    # log I_{nu} = log I_0 + sum_{j=1}^{nu} log r_j, with log I_0 = kappa + log(i0e(kappa)).
+    log_i_nu = kappa + torch.log(torch.special.i0e(kappa))
+    for j in range(1, nu + 1):
+        log_i_nu = log_i_nu + torch.log(ratios[j])
+    log_norm = nu * torch.log(kappa) - half * math.log(2.0 * math.pi) - log_i_nu
+    return log_norm.squeeze(), a_ratio.squeeze()
+
+
+_vmf_bessel_terms_fused = torch.compile(_vmf_bessel_terms, fullgraph=True, dynamic=False)
+
+
+@functools.cache
+def _has_triton() -> bool:
+    """Whether inductor can generate GPU kernels here."""
+    from torch.utils._triton import has_triton
+
+    return has_triton()
+
+
+# Proposals per row in the vMF rejection sampler. Wood's acceptance rate is at least 0.7 for p = 256, so a
+# row misses all 32 with probability below 1e-17.
+VMF_PROPOSALS = 32
+
+
+def _wood_b(kappa: torch.Tensor, d: float) -> torch.Tensor:
+    """Wood's ``b = (-2 kappa + sqrt(4 kappa^2 + d^2)) / d``, written without the cancellation at large kappa."""
+    return d / (2.0 * kappa + torch.sqrt(4.0 * kappa * kappa + d * d))
+
+
+def _wood_noise(kappa: torch.Tensor, d: float, batch: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the first accepted of :data:`VMF_PROPOSALS` ``Beta(d/2, d/2)`` proposals per row, and whether any was."""
+    kappa = kappa.double()  # the acceptance test's terms cancel to well below float32's resolution
+    b = _wood_b(kappa, d)
+    x0 = (1.0 - b) / (1.0 + b)
+    c = kappa * x0 + d * torch.log((1.0 - x0 * x0).clamp_min(1e-300))
+    conc = torch.full((), d / 2.0, device=device)
+    z_prop = Beta(conc, conc, validate_args=False).sample((batch, VMF_PROPOSALS)).double()
+    w_prop = (1.0 - (1.0 + b) * z_prop) / (1.0 - (1.0 - b) * z_prop)
+    u = torch.rand(batch, VMF_PROPOSALS, device=device, dtype=torch.float64)
+    accept = kappa * w_prop + d * torch.log((1.0 - x0 * w_prop).clamp_min(1e-300)) - c >= torch.log(u)
+    first = accept.to(torch.uint8).argmax(dim=1, keepdim=True)  # argmax returns the first maximal index
+    return z_prop.gather(1, first).squeeze(1), accept.any(dim=1)
 
 
 class VonMisesFisherDistribution(Distribution):
@@ -605,34 +707,14 @@ class VonMisesFisherDistribution(Distribution):
         self._a_ratio: torch.Tensor | None = None  # A_p(kappa) = I_{p/2}(kappa) / I_{p/2-1}(kappa)
 
     def _bessel_terms(self, kappa: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        r"""Compute ``(log C_p(kappa), A_p(kappa))`` for a scalar concentration, differentiably.
+        """Compute ``(log C_p(kappa), A_p(kappa))`` for a scalar concentration, differentiably.
 
-        Uses a downward recurrence for the Bessel ratios :math:`r_k = I_k(\kappa)/I_{k-1}(\kappa)`, which are bounded
-        in ``(0, 1)`` and hence numerically stable. ``log I_{p/2-1}`` is then accumulated from
-        :math:`\log I_0(\kappa) = \kappa + \log(\text{i0e}(\kappa))` and the log-ratios; everything is plain arithmetic
-        so autograd yields the exact gradients (with :math:`\frac{d}{d\kappa}(-\log C_p) = A_p`). ``kappa`` is a single
-        scalar, so the Python loop is cheap.
+        See :func:`_vmf_bessel_terms`; fused on CUDA with Triton, and by the enclosing graph when compiled.
         """
-        p = self.output_dim
-        half = p // 2  # = p/2 ; A_p = r_{p/2} = ratios[half]
-        nu = half - 1  # order of the normalizer's Bessel term, I_{p/2-1}
-        m = half + self._cf_extra
-        # Downward recurrence r_k = 1/(2k/kappa + r_{k+1}); seed r_{m+1} at the continued-fraction fixed
-        # point (sqrt(1+s^2)-s, s=(m+1)/kappa) so it converges immediately for large kappa.
-        ratios: list[torch.Tensor | None] = [None] * (half + 1)
-        s = (m + 1) / kappa
-        r = torch.sqrt(1.0 + s * s) - s
-        for k in range(m, 0, -1):
-            r = 1.0 / (2.0 * k / kappa + r)
-            if k <= half:
-                ratios[k] = r
-        a_ratio = ratios[half]  # I_{p/2}/I_{p/2-1}
-        # log I_{nu} = log I_0 + sum_{j=1}^{nu} log r_j, with log I_0 = kappa + log(i0e(kappa)).
-        log_i_nu = kappa + torch.log(torch.special.i0e(kappa))
-        for j in range(1, nu + 1):
-            log_i_nu = log_i_nu + torch.log(ratios[j])
-        log_norm = nu * torch.log(kappa) - half * math.log(2.0 * math.pi) - log_i_nu
-        return log_norm.squeeze(), a_ratio.squeeze()
+        # inside a compiled region the Triton check would break the graph (dynamo does not trace it)
+        fused = not torch.compiler.is_compiling() and kappa.is_cuda and _has_triton()
+        fn = _vmf_bessel_terms_fused if fused else _vmf_bessel_terms
+        return fn(kappa, self.output_dim // 2, self._cf_extra)
 
     def update(self, mlp_output: torch.Tensor) -> None:
         """Update the distribution: mean direction = normalized MLP output, concentration = kappa param."""
@@ -675,8 +757,8 @@ class VonMisesFisherDistribution(Distribution):
         d = float(p - 1)
         kappa = self._kappa.squeeze()
         with torch.no_grad():
-            z = self._sample_weight_noise(n, p, float(kappa.item()), device)  # [N]
-        b = (-2.0 * kappa + torch.sqrt(4.0 * kappa * kappa + d * d)) / d
+            z = self._sample_weight_noise(n, p, kappa.detach(), device)  # [N]
+        b = _wood_b(kappa, d)
         w = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z)
         # Direction orthogonal to mu, uniform on the (p-2)-subsphere.
         v = torch.randn(n, p, device=device)
@@ -686,34 +768,14 @@ class VonMisesFisherDistribution(Distribution):
         x = torch.nn.functional.normalize(x, dim=-1)  # defensive re-normalization
         return x.reshape(*lead, p)
 
-    def _sample_weight_noise(self, batch: int, p: int, kappa: float, device: torch.device) -> torch.Tensor:
-        """Rejection-sample the Beta noise behind the tangential component ``w`` (Wood, 1994), with refill.
+    def _sample_weight_noise(self, batch: int, p: int, kappa: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Rejection-sample the Beta noise behind the tangential component ``w`` (Wood, 1994).
 
-        Returns the accepted ``Beta(d/2, d/2)`` draws; rows still unaccepted after the retry cap (should not
-        happen) keep the initial ``z = 0.5``, which maps exactly to the mode ``w = x0``.
+        Each row keeps the first accepted of :data:`VMF_PROPOSALS` proposals (fixed shapes, no host sync); a row
+        with none keeps ``z = 0.5``, the mode.
         """
-        d = float(p - 1)
-        b = (-2.0 * kappa + math.sqrt(4.0 * kappa * kappa + d * d)) / d
-        x0 = (1.0 - b) / (1.0 + b)
-        c = kappa * x0 + d * math.log(max(1.0 - x0 * x0, 1e-300))
-        beta = Beta(torch.tensor(d / 2.0, device=device), torch.tensor(d / 2.0, device=device))
-
-        z = torch.full((batch,), 0.5, device=device)
-        done = torch.zeros(batch, dtype=torch.bool, device=device)
-        # Refill only the not-yet-accepted entries each round until all are accepted.
-        for _ in range(100):
-            todo = (~done).nonzero(as_tuple=True)[0]
-            n = todo.numel()
-            if n == 0:
-                break
-            z_prop = beta.sample((n,))
-            w_prop = (1.0 - (1.0 + b) * z_prop) / (1.0 - (1.0 - b) * z_prop)
-            u = torch.rand(n, device=device)
-            accept = kappa * w_prop + d * torch.log((1.0 - x0 * w_prop).clamp_min(1e-300)) - c >= torch.log(u)
-            acc_idx = todo[accept]
-            z[acc_idx] = z_prop[accept]
-            done[acc_idx] = True
-        return z
+        z, accepted = _wood_noise(kappa, float(p - 1), batch, device)
+        return torch.where(accepted, z, 0.5).float()
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Return the unit mean direction (the deterministic action is the mode of the vMF)."""
@@ -962,3 +1024,20 @@ class _BetaDeterministicOutput(nn.Module):
         alpha = torch.nn.functional.softplus(alpha_raw) + 1.0
         beta = torch.nn.functional.softplus(beta_raw) + 1.0
         return (alpha / (alpha + beta)) * self.range_scale + self.range_offset
+
+
+def bound_by_clip_actions(distribution_cfg: dict, clip_actions: float) -> bool:
+    """Set a truncated-Gaussian distribution cfg's bounds to ``+-clip_actions``, in place.
+
+    Args:
+        distribution_cfg: A distribution cfg; one that names no class is left alone.
+        clip_actions: The runner's action clip.
+
+    Returns:
+        Whether the cfg names :class:`TruncatedGaussianDistribution` or a subclass of it, and so was bounded.
+    """
+    class_name = distribution_cfg.get("class_name")
+    if class_name is None or not issubclass(resolve_callable(class_name), TruncatedGaussianDistribution):
+        return False
+    distribution_cfg["low"], distribution_cfg["high"] = -clip_actions, clip_actions
+    return True

@@ -30,6 +30,12 @@ class MLPModel(nn.Module):
     is_recurrent: bool = False
     """Whether the model contains a recurrent module."""
 
+    loads_own_weights: bool = False
+    """Whether the model's weights come from its own configuration rather than from a checkpoint."""
+
+    head_module: str = "mlp"
+    """Name of the submodule whose last layer produces the model's raw output."""
+
     def __init__(
         self,
         obs: TensorDict,
@@ -113,8 +119,10 @@ class MLPModel(nn.Module):
 
         # Distribution
         if distribution_cfg is not None:
-            dist_class: type[Distribution] = resolve_callable(distribution_cfg.pop("class_name"))  # type: ignore
-            self.distribution: Distribution | None = dist_class(output_dim, **distribution_cfg)
+            dist_class: type[Distribution] = resolve_callable(distribution_cfg["class_name"])  # type: ignore
+            self.distribution: Distribution | None = dist_class(
+                output_dim, **{k: v for k, v in distribution_cfg.items() if k != "class_name"}
+            )
             mlp_output_dim = self.distribution.input_dim
         else:
             self.distribution = None
@@ -310,6 +318,24 @@ class MLPModel(nn.Module):
         base_dim = self._input_dim_override if self._input_dim_override is not None else 0
         return base_dim + self.obs_dim + self.other_input_dim
 
+    @classmethod
+    def head_output_width(cls, state_dict: dict[str, torch.Tensor]) -> int:
+        """Return the width of the head's last layer, read from a saved state dict.
+
+        Args:
+            state_dict: The model's state dict.
+
+        Raises:
+            ValueError: If the state dict holds no biased layer under :attr:`head_module`.
+        """
+        biases = [v for k, v in state_dict.items() if k.startswith(f"{cls.head_module}.") and k.endswith(".bias")]
+        if not biases:
+            raise ValueError(
+                f"Cannot infer the output width: {cls.__name__} has no '{cls.head_module}.*.bias' weights."
+            )
+        # a Linear bias is (out,) and a ParallelLinear bias (num_parallel, 1, out)
+        return biases[-1].shape[-1]
+
 
 class _TorchMLPModel(nn.Module):
     """Exportable MLP model for JIT."""
@@ -324,12 +350,24 @@ class _TorchMLPModel(nn.Module):
         else:
             self.deterministic_output = nn.Identity()
         self.last_activation = copy.deepcopy(model.last_activation) or nn.Identity()
+        # Empty buffer marks a policy whose ``(mean, std)`` cannot be exported; ``forward_dist`` rejects it.
+        std = model.distribution.export_std() if model.distribution is not None else None
+        self.register_buffer("_std", torch.empty(0) if std is None else std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run deterministic inference on pre-concatenated observations."""
         x = self.obs_normalizer(x)
         out = self.mlp(x)
         return self.last_activation(self.deterministic_output(out))
+
+    @torch.jit.export
+    def forward_dist(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the Gaussian policy's ``(mean, std)`` for pre-concatenated observations."""
+        if self._std.numel() == 0:
+            raise RuntimeError("forward_dist is only supported for a plain GaussianDistribution policy.")
+        x = self.obs_normalizer(x)
+        mean = self.deterministic_output(self.mlp(x))
+        return mean, self._std.expand_as(mean)
 
     @torch.jit.export
     def reset(self) -> None:

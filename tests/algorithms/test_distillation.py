@@ -10,6 +10,8 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
+import pytest
+
 from robot_rl.algorithms.distillation import Distillation
 from robot_rl.models import MLPModel
 from robot_rl.storage import RolloutStorage
@@ -112,3 +114,55 @@ class TestDistillationLoss:
 
         for name, p in alg.teacher.named_parameters():
             assert torch.equal(p, teacher_before[name]), f"Teacher parameter {name} changed during student update"
+
+
+class TestTeacherReadiness:
+    """A teacher is ready when it loads its own weights or gets them from a checkpoint."""
+
+    @staticmethod
+    def _alg() -> Distillation:
+        obs = make_obs(NUM_ENVS, OBS_DIM)
+        obs_groups = {"student": ["policy"], "teacher": ["policy"]}
+        student = MLPModel(obs, obs_groups, "student", NUM_ACTIONS, hidden_dims=[32, 32])
+        teacher = MLPModel(obs, obs_groups, "teacher", NUM_ACTIONS, hidden_dims=[32])
+        storage = RolloutStorage("distillation", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+        return Distillation(student, teacher, storage)
+
+    def test_weighted_teacher_needs_a_checkpoint(self) -> None:
+        """A teacher with weights is not ready until loaded, and an empty teacher checkpoint is refused."""
+        alg = self._alg()
+        assert not alg.teacher_loaded
+        with pytest.raises(ValueError, match="no teacher weights"):
+            alg.load({"student_state_dict": alg.student.state_dict(), "teacher_state_dict": {}}, None, strict=True)
+
+    def test_rl_actor_loads_as_teacher(self) -> None:
+        """An RL checkpoint's actor becomes the teacher."""
+        alg = self._alg()
+        source = MLPModel(make_obs(NUM_ENVS, OBS_DIM), {"actor": ["policy"]}, "actor", NUM_ACTIONS, hidden_dims=[32])
+        alg.load({"actor_state_dict": source.state_dict()}, None, strict=True)
+        assert alg.teacher_loaded
+        for name, p in alg.teacher.named_parameters():
+            assert torch.equal(p, source.state_dict()[name])
+
+
+class TestRecurrentTeacher:
+    """A recurrent teacher's memory must survive the update between rollouts."""
+
+    def test_update_keeps_teacher_hidden_state(self) -> None:
+        """The teacher's state after ``update()`` is the state its rollout ended in."""
+        from robot_rl.models import RNNModel
+
+        obs = make_obs(NUM_ENVS, OBS_DIM)
+        obs_groups = {"student": ["policy"], "teacher": ["policy"]}
+        student = MLPModel(obs, obs_groups, "student", NUM_ACTIONS, hidden_dims=[32])
+        teacher = RNNModel(obs, obs_groups, "teacher", NUM_ACTIONS, hidden_dims=[32], rnn_hidden_dim=16)
+        storage = RolloutStorage("distillation", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+        alg = Distillation(student, teacher, storage, num_learning_epochs=2, gradient_length=3, learning_rate=1e-3)
+        alg.train_mode()
+        for _ in range(2):
+            for _ in range(NUM_STEPS):
+                alg.act(make_obs(NUM_ENVS, OBS_DIM))
+                alg.process_env_step(obs, torch.zeros(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+            before = [h.clone() for h in alg.teacher.get_hidden_state()]
+            alg.update()
+            assert all(torch.equal(a, b) for a, b in zip(alg.teacher.get_hidden_state(), before, strict=True))

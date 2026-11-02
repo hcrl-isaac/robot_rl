@@ -20,6 +20,16 @@ except ModuleNotFoundError:
     wandb = None
 
 
+def run_settings(shared: bool) -> wandb.Settings:
+    """Return the W&B run settings; ``shared`` makes this process the primary writer of a shared-mode run."""
+    settings = wandb.Settings()
+    if shared:
+        settings.x_label = "main"
+        settings.mode = "shared"
+        settings.x_primary = True
+    return settings
+
+
 class WandbLogWriter(SummaryWriter, LogWriter):
     """Summary writer for W&B."""
 
@@ -31,8 +41,9 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         group: str | None = None,
         num_envs: int = 1,
         shared: bool = False,
-        log_videos_async: bool = False,
+        log_evals_async: bool = False,
         tags: list[str] | None = None,
+        entity: str | None = None,
     ) -> None:
         """Initialize a W&B run for logging."""
         if wandb is None:
@@ -42,22 +53,16 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         # Get the run name
         run_name = run_name or os.path.split(log_dir)[-1]
 
-        try:
-            entity = os.environ["WANDB_USERNAME"]
-        except KeyError:
-            entity = None
+        # an explicit entity (a task's own team) wins over the per-user default
+        entity = entity or os.environ.get("WANDB_USERNAME") or None
 
         self.shared = shared
         self.num_envs = num_envs
 
-        settings = wandb.Settings(start_method="thread")
+        settings = run_settings(self.shared)
         tags = list(tags or [])
-        if self.shared:
-            settings.x_label = "main"
-            settings.mode = "shared"
-            settings.x_primary = True
-        if log_videos_async:
-            tags.append("log_videos_async")
+        if log_evals_async:
+            tags.append("log_evals_async")
 
         # Initialize wandb
         self.run = wandb.init(

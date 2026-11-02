@@ -33,7 +33,10 @@ class CNNModel(MLPModel):
         output_dim: int,
         hidden_dims: tuple[int, ...] | list[int] = (256, 256, 256),
         activation: str = "elu",
+        first_activation: str | None = None,
+        last_activation: str | None = None,
         obs_normalization: bool = False,
+        normalize_first_layer: bool = False,
         distribution_cfg: dict | None = None,
         cnn_cfg: dict[str, dict] | dict[str, Any] | None = None,
         cnns: nn.ModuleDict | dict[str, nn.Module] | None = None,
@@ -47,6 +50,9 @@ class CNNModel(MLPModel):
             output_dim: Dimension of the output.
             hidden_dims: Hidden dimensions of the MLP.
             activation: Activation function of the CNN and MLP.
+            first_activation: Activation function of the MLP's first layer. None uses ``activation``.
+            last_activation: Activation function of the MLP's last layer. None leaves it linear.
+            normalize_first_layer: Whether to normalize the MLP's first layer.
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
             distribution_cfg: Configuration dictionary for the output distribution.
             cnn_cfg: Configuration of the CNN encoder(s).
@@ -95,7 +101,10 @@ class CNNModel(MLPModel):
             output_dim,
             hidden_dims=hidden_dims,
             activation=activation,
+            first_activation=first_activation,
+            last_activation=last_activation,
             obs_normalization=obs_normalization,
+            normalize_first_layer=normalize_first_layer,
             distribution_cfg=distribution_cfg,
         )
 

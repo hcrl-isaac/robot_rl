@@ -25,11 +25,10 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    # Exact pin = the Isaac Sim container's bundled stack, so every Ray node resolves torch identically (NCCL consistency).
-    "torch==2.7.0",
-    "torchvision==0.22.0",
+    # Exact pin = Isaac Lab 3.0's torch, so every Ray node resolves torch identically (NCCL consistency).
+    "torch==2.11.0",
+    "torchvision==0.26.0",
     "tensordict>=0.7.0",
-    "packaging<24",
     "numpy>=1.16.4",
     "GitPython",
     "onnx",

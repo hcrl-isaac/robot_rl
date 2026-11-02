@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 import torch
 import torch.nn as nn
 from itertools import chain
@@ -13,7 +14,14 @@ from tensordict import TensorDict
 from typing import Any
 
 from robot_rl.env import VecEnv
-from robot_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
+from robot_rl.extensions import (
+    RandomNetworkDistillation,
+    StyleDiscriminators,
+    Symmetry,
+    resolve_rnd_config,
+    resolve_style_config,
+    resolve_symmetry_config,
+)
 from robot_rl.models import EncoderInferencePolicy, MLPModel, SharedMemoryInferencePolicy
 from robot_rl.modules import GaussianDistribution
 from robot_rl.storage import RolloutStorage
@@ -51,6 +59,7 @@ class PPO:
         max_grad_norm: float = 1.0,
         optimizer: str = "adam",
         use_clipped_value_loss: bool = True,
+        actor_warmup_iters: int = 0,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
@@ -67,6 +76,8 @@ class PPO:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        # Style discriminator parameters (per-expert reward streams)
+        style_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         # Meta-RL parameters
@@ -92,9 +103,17 @@ class PPO:
         # RND extension
         self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg) if rnd_cfg else None
 
+        # Style discriminators: every expert adds a reward stream with its own value head
+        if style_cfg and self.is_multi_gpu:
+            raise NotImplementedError("Style discriminators are trained per rank; multi-GPU is not supported yet.")
+        self.style = StyleDiscriminators(device=self.device, **style_cfg) if style_cfg else None
+        self.num_reward_streams = 1 + (self.style.num_experts if self.style is not None else 0)
+
         # Symmetry extension
         if symmetry_cfg is not None and (actor.is_recurrent or critic.is_recurrent or memory is not None):
             raise ValueError("Symmetry augmentation is not supported for recurrent policies (including shared memory).")
+        if symmetry_cfg is not None and encoder is not None:
+            raise ValueError("Symmetry augmentation is not supported with a shared observation encoder.")
         self.symmetry = Symmetry(**symmetry_cfg) if symmetry_cfg else None
 
         # Meta RL components
@@ -116,20 +135,16 @@ class PPO:
                 "When `meta_rl_cfg.memory` is set, actor and critic must be plain MLP heads."
             )
         self.memory: nn.Module | None = memory.to(self.device) if memory is not None else None
-        # Shared observation encoder (optional): trained by the joint PPO loss through the critic (and, unless
-        # ``encoder_cfg.detach_actor_gradients``, the actor) forward passes.
+        # Shared observation encoder (optional), trained by the joint PPO loss
         if encoder is not None and memory is not None:
             raise ValueError("A shared encoder cannot be combined with a shared memory module.")
         if encoder is not None and (actor.is_recurrent or critic.is_recurrent):
             raise ValueError("A shared encoder requires plain MLP actor/critic models.")
         self.encoder: nn.Module | None = encoder.to(self.device) if encoder is not None else None
         self.encoder_detach_actor = bool((encoder_cfg or {}).get("detach_actor_gradients", False))
-        # L2 penalty on the encoder latent, added to the joint PPO loss. 0.0 (the default) leaves the loss
-        # byte-identical to a run without it.
+        # L2 penalty on the encoder latent, added to the joint PPO loss
         self.encoder_l2_coef = float((encoder_cfg or {}).get("l2_coef", 0.0))
 
-        # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
-        # simply alias ``self.actor`` / ``self.critic`` / ``self.memory`` / ``self.encoder``.
         # A fresh residual starts as pure noise that can only jitter the frozen skills' action; at the policy-wide
         # init std it made the blend weight collapse within ~1k iterations, after which the residual got no
         # gradient. ``init_std`` starts its dims quieter. A resumed checkpoint overwrites this with its learned std.
@@ -139,6 +154,8 @@ class PPO:
                 if isinstance(module, GaussianDistribution):
                     module.set_std_(float(self.residual_reg["init_std"]), slice(a0, a1))
 
+        # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
+        # simply alias ``self.actor`` / ``self.critic`` / ``self.memory`` / ``self.encoder``.
         self._raw_actor = self.actor
         self._raw_critic = self.critic
         self._raw_memory = self.memory
@@ -166,6 +183,13 @@ class PPO:
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
+        # updates during which only the critic (and style critics) train: lets a warm-started actor keep its
+        # behaviour while fresh value heads stop feeding it garbage advantages
+        self.actor_warmup_iters = actor_warmup_iters
+        self.num_updates_done = 0
+        # per-stream record of whether a gate ever opened in the current rollout; the rewards cannot say, since
+        # the time-out bootstrap lands in every stream
+        self.style_paid = [False] * (self.num_reward_streams - 1)
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.adaptive_lr_once_per_iteration = adaptive_lr_once_per_iteration
@@ -176,15 +200,26 @@ class PPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
     def _encoder_args(self, obs: TensorDict, detach: bool = False) -> tuple[torch.Tensor, ...]:
-        """Return the encoder latent as an extra model input tuple; empty when no encoder is configured.
-
-        Returning a tuple keeps every call site a plain ``*args`` splat, so runs without an encoder pass
-        exactly the arguments they did before.
-        """
+        """Return the encoder latent as an extra model input tuple; empty when no encoder is configured."""
         if self.encoder is None:
             return ()
         latent = self.encoder(obs)
         return (latent.detach(),) if detach else (latent,)
+
+    def act_inference(self, obs: TensorDict, stochastic: bool = False) -> torch.Tensor:
+        """Actions for ``obs`` without recording a transition.
+
+        Args:
+            obs: Current observations.
+            stochastic: Sample from the policy instead of taking its mean, as a rollout does.
+
+        Returns:
+            Actions of shape ``(num_envs, num_actions)``.
+        """
+        if self.memory is not None:
+            raise NotImplementedError("act_inference does not carry a shared memory's hidden state.")
+        with torch.inference_mode():
+            return self.actor(obs, *self._encoder_args(obs, detach=True), stochastic_output=stochastic)
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
@@ -236,6 +271,8 @@ class PPO:
         self.critic.update_normalization(obs)
         if self.rnd:
             self.rnd.update_normalization(obs)
+        if self.style is not None:
+            self.style.update_normalization(obs)
 
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
@@ -259,6 +296,16 @@ class PPO:
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
+
+        # Style rewards are separate streams next to the task reward, not added to it
+        if self.style is not None:
+            # obs is the next state, which for a done env is the new episode's spawn: it scores nothing here
+            alive = (1.0 - dones.view(-1, 1).float()).to(self.device)
+            style_rewards = self.style.compute_rewards(obs) * alive
+            for k, gate in enumerate(self.style.gate_masks(obs)):
+                paid = alive.squeeze(-1) if gate is None else (gate & alive.squeeze(-1).bool())
+                self.style_paid[k] |= bool(paid.any())
+            self.transition.rewards = torch.cat([self.transition.rewards.view(-1, 1), style_rewards], dim=-1)
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
@@ -313,8 +360,18 @@ class PPO:
             st.returns[step] = advantage + st.values[step]
         # Compute the advantages
         st.advantages = st.returns - st.values
+        if self.num_reward_streams > 1:
+            # standardize every stream on its own, then combine: no hand-tuned reward scales across experts
+            adv = st.advantages
+            adv = (adv - adv.mean(dim=(0, 1), keepdim=True)) / (adv.std(dim=(0, 1), keepdim=True) + 1e-8)
+            weights = torch.ones(self.num_reward_streams, device=adv.device)
+            weights[1:] = self.style.stream_weights.to(adv.device) * self.style.weight  # type: ignore[union-attr]
+            # a stream whose gate never opened standardizes to unit-variance value noise, so it would enter the
+            # sum at full weight
+            weights[1:] *= torch.tensor(self.style_paid, device=adv.device, dtype=adv.dtype)
+            st.advantages = (adv * weights).sum(dim=-1, keepdim=True)
         # Normalize the advantages if per minibatch normalization is not used
-        if not self.normalize_advantage_per_mini_batch:
+        elif not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
@@ -413,7 +470,8 @@ class PPO:
 
                 # Per-minibatch adaptive LR
                 if (
-                    self.desired_kl is not None
+                    self.num_updates_done >= self.actor_warmup_iters
+                    and self.desired_kl is not None
                     and self.schedule == "adaptive"
                     and not self.adaptive_lr_once_per_iteration
                 ):
@@ -443,7 +501,10 @@ class PPO:
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+            if self.num_updates_done < self.actor_warmup_iters:
+                loss = self.value_loss_coef * value_loss
+            else:
+                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
             # CCRL RESIDUAL REGULARIZERS (Kumar et al., "Cascaded Compositional Residual Learning",
             # IEEE RA-L 2023, Eq. 5-7). A compositional policy with a trainable residual will, left
@@ -481,9 +542,7 @@ class PPO:
                 if self.symmetry.use_mirror_loss:
                     loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
 
-            # Encoder L2 regularizer on the latent. Uses the grad-carrying ``enc_args`` (not the possibly
-            # detached ``actor_enc_args``), so the penalty still reaches the encoder under
-            # ``detach_actor_gradients``. An encoder implies no shared memory, so the else-branch above ran.
+            # grad-carrying ``enc_args``, not ``actor_enc_args``, so the penalty survives ``detach_actor_gradients``
             if self.encoder is not None and self.encoder_l2_coef > 0.0:
                 encoder_l2_loss = enc_args[0].pow(2).mean()
                 loss = loss + self.encoder_l2_coef * encoder_l2_loss
@@ -495,6 +554,12 @@ class PPO:
             if self.rnd:
                 self.rnd.optimizer.zero_grad()
                 rnd_loss.backward()
+
+            if self.num_updates_done < self.actor_warmup_iters:
+                # the value, mirror and encoder-penalty losses all reach the actor; dropping its grads is what
+                # keeps Adam from stepping it on carried momentum
+                for param in self.actor.parameters():
+                    param.grad = None
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
@@ -539,7 +604,13 @@ class PPO:
         num_updates = self.num_learning_epochs * self.num_mini_batches
 
         # Adapt the LR once per iteration
-        if self.desired_kl is not None and self.schedule == "adaptive" and self.adaptive_lr_once_per_iteration:
+        warming_up = self.num_updates_done < self.actor_warmup_iters
+        if (
+            not warming_up
+            and self.desired_kl is not None
+            and self.schedule == "adaptive"
+            and self.adaptive_lr_once_per_iteration
+        ):
             mean_kl_iter = sum_kl / num_updates
             if self.gpu_global_rank == 0:
                 if mean_kl_iter > self.desired_kl * 2.0:
@@ -553,6 +624,7 @@ class PPO:
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.learning_rate
 
+        self.num_updates_done += 1
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
@@ -589,8 +661,18 @@ class PPO:
         if mean_residual_loss is not None:
             loss_dict["residual_reg"] = mean_residual_loss
 
+        # Train the style discriminators on this rollout's policy states before the storage is cleared
+        if self.style is not None:
+            flat_obs = self.storage.observations.flatten(0, 1)
+            policy_states = self.style.get_style_state(flat_obs).to(self.device)
+            loss_dict.update(self.style.update(policy_states, self.style.gate_masks(flat_obs)))
+            for k, name in enumerate(self.style.names):
+                loss_dict[f"Style/{name}_reward"] = self.storage.rewards[..., 1 + k].mean().item()
+            loss_dict["Style/weight"] = self.style.weight
+
         # Clear the storage
         self.storage.clear()
+        self.style_paid = [False] * (self.num_reward_streams - 1)
 
         return loss_dict
 
@@ -604,6 +686,8 @@ class PPO:
             self.encoder.train()
         if self.rnd:
             self.rnd.train()
+        if self.style is not None:
+            self.style.train()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -615,6 +699,8 @@ class PPO:
             self.encoder.eval()
         if self.rnd:
             self.rnd.eval()
+        if self.style is not None:
+            self.style.eval()
 
     def eval(
         self, env: VecEnv, max_steps: int = 200, stochastic: bool = False, action_repeat: int = 1
@@ -697,10 +783,18 @@ class PPO:
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
+        # the actor warm-up counts updates, so a resume must not restart the freeze
+        saved_dict["num_updates_done"] = self.num_updates_done
+        if self.style is not None:
+            saved_dict["style_state_dict"] = self.style.state_dict()
+            saved_dict["style_optimizer_state_dict"] = self.style.optimizer.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
-        """Load specified models from a saved dict."""
+        """Load specified models from a saved dict.
+
+        A partial ``load_cfg`` loads the style modules only when it sets ``style``; the full default sets it.
+        """
         # If no load_cfg is provided, load all models and states
         if load_cfg is None:
             load_cfg = {
@@ -710,6 +804,7 @@ class PPO:
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
+                "style": True,
             }
 
         # Load the specified models
@@ -720,11 +815,12 @@ class PPO:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("memory") and self.memory is not None and "memory_state_dict" in loaded_dict:
             self._raw_memory.load_state_dict(loaded_dict["memory_state_dict"], strict=strict)
-        # Deliberately NOT gated on a load_cfg key: the encoder is part of the actor's input pipeline, not a
-        # resume-only model like the critic/optimizer. Callers pass partial load_cfgs for inference (e.g.
-        # ``{"actor": True}`` in play.py); gating this would silently run a randomly-initialized encoder.
-        if self._raw_encoder is not None and "encoder_state_dict" in loaded_dict:
-            self._raw_encoder.load_state_dict(loaded_dict["encoder_state_dict"], strict=strict)
+        # not gated on load_cfg: the encoder is part of the actor's input, so inference-only loads need it too
+        if self._raw_encoder is not None:
+            if "encoder_state_dict" in loaded_dict:
+                self._raw_encoder.load_state_dict(loaded_dict["encoder_state_dict"], strict=strict)
+            elif strict:
+                raise KeyError("Checkpoint has no encoder_state_dict for this encoder policy.")
         if load_cfg.get("optimizer") and "optimizer_state_dict" in loaded_dict:
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             # The adaptive schedule writes ``self.learning_rate`` into the optimizer on every minibatch, so it has
@@ -734,6 +830,12 @@ class PPO:
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        if load_cfg.get("iteration", False):
+            self.num_updates_done = int(loaded_dict.get("num_updates_done", 0))
+        if load_cfg.get("style", False) and self.style is not None and "style_state_dict" in loaded_dict:
+            self.style.load_state_dict(loaded_dict["style_state_dict"], strict=strict)
+            if load_cfg.get("optimizer") and "style_optimizer_state_dict" in loaded_dict:
+                self.style.optimizer.load_state_dict(loaded_dict["style_optimizer_state_dict"])
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> nn.Module:
@@ -767,6 +869,8 @@ class PPO:
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPO:
         """Construct the PPO algorithm."""
+        # resolve on a copy: the runner logs the cfg it was given
+        cfg = copy.deepcopy(cfg)
         # Resolve class callables
         alg_class: type[PPO] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
         actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
@@ -775,20 +879,26 @@ class PPO:
         # Optional shared memory config
         meta_rl_cfg = cfg["algorithm"].get("meta_rl_cfg")
         shared_memory_cfg: dict | None = meta_rl_cfg.get("memory") if isinstance(meta_rl_cfg, dict) else None
-        # Optional shared observation encoder config. Read with ``.get`` (NOT ``.pop``): it must also reach
-        # ``__init__`` through the ``**cfg["algorithm"]`` splat below.
+        # ``.get``, not ``.pop``: ``__init__`` also receives it through the ``**cfg["algorithm"]`` splat below
         encoder_cfg: dict | None = cfg["algorithm"].get("encoder_cfg")
 
-        # Resolve observation groups ("encoder" resolves only on encoder runs, so plain runs are untouched)
+        # Resolve observation groups
         default_sets = ["actor", "critic"]
         if encoder_cfg is not None:
             default_sets.append("encoder")
         if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
+        style_cfg: dict | None = cfg["algorithm"].get("style_cfg")
+        if style_cfg is not None:
+            default_sets.append("style")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
 
         # Resolve RND config if used
         cfg["algorithm"] = resolve_rnd_config(cfg["algorithm"], obs, cfg["obs_groups"], env)
+
+        # Resolve the style discriminator config if used; one value head per reward stream
+        cfg["algorithm"] = resolve_style_config(cfg["algorithm"], obs, cfg["obs_groups"])
+        num_reward_streams = 1 + (len(style_cfg["experts"]) if style_cfg is not None else 0)
 
         # Resolve symmetry config if used
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
@@ -806,8 +916,7 @@ class PPO:
             critic_head_kwargs["input_dim_override"] = memory.latent_dim  # type: ignore[attr-defined]
             critic_head_kwargs["append_obs_groups"] = True
 
-        # Build the optional shared encoder; its latent is an extra input to both heads (other_input_dims),
-        # concatenated after each head's own normalized observations.
+        # Build the optional shared encoder; its latent is appended to both heads' inputs
         encoder: nn.Module | None = None
         if encoder_cfg is not None:
             encoder_model_cfg = dict(encoder_cfg["model"])
@@ -825,9 +934,9 @@ class PPO:
         print(f"Actor Model: {actor}")
         if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
             cfg["critic"]["cnns"] = actor.cnns  # type: ignore
-        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_head_kwargs, **cfg["critic"]).to(
-            device
-        )
+        critic: MLPModel = critic_class(
+            obs, cfg["obs_groups"], "critic", num_reward_streams, **critic_head_kwargs, **cfg["critic"]
+        ).to(device)
         print(f"Critic Model: {critic}")
 
         # Initialize the storage. Use "meta_rl" when meta-RL is configured so the trajectory generator splits
@@ -837,7 +946,13 @@ class PPO:
         if storage_device is None:
             storage_device = device
         storage = RolloutStorage(
-            training_type, env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], storage_device
+            training_type,
+            env.num_envs,
+            cfg["num_steps_per_env"],
+            obs,
+            [env.num_actions],
+            storage_device,
+            num_reward_streams=num_reward_streams,
         )
 
         # Initialize the algorithm

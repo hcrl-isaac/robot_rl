@@ -5,6 +5,7 @@ import math
 import os
 import torch
 import torch.nn as nn
+from collections.abc import Callable
 from tensordict import TensorDict
 from typing import Any
 
@@ -488,7 +489,13 @@ class FbCpr:
             self.apply_eval_outputs({"motion_priorities": self.motion_priorities(result["emd"])})
         return [{"emd": result["emd"].cpu(), "joint_error": result["joint_error"].cpu()}]
 
-    def eval_motions(self, env: URLVecEnv, max_steps: int | None = None) -> dict[str, torch.Tensor]:
+    def eval_motions(
+        self,
+        env: URLVecEnv,
+        max_steps: int | None = None,
+        emd_joint_ids: list[int] | None = None,
+        on_step: Callable[[torch.Tensor, int], None] | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Track every expert motion from its first frame and score it; the expert buffer is not modified.
 
         Each motion is driven by ``z_t = B(obs_{t+1})`` with no termination guard, in a random env assignment
@@ -497,6 +504,8 @@ class FbCpr:
         Args:
             env: Vectorized environment to replay the expert motions in.
             max_steps: Stop after this many ``env.step`` calls; unscored motions keep NaN.
+            emd_joint_ids: Joints for an extra EMD over only them (``emd_subset``), e.g. the body without the neck.
+            on_step: Called after every step with the motion ids of the batch's first envs and the step index.
 
         Returns:
             emd: Per-motion EMD, shape ``(num_motions,)``.
@@ -508,6 +517,7 @@ class FbCpr:
                 ``(num_motions, bucket_size - 1, 2)``.
             heading_error: Per-step heading change since the clip's start minus the reference's [rad], wrapped,
                 ``(num_motions, bucket_size - 1)``.
+            emd_subset: Per-motion EMD over ``emd_joint_ids`` alone, when given.
         """
         print("[INFO] Evaluating motions...")
         self.eval_mode()
@@ -517,6 +527,7 @@ class FbCpr:
         rollout_steps = buffer.bucket_size - 1
         emd = torch.full((buffer.num_motions,), float("nan"), device=self.device)
         joint_error = torch.full_like(emd, float("nan"))
+        emd_subset = torch.full_like(emd, float("nan"))
         root_error = torch.full((buffer.num_motions, rollout_steps), float("nan"), device=self.device)
         tilt_error = torch.full_like(root_error, float("nan"))
         root_drift = torch.full((buffer.num_motions, rollout_steps, 2), float("nan"), device=self.device)
@@ -557,6 +568,8 @@ class FbCpr:
                     publish_ref(ghost_root[:, t + 1], ref_joint_pos[:, t + 1], ref_joint_vel[:, t + 1])
                 actions = pad_to_size(self.actor(self.obs_normalizer(obs), eval_zs[:, t, :]), env.num_envs, dim=0)
                 obs, _, _, _ = env.step(actions.to(env.device))
+                if on_step is not None:
+                    on_step(ids, t)
                 state = buffer.get_expert_state(obs)
                 qpos[:, t] = state["joint_position"][:batch].to(self.device)
                 root[:, t] = state["root_pose"][:batch, :3].to(self.device)
@@ -581,6 +594,9 @@ class FbCpr:
             tilt_error[ids, :steps] = torch.acos(cos)
             joint_error[ids] = (qpos[:, :steps] - ref_qpos).norm(dim=-1).mean(dim=-1)
             emd[ids] = torch.stack([compute_emd(qpos[i, :steps], ref_qpos[i]) for i in range(batch)])
+            if emd_joint_ids is not None:
+                sub = qpos[:, :steps, emd_joint_ids], ref_qpos[..., emd_joint_ids]
+                emd_subset[ids] = torch.stack([compute_emd(sub[0][i], sub[1][i]) for i in range(batch)])
             if max_steps is not None and steps_done >= max_steps:
                 break
 
@@ -594,6 +610,7 @@ class FbCpr:
             "tilt_error": tilt_error,
             "root_drift": root_drift,
             "heading_error": heading_error,
+            **({"emd_subset": emd_subset} if emd_joint_ids is not None else {}),
         }
 
     @staticmethod

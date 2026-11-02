@@ -145,9 +145,11 @@ class WorldModelLearner:
             reduce: Gradient averaging and clipping applied before each step.
 
         Returns:
-            Mean losses under ``world_model/``, or ``world_model/skipped`` when no window fits yet.
+            Mean losses under ``world_model/`` as detached tensors (no host sync), or ``world_model/skipped`` when no
+            window fits yet.
         """
-        sums = {"state": 0.0, "reward": 0.0, "obs": 0.0, "termination": 0.0, "k_step_error": 0.0}
+        zero = torch.zeros((), device=self.device)
+        sums = {"state": zero, "reward": zero, "obs": zero, "termination": zero, "k_step_error": zero}
         k, done = self.wm_window, 0
         wm = self.world_model
         for _ in range(self.wm_mini_batches):
@@ -186,14 +188,16 @@ class WorldModelLearner:
             loss.backward()
             reduce(self.world_model.parameters())
             self.optimizer.step()
-            sums["state"] += state_loss.item() / k
-            sums["reward"] += reward_loss.item() / k
-            sums["obs"] += obs_loss.item() / k
-            sums["termination"] += term_loss.item() / k
-            sums["k_step_error"] += ((err * last_mask).sum() / last_mask.sum().clamp(min=1)).item()
+            sums["state"] = sums["state"] + state_loss.detach() / k
+            sums["reward"] = sums["reward"] + reward_loss.detach() / k
+            sums["obs"] = sums["obs"] + obs_loss.detach() / k
+            sums["termination"] = sums["termination"] + term_loss.detach() / k
+            sums["k_step_error"] = (
+                sums["k_step_error"] + ((err * last_mask).sum() / last_mask.sum().clamp(min=1)).detach()
+            )
             done += 1
         if done == 0:
-            return {"world_model/skipped": 1.0}
+            return {"world_model/skipped": torch.ones((), device=self.device)}
         return {f"world_model/{key}": v / done for key, v in sums.items()}
 
     """

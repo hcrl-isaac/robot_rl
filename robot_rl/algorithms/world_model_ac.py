@@ -190,7 +190,7 @@ class WorldModelAC:
             self.update_step += 1
             for k, v in out.items():
                 logs.setdefault(k, []).append(v)
-        return {k: sum(v) / len(v) for k, v in logs.items()}
+        return {k: float(sum(v) / len(v)) for k, v in logs.items()}
 
     def _imagine_from_replay(self) -> Rollout | None:
         """Draw start states from replay and imagine ``H`` steps under the actor (None when no start is available)."""

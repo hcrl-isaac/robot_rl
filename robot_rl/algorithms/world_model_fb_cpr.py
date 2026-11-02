@@ -108,7 +108,8 @@ class WorldModelFbCpr(FbCpr):
 
     def update(self) -> tuple[dict[str, torch.Tensor], dict]:
         """Run FB-CPR's replay updates, fit the world model, then update the actor through imagination."""
-        win = self.learner.replay_buffer.sample_transitions(self.batch_size, device=self.device)
+        with torch.profiler.record_function("wm_fbcpr/sample"):
+            win = self.learner.replay_buffer.sample_transitions(self.batch_size, device=self.device)
         if win is None:
             return {"Actor_Loss/skipped": torch.ones(())}, {}
         starts = win.obs[0]
@@ -125,25 +126,28 @@ class WorldModelFbCpr(FbCpr):
             expert_next_obs = self.obs_normalizer(expert_next_obs)
 
         torch.compiler.cudagraph_mark_step_begin()
-        expert_z = self._encode_expert(expert_next_obs)
-        disc_loss, disc_extras = self._update_discriminator(batch, expert_obs, expert_z)
-        z = self._sample_mixed_z(batch.next_observations, expert_z)
-        self.z_buffer.add(z)
-        relabel_mask = torch.rand(self.batch_size, 1, device=self.device) < self.z_relabel_ratio
-        batch.context = torch.where(relabel_mask, z, batch.context)
-        batch.rewards = self.aux_reward_normalizer(batch.rewards)
-        fb_loss, fb_extras = self._update_forward_backward(batch)
-        disc_critic_loss, disc_critic_extras = self._update_disc_critic(batch)
-        aux_critic_loss, aux_critic_extras = self._update_aux_critic(batch)
+        with torch.profiler.record_function("wm_fbcpr/fb_cpr_updates"):
+            expert_z = self._encode_expert(expert_next_obs)
+            disc_loss, disc_extras = self._update_discriminator(batch, expert_obs, expert_z)
+            z = self._sample_mixed_z(batch.next_observations, expert_z)
+            self.z_buffer.add(z)
+            relabel_mask = torch.rand(self.batch_size, 1, device=self.device) < self.z_relabel_ratio
+            batch.context = torch.where(relabel_mask, z, batch.context)
+            batch.rewards = self.aux_reward_normalizer(batch.rewards)
+            fb_loss, fb_extras = self._update_forward_backward(batch)
+            disc_critic_loss, disc_critic_extras = self._update_disc_critic(batch)
+            aux_critic_loss, aux_critic_extras = self._update_aux_critic(batch)
 
-        wm_logs = self.learner.fit(self._reduce_and_clip_wm)
+        with torch.profiler.record_function("wm_fbcpr/world_model_fit"):
+            wm_logs = self.learner.fit(self._reduce_and_clip_wm)
         imagined = self.update_step >= self.actor_start_update and self.update_step % self.imagined_actor_interval == 0
         horizon = self.learner.horizon if imagined else 0
         z = batch.context.clone()
         if horizon > 0 and self.num_imagined is not None and self.num_imagined < self.batch_size:
             rows = torch.randperm(self.batch_size, device=self.device)[: self.num_imagined]
             starts, z = starts[rows], z[rows]
-        actor_loss, actor_extras = self._update_imagined_actor(starts, z, batch.next_observations, horizon)
+        with torch.profiler.record_function("wm_fbcpr/imagined_actor"):
+            actor_loss, actor_extras = self._update_imagined_actor(starts, z, batch.next_observations, horizon)
         self.update_step += 1
 
         loss_dict = {**disc_loss, **fb_loss, **disc_critic_loss, **aux_critic_loss, **actor_loss}
@@ -152,7 +156,7 @@ class WorldModelFbCpr(FbCpr):
             self._soft_update_targets()
             loss_dict = {k: v.clone() for k, v in loss_dict.items()}
             extras = {k: v.clone() for k, v in extras.items()}
-        loss_dict.update({k: torch.tensor(v) for k, v in wm_logs.items()})
+        loss_dict.update(wm_logs)
         return loss_dict, extras
 
     def _update_imagined_actor(

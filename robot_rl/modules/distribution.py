@@ -1014,6 +1014,7 @@ class VonMisesFisherTanhGaussianDistribution(Distribution):
         tail_learn_std: bool = True,
         tail_low: float = -1.0,
         tail_high: float = 1.0,
+        state_dependent_kappa: bool = False,
     ) -> None:
         """Initialize both parts.
 
@@ -1027,20 +1028,29 @@ class VonMisesFisherTanhGaussianDistribution(Distribution):
             tail_learn_std: Whether the tail's std is learnable.
             tail_low: Lower bound of the tail actions.
             tail_high: Upper bound of the tail actions.
+            state_dependent_kappa: Whether the vMF part reads its ``log kappa`` from the network per state.
         """
         super().__init__(output_dim)
         self.head_dim = output_dim - tail_dim
-        self.head = VonMisesFisherDistribution(self.head_dim, init_std, learn_std, kappa_range)
+        self.head = VonMisesFisherDistribution(
+            self.head_dim, init_std, learn_std, kappa_range, state_dependent_kappa=state_dependent_kappa
+        )
         self.tail = SquashedTanhGaussianDistribution(
             tail_dim, tail_init_noise_std, learn_std=tail_learn_std, low=tail_low, high=tail_high
         )
 
     def _split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split an action into its vMF and tail parts."""
         return x[..., : self.head_dim], x[..., self.head_dim :]
+
+    def _split_mlp(self, mlp_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split the network output into the vMF part's inputs (with a per-state ``log kappa``) and the tail's."""
+        width = self.head.input_dim
+        return mlp_output[..., :width], mlp_output[..., width:]
 
     def update(self, mlp_output: torch.Tensor) -> None:
         """Update the vMF part from the leading outputs and the squashed Gaussian from the trailing ones."""
-        head, tail = self._split(mlp_output)
+        head, tail = self._split_mlp(mlp_output)
         self.head.update(head)
         self.tail.update(tail)
 
@@ -1056,19 +1066,32 @@ class VonMisesFisherTanhGaussianDistribution(Distribution):
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Return the vMF mean direction joined with the squashed tail mean."""
-        head, tail = self._split(mlp_output)
+        head, tail = self._split_mlp(mlp_output)
         return torch.cat([self.head.deterministic_output(head), self.tail.deterministic_output(tail)], dim=-1)
 
     def as_deterministic_output_module(self) -> nn.Module:
         """Export module applying each part's deterministic output to its slice."""
         return _SplitDeterministicOutput(
-            self.head_dim, self.head.as_deterministic_output_module(), self.tail.as_deterministic_output_module()
+            self.head.input_dim, self.head.as_deterministic_output_module(), self.tail.as_deterministic_output_module()
         )
 
     @property
     def input_dim(self) -> int:
-        """The MLP outputs the raw vMF direction then the tail's pre-squash mean."""
-        return self.output_dim
+        """The MLP outputs the raw vMF direction (and its ``log kappa``) then the tail's pre-squash mean."""
+        return self.head.input_dim + self.tail.input_dim
+
+    @classmethod
+    def output_dim_for_input_width(cls, width: int) -> int:
+        """Return the action dimension for a ``width``-wide output; not inferable when kappa is per state."""
+        return width
+
+    def init_mlp_weights(self, mlp: nn.Module) -> None:
+        """Initialize only the vMF part's per-state ``log kappa`` row, which sits right after its direction."""
+        if self.head.state_dependent_kappa:
+            last = [m for m in mlp.modules() if isinstance(m, nn.Linear)][-1]
+            row = slice(self.head_dim, self.head_dim + 1)
+            torch.nn.init.zeros_(last.weight[row])
+            torch.nn.init.constant_(last.bias[row], self.head.init_log_kappa)
 
     @property
     def mean(self) -> torch.Tensor:

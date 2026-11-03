@@ -233,6 +233,7 @@ class TestHeadReadsFeatures:
 
     @pytest.mark.parametrize("rnn_type", ["gru", "lstm"])
     def test_head_width_and_exports(self, rnn_type: str) -> None:
+        """With head_reads_features the head reads features and recurrent output; both exports match eager."""
         obs = make_obs(1, OBS_DIM)
         model = RNNModel(
             obs,

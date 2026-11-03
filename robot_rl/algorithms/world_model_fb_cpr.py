@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from dataclasses import dataclass
 from tensordict import TensorDict
 from typing import Any
 
@@ -13,6 +14,26 @@ from robot_rl.algorithms.world_model_learner import Rollout, WorldModelLearner
 from robot_rl.env import URLVecEnv
 from robot_rl.storage import ReplayBuffer, SequenceReplayBuffer
 from robot_rl.utils import compute_td_targets, eval_mode
+
+
+@dataclass
+class CriticExpansion:
+    """k-step critic targets from a world-model rollout started at each transition's real next state."""
+
+    obs: TensorDict
+    """Normalized observations at the bootstrap state ``s_{k-1}``."""
+
+    gammas: torch.Tensor
+    """Bootstrap discount ``gamma^k`` (zero past a real termination), ``(B, 1)``."""
+
+    credit: torch.Tensor
+    """``sum_{i=1}^{k-1} gamma^i B(s_i)`` over the imagined states, detached, ``(B, z_dim)``."""
+
+    disc_rewards: torch.Tensor
+    """``sum_{i=1}^{k-1} gamma^i r_D(s_{i-1})``, ``(B, 1)``."""
+
+    aux_rewards: torch.Tensor
+    """``sum_{i=1}^{k-1} gamma^i r_{i-1}`` (the world model's reward head), at the aux critic's scale, ``(B, 1)``."""
 
 
 class WorldModelFbCpr(FbCpr):
@@ -43,6 +64,10 @@ class WorldModelFbCpr(FbCpr):
         actor_grad_clip_value: float | None = 0.1,
         tf32: bool = True,
         imagination_compile_mode: str | None = "max-autotune",
+        mve_k: int = 1,
+        mage_beta: float = 0.0,
+        mage_action: str = "policy",
+        critic_model_start_update: int = 0,
         **kwargs: Any,
     ) -> None:
         """Initialize the algorithm.
@@ -57,9 +82,23 @@ class WorldModelFbCpr(FbCpr):
             actor_grad_clip_value: Element-wise clip of the imagined actor gradients after the norm clip.
             tf32: Allow TF32 matmuls (a process-wide torch setting).
             imagination_compile_mode: ``torch.compile`` mode of the imagined loss; None runs it eagerly.
+            mve_k: Steps of the critics' targets: the real next state plus ``k - 1`` imagined ones (1 = FB-CPR's).
+            mage_beta: Weight of the critics' action-gradient (MAGE) loss through the world model (0 = off).
+            mage_action: Where MAGE differentiates: ``"policy"`` (the actor's action) or ``"buffer"`` (the logged one).
+            critic_model_start_update: Updates before MVE and MAGE start (the world model's warm-up).
             **kwargs: :class:`FbCpr` keyword arguments.
         """
         super().__init__(*args, **kwargs)
+        if mve_k < 1:
+            raise ValueError(f"mve_k must be at least 1, got {mve_k}.")
+        if mve_k > 1 and self.value_loss_coef > 0:
+            raise ValueError("mve_k > 1 does not expand the F value regularizer's target; set value_loss_coef = 0.")
+        if mage_action not in ("policy", "buffer"):
+            raise ValueError(f"mage_action must be 'policy' or 'buffer', got '{mage_action}'.")
+        self.mve_k = mve_k
+        self.mage_beta = mage_beta
+        self.mage_action = mage_action
+        self.critic_model_start_update = critic_model_start_update
         self.learner = learner
         self.world_model = learner.world_model
         self.num_imagined = num_imagined
@@ -134,9 +173,19 @@ class WorldModelFbCpr(FbCpr):
             relabel_mask = torch.rand(self.batch_size, 1, device=self.device) < self.z_relabel_ratio
             batch.context = torch.where(relabel_mask, z, batch.context)
             batch.rewards = self.aux_reward_normalizer(batch.rewards)
-            fb_loss, fb_extras = self._update_forward_backward(batch)
-            disc_critic_loss, disc_critic_extras = self._update_disc_critic(batch)
-            aux_critic_loss, aux_critic_extras = self._update_aux_critic(batch)
+            fb_kwargs, disc_kwargs, aux_kwargs, model_extras = self._model_critic_inputs(win, batch)
+            if "forward" in model_extras:
+                fb_kwargs["keep_grads"] = True
+            fb_loss, fb_extras = self._update_forward_backward(batch, **fb_kwargs)
+            if self._mage_on():
+                model_extras.update(self._mage_backward("disc", win, batch))
+                disc_kwargs["keep_grads"] = True
+            disc_critic_loss, disc_critic_extras = self._update_disc_critic(batch, **disc_kwargs)
+            if self._mage_on():
+                model_extras.update(self._mage_backward("aux", win, batch))
+                aux_kwargs["keep_grads"] = True
+            aux_critic_loss, aux_critic_extras = self._update_aux_critic(batch, **aux_kwargs)
+            model_extras.pop("forward", None)
 
         with torch.profiler.record_function("wm_fbcpr/world_model_fit"):
             wm_logs = self.learner.fit(self._reduce_and_clip_wm)
@@ -151,13 +200,159 @@ class WorldModelFbCpr(FbCpr):
         self.update_step += 1
 
         loss_dict = {**disc_loss, **fb_loss, **disc_critic_loss, **aux_critic_loss, **actor_loss}
-        extras = {**disc_extras, **fb_extras, **disc_critic_extras, **aux_critic_extras, **actor_extras}
+        extras = {**disc_extras, **fb_extras, **disc_critic_extras, **aux_critic_extras, **actor_extras, **model_extras}
         with torch.no_grad():
             self._soft_update_targets()
             loss_dict = {k: v.clone() for k, v in loss_dict.items()}
             extras = {k: v.clone() for k, v in extras.items()}
         loss_dict.update(wm_logs)
         return loss_dict, extras
+
+    """
+    World-model critics.
+    """
+
+    def _mage_on(self) -> bool:
+        return self.mage_beta > 0 and self.update_step >= self.critic_model_start_update
+
+    def _model_critic_inputs(
+        self, win: SequenceReplayBuffer.Window, batch: ReplayBuffer.Batch
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, torch.Tensor]]:
+        """Return the FB, discriminator-critic and aux-critic update arguments for MVE, after MAGE's F gradient if on.
+
+        Args:
+            win: The update's one-step replay windows (raw observations).
+            batch: The same transitions, normalized, with their latents and normalized aux rewards.
+
+        Returns:
+            The three updates' keyword arguments and the logged diagnostics (``"forward"`` marks a MAGE gradient
+            already accumulated on F).
+        """
+        fb_kwargs: dict[str, Any] = {}
+        disc_kwargs: dict[str, Any] = {}
+        aux_kwargs: dict[str, Any] = {}
+        extras: dict[str, torch.Tensor] = {}
+        if self.update_step < self.critic_model_start_update:
+            return fb_kwargs, disc_kwargs, aux_kwargs, extras
+        if self.mve_k > 1:
+            exp = self._critic_expansion(win.obs[1], batch)
+            fb_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, credit_backward=exp.credit)
+            disc_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, extra_rewards=exp.disc_rewards)
+            aux_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, extra_rewards=exp.aux_rewards)
+            extras["mve_fb_credit_norm"] = exp.credit.norm(dim=-1).mean()
+            extras["mve_disc_reward"] = exp.disc_rewards.mean()
+            extras["mve_aux_reward"] = exp.aux_rewards.mean()
+        if self._mage_on():
+            extras.update(self._mage_backward("forward", win, batch))
+            extras["forward"] = torch.ones(())
+        return fb_kwargs, disc_kwargs, aux_kwargs, extras
+
+    @torch.no_grad()
+    def _critic_expansion(self, next_raw: TensorDict, batch: ReplayBuffer.Batch) -> CriticExpansion:
+        """Roll ``k - 1`` steps from each real next state under the current policy and sum the critics' rewards.
+
+        Args:
+            next_raw: The transitions' real next states, raw, ``(B, ...)``.
+            batch: The same transitions, normalized, with their latents.
+
+        Returns:
+            The expanded targets' pieces (rewards at imagined states; ``B`` there detached).
+        """
+        k, n, z = self.mve_k, self.batch_size, batch.context
+        alive = (batch.gammas > 0).float()
+
+        def policy(raw: TensorDict) -> torch.Tensor:
+            return self.actor(self._normalize(raw), z, stochastic_output=True, std_clip=self.clip_actor_std)
+
+        with torch.autocast(device_type=self.device, dtype=self.dtype):
+            goals = self.learner.start_goals(next_raw, k - 1)
+            rollout = self.learner.imagine(policy, next_raw, goals, self.learner.noise_bank(), horizon=k - 1)
+            norm = self._normalize(torch.stack(rollout.obs).reshape(-1)).reshape(k, n)
+            weights = self.gamma ** torch.arange(1, k, device=self.device, dtype=torch.float32)
+            B_imag = self.backward_map(norm[1:].reshape(-1)).float().view(k - 1, n, -1)
+            credit = (weights[:, None, None] * B_imag).sum(dim=0) * alive
+            eps = self.discriminator_reward_eps
+            logits = self.discriminator(norm[: k - 1].reshape(-1), z.repeat(k - 1, 1)).view(k - 1, n)
+            logits = logits.clamp(eps, 1 - eps)
+            r_disc = torch.log(logits) - torch.log(1 - logits)
+            r_aux = rollout.rewards * self.aux_reward_normalizer.S.sqrt().reciprocal()
+            return CriticExpansion(
+                obs=norm[k - 1],
+                gammas=(self.gamma**k) * alive,
+                credit=credit,
+                disc_rewards=(weights[:, None] * r_disc).sum(dim=0, keepdim=True).T * alive,
+                aux_rewards=(weights[:, None] * r_aux).sum(dim=0, keepdim=True).T * alive,
+            )
+
+    def _mage_backward(
+        self, critic: str, win: SequenceReplayBuffer.Window, batch: ReplayBuffer.Batch
+    ) -> dict[str, torch.Tensor]:
+        """Accumulate ``mage_beta`` E||∂δ/∂a||² on one critic's gradients (its optimizer's gradients reset first).
+
+        δ is the critic's one-step TD residual with the next state from one differentiable world-model step, so the
+        model's action Jacobian shapes the critic's action slope. Only the trained critic gets gradient.
+
+        Args:
+            critic: ``"forward"`` (F, through ``F^T z`` and B's implicit reward), ``"disc"`` or ``"aux"``.
+            win: The update's one-step replay windows (raw observations).
+            batch: The same transitions, normalized, with their latents and normalized aux rewards.
+
+        Returns:
+            The mean action-gradient norm, for logging.
+        """
+        trained, optimizer = {
+            "forward": (self.forward_map, self.forward_optimizer),
+            "disc": (self.disc_critic, self.disc_critic_optimizer),
+            "aux": (self.aux_critic, self.aux_critic_optimizer),
+        }[critic]
+        frozen = [self.actor, self.backward_map, self.discriminator, self.world_model]
+        frozen += [m for m in (self.forward_map, self.disc_critic, self.aux_critic) if m is not trained]
+        for net in frozen:
+            net.requires_grad_(False)
+        z, obs, alive = batch.context, batch.observations, (batch.gammas > 0).float().squeeze(-1)
+        with torch.autocast(device_type=self.device, dtype=self.dtype):
+            if self.mage_action == "policy":
+                with torch.no_grad():
+                    action = self.actor(obs, z, stochastic_output=True, std_clip=self.clip_actor_std)
+            else:
+                action = batch.actions
+            action = action.detach().clone().requires_grad_(True)
+            starts = win.obs[0]
+            goals = self.learner.start_goals(starts, 1)
+            step = self.learner.imagine(
+                lambda _: action, starts, goals, self.learner.noise_bank(), freeze_model=False, horizon=1
+            )
+            next_raw = step.obs[1]
+            if self.mage_action == "buffer":
+                # the real next state's value, the model's derivative
+                next_raw = win.obs[1].select(*next_raw.keys()) + (next_raw - next_raw.detach())
+            next_obs = self._normalize(next_raw)
+            next_action = self.actor(next_obs, z)
+            if critic == "forward":
+                q = (self.forward_map(obs, z, action) * z).sum(dim=-1)
+                with torch.no_grad():
+                    reward_z = self._implicit_reward_weights(batch.next_observations, z)
+                reward = (self.backward_map(next_obs).float() * reward_z).sum(dim=-1)
+                q_next = (self.target_forward_map.target(next_obs, z, next_action) * z).sum(dim=-1).mean(dim=0)
+            elif critic == "disc":
+                q = self.disc_critic(obs, z, action).squeeze(-1)
+                reward = torch.zeros_like(alive)
+                q_next = self.target_disc_critic.target(next_obs, z, next_action).squeeze(-1).mean(dim=0)
+            else:
+                q = self.aux_critic(obs, z, action).squeeze(-1)
+                reward = step.rewards[0] * self.aux_reward_normalizer.S.sqrt().reciprocal()
+                q_next = self.target_aux_critic.target(next_obs, z, next_action).squeeze(-1).mean(dim=0)
+            delta = q - (reward + self.gamma * alive * q_next)
+            sq = torch.stack([
+                torch.autograd.grad(delta[p].sum(), action, create_graph=True)[0].pow(2).sum(dim=-1)
+                for p in range(delta.shape[0])
+            ]).mean()
+            loss = self.mage_beta * sq
+        optimizer.zero_grad()
+        loss.backward()
+        for net in frozen:
+            net.requires_grad_(True)
+        return {f"mage_{critic}_action_grad": sq.detach().sqrt()}
 
     def _update_imagined_actor(
         self, starts: TensorDict, z: torch.Tensor, cov_obs: TensorDict, horizon: int

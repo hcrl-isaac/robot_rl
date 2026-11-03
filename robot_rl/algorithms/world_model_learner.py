@@ -231,11 +231,12 @@ class WorldModelLearner:
             goals = win.obs.select(*self.spec.goal_groups)[: H + 1] if self.spec.goal_groups else None
         return starts, goals, self.noise_bank(), row_extras
 
-    def start_goals(self, starts: TensorDict) -> TensorDict | None:
+    def start_goals(self, starts: TensorDict, horizon: int | None = None) -> TensorDict | None:
         """Return the goal groups at steps ``0 .. H`` after arbitrary start rows (None when the spec has none).
 
         Args:
             starts: Logged rows, ``(B, ...)``.
+            horizon: Steps ahead; None is the learner's ``imagination_horizon``.
 
         Returns:
             The goals, ``(H + 1, B, ...)``, recomputed by the goal provider.
@@ -244,7 +245,7 @@ class WorldModelLearner:
             return None
         if self.goal_provider is None:
             raise ValueError("Imagining from arbitrary replay rows needs a goal provider (the spec's goal_key_group).")
-        return self.provided_goals(starts[self.spec.goal_key_group], self.horizon)
+        return self.provided_goals(starts[self.spec.goal_key_group], self.horizon if horizon is None else horizon)
 
     def noise_bank(self) -> dict[str, torch.Tensor]:
         """Sensor-noise rows per group, drawn from logged rows (see :meth:`ImaginedObservation.noise_bank`)."""
@@ -258,6 +259,7 @@ class WorldModelLearner:
         goals: TensorDict | None,
         noise_bank: dict[str, torch.Tensor],
         freeze_model: bool = True,
+        horizon: int | None = None,
     ) -> Rollout:
         """Roll ``policy`` ``H`` steps through the world model (its parameters frozen; the graph reaches the policy).
 
@@ -267,11 +269,12 @@ class WorldModelLearner:
             goals: The goal groups at steps ``0 .. H``, ``(H + 1, B, ...)`` (None without goals).
             noise_bank: Sensor-noise rows per group, from :meth:`noise_bank`.
             freeze_model: Freeze the model's parameters for the rollout; a compiled caller freezes it outside instead.
+            horizon: Imagined steps; None is the learner's ``imagination_horizon``.
 
         Returns:
             The rollout, attached to the policy's graph.
         """
-        wm, H = self.world_model, self.horizon
+        wm, H = self.world_model, self.horizon if horizon is None else horizon
         B = starts.batch_size[0]
         if goals is not None:
             starts = self.with_goals(starts, goals[0])

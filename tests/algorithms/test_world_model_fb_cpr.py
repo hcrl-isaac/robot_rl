@@ -157,3 +157,78 @@ def test_horizon_zero_is_fb_cpr_actor_loss() -> None:
     torch.manual_seed(0)
     one_step, _ = FbCpr._update_actor(reference, batch)
     torch.testing.assert_close(imagined["Actor_Loss/total_loss"], one_step["Actor_Loss/total_loss"])
+
+
+def _model_cfg_alg(**algorithm: object) -> WorldModelFbCpr:
+    env = _env()
+    cfg = _cfg(horizon=4)
+    cfg["algorithm"].update(algorithm)
+    alg = WorldModelFbCpr.construct_algorithm(env.get_observations(), env, cfg, "cpu")
+    obs = env.get_observations()
+    for _ in range(30):
+        with torch.inference_mode():
+            actions = alg.act(obs)
+            obs, rewards, dones, extras = env.step(actions)
+            alg.process_env_step(obs, rewards, dones, extras)
+    return alg
+
+
+def _normalized_batch(alg: WorldModelFbCpr) -> tuple:
+    win = alg.learner.replay_buffer.sample_transitions(BATCH)
+    batch = alg._as_batch(win)
+    batch.observations = alg._normalize(batch.observations)
+    batch.next_observations = alg._normalize(batch.next_observations)
+    batch.context = alg.project_z(torch.randn(BATCH, Z_DIM))
+    batch.rewards = alg.aux_reward_normalizer(batch.rewards)  # as update() does before the critics
+    return win, batch
+
+
+def test_critic_hooks_at_their_defaults_are_fb_cprs_updates() -> None:
+    """The real next state, the real discount and zero extra credit or reward reproduce each critic loss exactly."""
+    alg = _model_cfg_alg()
+    _, batch = _normalized_batch(alg)
+    zeros = torch.zeros(BATCH, 1)
+    calls = [
+        ("_update_forward_backward", {"credit_backward": torch.zeros(BATCH, Z_DIM)}),
+        ("_update_disc_critic", {"extra_rewards": zeros}),
+        ("_update_aux_critic", {"extra_rewards": zeros}),
+    ]
+    for name, extra in calls:
+        plain, hooked = copy.deepcopy(alg), copy.deepcopy(alg)
+        explicit = {"bootstrap_obs": batch.next_observations, "bootstrap_gammas": batch.gammas, **extra}
+        torch.manual_seed(0)
+        a, _ = getattr(plain, name)(copy.deepcopy(batch))
+        torch.manual_seed(0)
+        b, _ = getattr(hooked, name)(copy.deepcopy(batch), **explicit)
+        for key in a:
+            torch.testing.assert_close(a[key], b[key], msg=f"{name} {key}")
+
+
+@pytest.mark.parametrize("mage_action", ["policy", "buffer"])
+def test_mve_and_mage_update_and_log(mage_action: str) -> None:
+    """With k-step targets and the action-gradient loss on, an update trains every critic and logs both."""
+    alg = _model_cfg_alg(mve_k=3, mage_beta=0.1, mage_action=mage_action, value_loss_coef=0.0)
+    loss_dict, extras = alg.update()
+    for key in ("Forward_Backward_Loss/fb_loss", "Critic_Loss/discriminator_critic_loss", "Actor_Loss/total_loss"):
+        assert torch.isfinite(loss_dict[key]).all(), key
+    for key in ("mve_fb_credit_norm", "mve_disc_reward", "mage_forward_action_grad", "mage_aux_action_grad"):
+        assert key in extras and torch.isfinite(extras[key]), (key, extras)
+
+
+@pytest.mark.parametrize("critic", ["forward", "disc", "aux"])
+def test_mage_trains_only_its_critic(critic: str) -> None:
+    """The action-gradient loss reaches the trained critic's parameters and nothing else."""
+    alg = _model_cfg_alg(mage_beta=1.0)
+    win, batch = _normalized_batch(alg)
+    for m in (alg.actor, alg.backward_map, alg.discriminator, alg.world_model, alg.forward_map, alg.disc_critic):
+        m.zero_grad(set_to_none=True)
+    alg.aux_critic.zero_grad(set_to_none=True)
+    alg._mage_backward(critic, win, batch)
+    trained = {"forward": alg.forward_map, "disc": alg.disc_critic, "aux": alg.aux_critic}[critic]
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trained.parameters())
+    others = [alg.actor, alg.backward_map, alg.discriminator, alg.world_model]
+    others += [m for m in (alg.forward_map, alg.disc_critic, alg.aux_critic) if m is not trained]
+    for m in others:
+        assert all(p.grad is None for p in m.parameters()), type(m).__name__
+    for target in (alg.target_forward_map, alg.target_disc_critic, alg.target_aux_critic):
+        assert all(p.grad is None for p in target.target.parameters())

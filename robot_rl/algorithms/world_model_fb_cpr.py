@@ -506,7 +506,15 @@ class WorldModelFbCpr(FbCpr):
             cov = torch.matmul(B.T.float(), B.float()) / B.shape[0]
             # a small ridge keeps the solve defined while B spans fewer than z_dim directions (early training)
             ridge = 1e-3 * cov.diagonal().mean() * torch.eye(cov.shape[0], device=cov.device)
-            return torch.linalg.solve(cov + ridge, z.float().T).T
+            weights, info = torch.linalg.solve_ex(cov + ridge, z.float().T)
+            if int(info) != 0 or not bool(torch.isfinite(weights).all()):
+                bad = {k: int((~torch.isfinite(v)).any(dim=-1).sum()) for k, v in cov_obs.items()}
+                bad_b = int((~torch.isfinite(B)).any(dim=-1).sum())
+                raise FloatingPointError(
+                    f"Cov(B) solve failed (info {int(info)}): non-finite B rows {bad_b}/{B.shape[0]}, non-finite obs"
+                    f" rows per group {bad}, cov diag mean {float(cov.diagonal().mean())}"
+                )
+            return weights.T
 
     def _normalize(self, raw: TensorDict) -> TensorDict:
         """FB-CPR's observation normalization at its running statistics, differentiable in the observations.

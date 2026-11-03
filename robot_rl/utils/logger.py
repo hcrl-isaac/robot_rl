@@ -19,18 +19,21 @@ import robot_rl
 from robot_rl.utils.log_writer import LogWriter
 from robot_rl.utils.utils import resolve_callable
 
+# the policy's own statistics keep their W&B section, apart from the training internals
+KEPT_SECTIONS = ("Train", "Policy")
+
 
 def train_key(tag: str) -> str:
     """Move a scalar name under ``Train/``: ``Actor/grad_norm`` becomes ``Train/actor/grad_norm``.
 
     Args:
-        tag: A ``<Section>/<name>`` scalar name; one already under ``Train/`` is kept.
+        tag: A ``<Section>/<name>`` scalar name; one already under ``Train/`` or in ``Policy/`` is kept.
 
     Returns:
         The name W&B groups in its ``Train`` section.
     """
     section, _, name = tag.partition("/")
-    if section == "Train" or not name:
+    if section in KEPT_SECTIONS or not name:
         return tag
     return f"Train/{section.lower()}/{name}"
 

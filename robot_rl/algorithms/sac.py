@@ -63,6 +63,7 @@ class SAC:
         tau: float = 0.005,
         gamma: float = 0.99,
         target_entropy_scale: float = 1.0,
+        backup_entropy: bool = True,
         max_grad_norm: float = 1.0,
         policy_frequency: int = 1,
         n_steps: int = 1,
@@ -123,6 +124,8 @@ class SAC:
         self.num_mini_batches = num_mini_batches
         self.gamma = gamma
         self.auto_alpha = auto_alpha
+        # with log-probs above zero the entropy term in the backup is a per-step cost, which pays early terminations
+        self.backup_entropy = backup_entropy
         self.alpha = alpha
         self.actor_learning_rate = actor_learning_rate
         self.policy_frequency = policy_frequency
@@ -537,7 +540,7 @@ class SAC:
             next_in = self._critic_input(next_actions, next_latent)
             q1_t = self.critic_1_target(flat_next_obs, next_in).view(-1)
             q2_t = self.critic_2_target(flat_next_obs, next_in).view(-1)
-            min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
+            min_q_t = torch.min(q1_t, q2_t) - self._backup_alpha() * next_logp
             rewards = batch.rewards[burn:].reshape(-1)
             not_terminated = 1.0 - batch.next_terminated[burn:].reshape(-1).float()
             target_q = rewards + self.gamma * not_terminated * min_q_t
@@ -580,7 +583,7 @@ class SAC:
             next_in = self._critic_input(next_actions, next_latent)
             q1_t = self.critic_1_target(next_obs_b, next_in).view(-1)
             q2_t = self.critic_2_target(next_obs_b, next_in).view(-1)
-            min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
+            min_q_t = torch.min(q1_t, q2_t) - self._backup_alpha() * next_logp
             target_q = rewards_b + self._bootstrap_discount(batch) * not_terminated * min_q_t
             latent_b = self.actor.encode_step(obs_b, batch.hidden) if self.critic_sees_hidden else None
         data_in = self._critic_input(actions_b, latent_b)
@@ -657,6 +660,10 @@ class SAC:
         self.critic_optimizer.step()
         return critic_1_loss, critic_2_loss
 
+    def _backup_alpha(self) -> torch.Tensor | float:
+        """Entropy weight in the critic target: alpha, or 0 when the backup leaves entropy to the actor loss."""
+        return self.log_alpha.exp() if self.backup_entropy else 0.0
+
     def _bootstrap_discount(self, batch: ReplayBuffer.Batch) -> torch.Tensor | float:
         """Discount on the bootstrap: gamma to the per-sample horizon the batch aggregated (gamma^1 single-step)."""
         if batch.effective_n_steps is not None:
@@ -677,7 +684,7 @@ class SAC:
             next_actions, next_logp = self.actor.act_and_log_prob(next_obs_b)
             q1_t = self.critic_1_target(next_obs_b, next_actions).view(-1)
             q2_t = self.critic_2_target(next_obs_b, next_actions).view(-1)
-            min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
+            min_q_t = torch.min(q1_t, q2_t) - self._backup_alpha() * next_logp
             target_q = rewards_b + self._bootstrap_discount(batch) * not_terminated * min_q_t
 
         q1 = self.critic_1(obs_b, actions_b).view(-1)

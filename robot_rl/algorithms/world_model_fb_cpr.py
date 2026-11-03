@@ -66,6 +66,8 @@ class WorldModelFbCpr(FbCpr):
         imagination_compile_mode: str | None = "max-autotune",
         mve_k: int = 1,
         mage_beta: float = 0.0,
+        mage_q_beta: float | None = None,
+        mage_batch_size: int | None = None,
         mage_action: str = "policy",
         critic_model_start_update: int = 0,
         **kwargs: Any,
@@ -83,7 +85,9 @@ class WorldModelFbCpr(FbCpr):
             tf32: Allow TF32 matmuls (a process-wide torch setting).
             imagination_compile_mode: ``torch.compile`` mode of the imagined loss; None runs it eagerly.
             mve_k: Steps of the critics' targets: the real next state plus ``k - 1`` imagined ones (1 = FB-CPR's).
-            mage_beta: Weight of the critics' action-gradient (MAGE) loss through the world model (0 = off).
+            mage_beta: Weight of F's action-gradient (MAGE) loss through the world model (0 = off).
+            mage_q_beta: Weight of the discriminator and aux critics' MAGE losses; None uses ``mage_beta``.
+            mage_batch_size: Rows of the update's batch MAGE differentiates on; None uses all of them.
             mage_action: Where MAGE differentiates: ``"policy"`` (the actor's action) or ``"buffer"`` (the logged one).
             critic_model_start_update: Updates before MVE and MAGE start (the world model's warm-up).
             **kwargs: :class:`FbCpr` keyword arguments.
@@ -97,6 +101,8 @@ class WorldModelFbCpr(FbCpr):
             raise ValueError(f"mage_action must be 'policy' or 'buffer', got '{mage_action}'.")
         self.mve_k = mve_k
         self.mage_beta = mage_beta
+        self.mage_q_beta = mage_beta if mage_q_beta is None else mage_q_beta
+        self.mage_batch_size = mage_batch_size
         self.mage_action = mage_action
         self.critic_model_start_update = critic_model_start_update
         self.learner = learner
@@ -177,11 +183,11 @@ class WorldModelFbCpr(FbCpr):
             if "forward" in model_extras:
                 fb_kwargs["keep_grads"] = True
             fb_loss, fb_extras = self._update_forward_backward(batch, **fb_kwargs)
-            if self._mage_on():
+            if self._mage_on() and self.mage_q_beta > 0:
                 model_extras.update(self._mage_backward("disc", win, batch))
                 disc_kwargs["keep_grads"] = True
             disc_critic_loss, disc_critic_extras = self._update_disc_critic(batch, **disc_kwargs)
-            if self._mage_on():
+            if self._mage_on() and self.mage_q_beta > 0:
                 model_extras.update(self._mage_backward("aux", win, batch))
                 aux_kwargs["keep_grads"] = True
             aux_critic_loss, aux_critic_extras = self._update_aux_critic(batch, **aux_kwargs)
@@ -213,7 +219,7 @@ class WorldModelFbCpr(FbCpr):
     """
 
     def _mage_on(self) -> bool:
-        return self.mage_beta > 0 and self.update_step >= self.critic_model_start_update
+        return (self.mage_beta > 0 or self.mage_q_beta > 0) and self.update_step >= self.critic_model_start_update
 
     def _model_critic_inputs(
         self, win: SequenceReplayBuffer.Window, batch: ReplayBuffer.Batch
@@ -242,7 +248,7 @@ class WorldModelFbCpr(FbCpr):
             extras["mve_fb_credit_norm"] = exp.credit.norm(dim=-1).mean()
             extras["mve_disc_reward"] = exp.disc_rewards.mean()
             extras["mve_aux_reward"] = exp.aux_rewards.mean()
-        if self._mage_on():
+        if self._mage_on() and self.mage_beta > 0:
             extras.update(self._mage_backward("forward", win, batch))
             extras["forward"] = torch.ones(())
         return fb_kwargs, disc_kwargs, aux_kwargs, extras
@@ -310,14 +316,18 @@ class WorldModelFbCpr(FbCpr):
         for net in frozen:
             net.requires_grad_(False)
         z, obs, alive = batch.context, batch.observations, (batch.gammas > 0).float().squeeze(-1)
+        actions, starts, next_real = batch.actions, win.obs[0], win.obs[1]
+        if self.mage_batch_size is not None and self.mage_batch_size < self.batch_size:
+            rows = torch.randperm(self.batch_size, device=self.device)[: self.mage_batch_size]
+            z, obs, alive, actions = z[rows], obs[rows], alive[rows], actions[rows]
+            starts, next_real = starts[rows], next_real[rows]
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             if self.mage_action == "policy":
                 with torch.no_grad():
                     action = self.actor(obs, z, stochastic_output=True, std_clip=self.clip_actor_std)
             else:
-                action = batch.actions
+                action = actions
             action = action.detach().clone().requires_grad_(True)
-            starts = win.obs[0]
             goals = self.learner.start_goals(starts, 1)
             step = self.learner.imagine(
                 lambda _: action, starts, goals, self.learner.noise_bank(), freeze_model=False, horizon=1
@@ -325,7 +335,7 @@ class WorldModelFbCpr(FbCpr):
             next_raw = step.obs[1]
             if self.mage_action == "buffer":
                 # the real next state's value, the model's derivative
-                next_raw = win.obs[1].select(*next_raw.keys()) + (next_raw - next_raw.detach())
+                next_raw = next_real.select(*next_raw.keys()) + (next_raw - next_raw.detach())
             next_obs = self._normalize(next_raw)
             next_action = self.actor(next_obs, z)
             if critic == "forward":
@@ -347,7 +357,7 @@ class WorldModelFbCpr(FbCpr):
                 torch.autograd.grad(delta[p].sum(), action, create_graph=True)[0].pow(2).sum(dim=-1)
                 for p in range(delta.shape[0])
             ]).mean()
-            loss = self.mage_beta * sq
+            loss = (self.mage_beta if critic == "forward" else self.mage_q_beta) * sq
         optimizer.zero_grad()
         loss.backward()
         for net in frozen:

@@ -889,6 +889,7 @@ class SquashedTanhGaussianDistribution(Distribution):
         low: float = -1.0,
         high: float = 1.0,
         eps: float = 1e-6,
+        state_dependent_std: bool = False,
     ) -> None:
         """Initialize the squashed-tanh Gaussian distribution module.
 
@@ -901,9 +902,16 @@ class SquashedTanhGaussianDistribution(Distribution):
             low: Lower bound of the squashed action range.
             high: Upper bound of the squashed action range.
             eps: Small tolerance for the ``atanh`` inversion in :meth:`log_prob`.
+            state_dependent_std: Whether the MLP outputs the log-std per state (after the mean) instead of the
+                learnable parameter.
         """
         super().__init__(output_dim)
-        self.log_std_param = nn.Parameter(torch.log(init_noise_std * torch.ones(output_dim)), requires_grad=learn_std)
+        self.state_dependent_std = state_dependent_std
+        self.init_log_std = math.log(init_noise_std)
+        if not state_dependent_std:
+            self.log_std_param = nn.Parameter(
+                torch.log(init_noise_std * torch.ones(output_dim)), requires_grad=learn_std
+            )
         self.log_std_min = float(log_std_min)
         self.log_std_max = float(log_std_max)
         self._eps = eps
@@ -917,10 +925,15 @@ class SquashedTanhGaussianDistribution(Distribution):
         Normal.set_default_validate_args(False)
 
     def update(self, mlp_output: torch.Tensor) -> None:
-        """Update the pre-squash Gaussian from MLP output (mean = output; std = clamped log-std param)."""
-        self._mean_pre = mlp_output
-        log_std = self.log_std_param.clamp(self.log_std_min, self.log_std_max)
-        self._std = torch.exp(log_std).expand_as(mlp_output)
+        """Update the pre-squash Gaussian from MLP output (mean, then the per-state log-std if enabled)."""
+        if self.state_dependent_std:
+            self._mean_pre = mlp_output[..., : self.output_dim]
+            log_std = mlp_output[..., self.output_dim :].clamp(self.log_std_min, self.log_std_max)
+            self._std = torch.exp(log_std)
+        else:
+            self._mean_pre = mlp_output
+            log_std = self.log_std_param.clamp(self.log_std_min, self.log_std_max)
+            self._std = torch.exp(log_std).expand_as(mlp_output)
         self._distribution = Normal(self._mean_pre, self._std)
 
     def _squash(self, pre_tanh: torch.Tensor) -> torch.Tensor:
@@ -954,16 +967,23 @@ class SquashedTanhGaussianDistribution(Distribution):
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Return the squashed mean action (the deterministic policy output)."""
-        return self._squash(mlp_output)
+        return self._squash(mlp_output[..., : self.output_dim])
 
     def as_deterministic_output_module(self) -> nn.Module:
         """Return an export-friendly module that squashes the MLP output into ``[low, high]``."""
-        return _TanhScaledDeterministicOutput(self._scale, self._offset)
+        return _TanhScaledDeterministicOutput(self._scale, self._offset, self.output_dim)
 
     @property
     def input_dim(self) -> int:
-        """Return the input dimension required by the distribution (the MLP outputs the pre-squash mean)."""
-        return self.output_dim
+        """Return the MLP width: the pre-squash mean, plus the log-std when it is per state."""
+        return self.output_dim * (2 if self.state_dependent_std else 1)
+
+    def init_mlp_weights(self, mlp: nn.Module) -> None:
+        """Start a per-state std at ``init_noise_std`` in every state."""
+        if self.state_dependent_std:
+            head = [m for m in mlp.modules() if isinstance(m, nn.Linear)][-1]
+            torch.nn.init.zeros_(head.weight[self.output_dim :])
+            torch.nn.init.constant_(head.bias[self.output_dim :], self.init_log_std)
 
     @property
     def mean(self) -> torch.Tensor:
@@ -1015,6 +1035,7 @@ class VonMisesFisherTanhGaussianDistribution(Distribution):
         tail_low: float = -1.0,
         tail_high: float = 1.0,
         state_dependent_kappa: bool = False,
+        tail_state_dependent_std: bool = False,
     ) -> None:
         """Initialize both parts.
 
@@ -1029,6 +1050,7 @@ class VonMisesFisherTanhGaussianDistribution(Distribution):
             tail_low: Lower bound of the tail actions.
             tail_high: Upper bound of the tail actions.
             state_dependent_kappa: Whether the vMF part reads its ``log kappa`` from the network per state.
+            tail_state_dependent_std: Whether the tail reads its log-std from the network per state.
         """
         super().__init__(output_dim)
         self.head_dim = output_dim - tail_dim
@@ -1036,7 +1058,12 @@ class VonMisesFisherTanhGaussianDistribution(Distribution):
             self.head_dim, init_std, learn_std, kappa_range, state_dependent_kappa=state_dependent_kappa
         )
         self.tail = SquashedTanhGaussianDistribution(
-            tail_dim, tail_init_noise_std, learn_std=tail_learn_std, low=tail_low, high=tail_high
+            tail_dim,
+            tail_init_noise_std,
+            learn_std=tail_learn_std,
+            low=tail_low,
+            high=tail_high,
+            state_dependent_std=tail_state_dependent_std,
         )
 
     def _split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1086,12 +1113,16 @@ class VonMisesFisherTanhGaussianDistribution(Distribution):
         return width
 
     def init_mlp_weights(self, mlp: nn.Module) -> None:
-        """Initialize only the vMF part's per-state ``log kappa`` row, which sits right after its direction."""
+        """Initialize only the per-state spread rows: the vMF ``log kappa`` after its direction, the tail log-std."""
+        last = [m for m in mlp.modules() if isinstance(m, nn.Linear)][-1]
         if self.head.state_dependent_kappa:
-            last = [m for m in mlp.modules() if isinstance(m, nn.Linear)][-1]
             row = slice(self.head_dim, self.head_dim + 1)
             torch.nn.init.zeros_(last.weight[row])
             torch.nn.init.constant_(last.bias[row], self.head.init_log_kappa)
+        if self.tail.state_dependent_std:
+            rows = slice(self.head.input_dim + self.tail.output_dim, self.head.input_dim + self.tail.input_dim)
+            torch.nn.init.zeros_(last.weight[rows])
+            torch.nn.init.constant_(last.bias[rows], self.tail.init_log_std)
 
     @property
     def mean(self) -> torch.Tensor:
@@ -1170,15 +1201,17 @@ class _ClampedDeterministicOutput(nn.Module):
 
 
 class _TanhScaledDeterministicOutput(nn.Module):
-    """Exportable module that returns ``scale * tanh(mlp_output) + offset``, bounded to ``(low, high)``."""
+    """Exportable module that returns ``scale * tanh(mlp_output) + offset`` over the first ``dim`` outputs."""
 
-    def __init__(self, scale: float, offset: float) -> None:
+    def __init__(self, scale: float, offset: float, dim: int | None = None) -> None:
         super().__init__()
         self.scale = scale
         self.offset = offset
+        self.dim = dim
 
     def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
-        return self.scale * torch.tanh(mlp_output) + self.offset
+        out = mlp_output if self.dim is None else mlp_output[..., : self.dim]
+        return self.scale * torch.tanh(out) + self.offset
 
 
 class _FirstSliceDeterministicOutput(nn.Module):

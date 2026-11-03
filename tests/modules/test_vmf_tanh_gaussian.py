@@ -62,3 +62,27 @@ def test_a_per_state_kappa_is_read_from_its_own_output_and_initialized_alone() -
     assert action.shape == (3, HEAD + TAIL) and logp.shape == (3,)
     module = torch.jit.script(dist.as_deterministic_output_module())
     torch.testing.assert_close(module(raw), dist.deterministic_output(raw))
+
+
+def test_a_per_state_tail_std_is_read_after_the_tail_mean_and_starts_at_the_init_std() -> None:
+    """With per-state kappa and tail std the network emits HEAD + 1 + 2 * TAIL values; the std rows start constant."""
+    dist = VonMisesFisherTanhGaussianDistribution(
+        HEAD + TAIL,
+        tail_dim=TAIL,
+        init_std=0.5,
+        tail_init_noise_std=0.3,
+        state_dependent_kappa=True,
+        tail_state_dependent_std=True,
+    )
+    assert dist.input_dim == HEAD + 1 + 2 * TAIL
+    mlp = torch.nn.Sequential(torch.nn.Linear(4, dist.input_dim))
+    dist.init_mlp_weights(mlp)
+    dist.update(mlp(torch.randn(3, 4)))
+    torch.testing.assert_close(dist.tail.std, torch.full((3, TAIL), 0.3))
+    raw = torch.randn(3, dist.input_dim)
+    dist.update(raw)
+    torch.testing.assert_close(dist.tail.std, raw[:, HEAD + 1 + TAIL :].exp())
+    action, logp = dist.sample_and_log_prob()
+    assert action.shape == (3, HEAD + TAIL) and logp.shape == (3,)
+    module = torch.jit.script(dist.as_deterministic_output_module())
+    torch.testing.assert_close(module(raw), dist.deterministic_output(raw))

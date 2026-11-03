@@ -183,9 +183,14 @@ def _rebuild_distillation(
         The student under the ``policy`` export name.
     """
     cfg = copy.deepcopy(train_cfg)
-    # an auxiliary head only supervises the encoder in training; it is not part of the exported policy
-    sd = {k: v for k, v in ckpt["student_state_dict"].items() if not k.startswith("aux_head.")}
     model_cfg = dict(cfg["student"])
+    sd = dict(ckpt["student_state_dict"])
+    if model_cfg.get("aux_readout"):
+        # the head reads the aux prediction, so the aux head stays; the dump does not record its width
+        model_cfg["aux_target_dim"] = sd["aux_head.weight"].shape[0]
+    else:
+        # an auxiliary head only supervises the encoder in training; it is not part of the exported policy
+        sd = {k: v for k, v in sd.items() if not k.startswith("aux_head.")}
     model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
     if issubclass(model_class, RNNModel) and not issubclass(model_class, CNNRNNModel):
         raise NotImplementedError("Export of recurrent (memory-bearing) students is not supported.")

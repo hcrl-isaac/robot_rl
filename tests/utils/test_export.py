@@ -522,3 +522,35 @@ def test_fuse_model_reports_its_output_width(distribution: str) -> None:
     actor = ResidualFuseModel(obs, {"actor": ["policy"]}, "actor", (z_dim, 0), num_actions, **copy.deepcopy(model_cfg))
     logged = {"class_name": "ResidualFuseModel", **model_cfg}
     assert _num_actions(logged, actor.state_dict()) == num_actions
+
+
+def test_a_reference_student_with_an_aux_readout_rebuilds_with_its_aux_head() -> None:
+    """A student whose head reads the aux prediction keeps its aux head on rebuild, sized from the checkpoint."""
+    from tensordict import TensorDict
+
+    from robot_rl.models.cref_model import CrefModel
+
+    obs = TensorDict({"policy": torch.zeros(2, 7), "image": torch.zeros(2, 1, 8, 12)}, batch_size=[2])
+    obs_groups = {"student": ["policy", "image"], "teacher": ["policy"]}
+    student_cfg = {
+        "class_name": "CrefModel",
+        "hidden_dims": [16],
+        "obs_normalization": True,
+        "token_dim": 8,
+        "num_heads": 2,
+        "rnn_type": "gru",
+        "rnn_hidden_dim": 8,
+        "cnn_cfg": {"output_channels": [4, 4], "kernel_size": 3, "stride": 2, "activation": "elu"},
+        "distribution_cfg": {"class_name": "VonMisesFisherDistribution", "init_std": 0.05},
+        "aux_readout": True,
+    }
+    model_cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in student_cfg.items() if k != "class_name"}
+    model = CrefModel(obs, obs_groups, "student", 6, aux_target_dim=2, **model_cfg).eval()
+    train_cfg = {"student": student_cfg, "obs_groups": obs_groups, "algorithm": {}}
+    policy = rebuild_models(train_cfg, {"student_state_dict": model.state_dict()}, obs_shapes={"image": (1, 8, 12)})[
+        "policy"
+    ]
+    step = TensorDict({"policy": torch.randn(1, 7), "image": torch.rand(1, 1, 8, 12)}, batch_size=[1])
+    model.reset()
+    with torch.inference_mode():
+        torch.testing.assert_close(policy(step, stochastic_output=False), model(step, stochastic_output=False))

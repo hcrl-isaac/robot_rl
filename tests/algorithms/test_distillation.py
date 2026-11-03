@@ -166,3 +166,48 @@ class TestRecurrentTeacher:
             before = [h.clone() for h in alg.teacher.get_hidden_state()]
             alg.update()
             assert all(torch.equal(a, b) for a, b in zip(alg.teacher.get_hidden_state(), before, strict=True))
+
+
+class TestTeacherDrivenRollouts:
+    """DAgger mixing: drawn envs execute the teacher's action, the fraction decays, labels stay the teacher's."""
+
+    def _setup(self, prob: float, decay: int = 0) -> tuple:
+        alg, obs, storage = _make_distillation_setup()
+        alg.teacher_action_prob_init = alg.teacher_action_prob = prob
+        alg.teacher_action_decay_updates = decay
+        return alg, obs, storage
+
+    def test_default_executes_the_student(self) -> None:
+        """With mixing off, the executed action is the student's."""
+        alg, obs, _ = _make_distillation_setup()
+        actions = alg.act(obs)
+        assert torch.equal(actions, alg.transition.actions)
+        assert alg._teacher_driven is None
+
+    def test_all_teacher_driven_executes_the_teacher(self) -> None:
+        """With every env drawn, the executed action is the teacher's while storage keeps the student's."""
+        alg, obs, _ = self._setup(1.0)
+        actions = alg.act(obs)
+        assert torch.allclose(actions, alg.teacher(obs))
+        # the stored action and the label are unchanged by the mixing
+        assert torch.equal(alg.transition.privileged_actions, alg.teacher(obs).detach())
+        assert not torch.equal(alg.transition.actions, actions)
+
+    def test_fraction_decays_and_resets_redraw(self) -> None:
+        """The fraction decays per update, and only resetting envs redraw at the current fraction."""
+        alg, obs, _ = self._setup(1.0, decay=2)
+        alg.act(obs)
+        assert alg._teacher_driven.all()
+        _fill_distillation_storage(alg, obs)
+        alg.update()
+        assert alg.teacher_action_prob == pytest.approx(0.5)
+        _fill_distillation_storage(alg, obs)
+        loss = alg.update()
+        assert alg.teacher_action_prob == pytest.approx(0.0)
+        assert loss["teacher_action_prob"] == pytest.approx(0.0)
+        # envs keep their draw until they reset, then redraw at the current (zero) fraction
+        assert alg._teacher_driven.all()
+        alg.act(obs)
+        dones = torch.tensor([1.0, 0.0, 1.0, 0.0])
+        alg.process_env_step(obs, torch.zeros(NUM_ENVS), dones, {})
+        assert alg._teacher_driven.tolist() == [False, True, False, True]

@@ -234,3 +234,13 @@ def test_mage_trains_only_its_critic(critic: str) -> None:
         assert all(p.grad is None for p in m.parameters()), type(m).__name__
     for target in (alg.target_forward_map, alg.target_disc_critic, alg.target_aux_critic):
         assert all(p.grad is None for p in target.target.parameters())
+
+
+def test_implicit_reward_weights_survive_a_rank_deficient_backward_map() -> None:
+    """Cov(B) over a batch whose B spans fewer than z_dim directions still yields finite reward weights."""
+    alg = _model_cfg_alg()
+    _, batch = _normalized_batch(alg)
+    direction = torch.nn.functional.normalize(torch.randn(Z_DIM), dim=0)
+    alg.backward_map.forward = lambda obs: direction.expand(obs.batch_size[0], -1)  # rank one
+    weights = alg._implicit_reward_weights(batch.next_observations, batch.context)
+    assert torch.isfinite(weights).all()

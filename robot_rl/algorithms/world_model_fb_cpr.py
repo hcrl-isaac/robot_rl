@@ -504,7 +504,9 @@ class WorldModelFbCpr(FbCpr):
         # disable autocast so the covariance solve runs in float32, as FB-CPR's value regularizer does
         with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=False):
             cov = torch.matmul(B.T.float(), B.float()) / B.shape[0]
-            return torch.linalg.solve(cov, z.float().T).T
+            # a small ridge keeps the solve defined while B spans fewer than z_dim directions (early training)
+            ridge = 1e-3 * cov.diagonal().mean() * torch.eye(cov.shape[0], device=cov.device)
+            return torch.linalg.solve(cov + ridge, z.float().T).T
 
     def _normalize(self, raw: TensorDict) -> TensorDict:
         """FB-CPR's observation normalization at its running statistics, differentiable in the observations.

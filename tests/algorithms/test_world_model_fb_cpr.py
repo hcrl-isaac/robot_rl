@@ -244,3 +244,18 @@ def test_implicit_reward_weights_survive_a_rank_deficient_backward_map() -> None
     alg.backward_map.forward = lambda obs: direction.expand(obs.batch_size[0], -1)  # rank one
     weights = alg._implicit_reward_weights(batch.next_observations, batch.context)
     assert torch.isfinite(weights).all()
+
+
+def test_mage_gradient_is_clipped_and_a_non_finite_one_dropped() -> None:
+    """The MAGE parameter gradient written into the critic respects the norm clip, and a NaN one leaves it zero."""
+    alg = _model_cfg_alg(mage_beta=1e6, mage_max_grad_norm=0.5)
+    win, batch = _normalized_batch(alg)
+    alg._mage_backward("forward", win, batch)
+    norm = torch.linalg.vector_norm(
+        torch.stack([p.grad.norm() for p in alg.forward_map.parameters() if p.grad is not None])
+    )
+    assert float(norm) <= 0.5 + 1e-4
+    alg.mage_beta = float("nan")
+    out = alg._mage_backward("forward", win, batch)
+    assert float(out["mage_forward_dropped"]) == 1.0
+    assert all(p.grad is None or float(p.grad.abs().sum()) == 0 for p in alg.forward_map.parameters())

@@ -68,6 +68,7 @@ class WorldModelFbCpr(FbCpr):
         mage_beta: float = 0.0,
         mage_q_beta: float | None = None,
         mage_batch_size: int | None = None,
+        mage_max_grad_norm: float | None = 1.0,
         mage_action: str = "policy",
         critic_model_start_update: int = 0,
         **kwargs: Any,
@@ -88,6 +89,8 @@ class WorldModelFbCpr(FbCpr):
             mage_beta: Weight of F's action-gradient (MAGE) loss through the world model (0 = off).
             mage_q_beta: Weight of the discriminator and aux critics' MAGE losses; None uses ``mage_beta``.
             mage_batch_size: Rows of the update's batch MAGE differentiates on; None uses all of them.
+            mage_max_grad_norm: Norm clip of each critic's MAGE parameter gradient (FB-CPR's critics run unclipped,
+                and a second-order gradient can be large); None disables it.
             mage_action: Where MAGE differentiates: ``"policy"`` (the actor's action) or ``"buffer"`` (the logged one).
             critic_model_start_update: Updates before MVE and MAGE start (the world model's warm-up).
             **kwargs: :class:`FbCpr` keyword arguments.
@@ -103,6 +106,7 @@ class WorldModelFbCpr(FbCpr):
         self.mage_beta = mage_beta
         self.mage_q_beta = mage_beta if mage_q_beta is None else mage_q_beta
         self.mage_batch_size = mage_batch_size
+        self.mage_max_grad_norm = mage_max_grad_norm
         self.mage_action = mage_action
         self.critic_model_start_update = critic_model_start_update
         self.learner = learner
@@ -358,11 +362,26 @@ class WorldModelFbCpr(FbCpr):
                 for p in range(delta.shape[0])
             ]).mean()
             loss = (self.mage_beta if critic == "forward" else self.mage_q_beta) * sq
+        params = [p for p in trained.parameters() if p.requires_grad]
+        grads = torch.autograd.grad(loss, params, allow_unused=True)
+        norm = torch.linalg.vector_norm(torch.stack([g.norm() for g in grads if g is not None]))
+        finite = torch.isfinite(norm)
+        scale = torch.ones_like(norm)
+        if self.mage_max_grad_norm is not None:
+            scale = torch.clamp(self.mage_max_grad_norm / (norm + 1e-6), max=1.0)
+        # a non-finite gradient is dropped (scaled to zero) rather than written into the critic
+        scale = torch.where(finite, scale, torch.zeros_like(scale))
         optimizer.zero_grad()
-        loss.backward()
+        for p, g in zip(params, grads, strict=True):
+            if g is not None:
+                p.grad = torch.nan_to_num(g) * scale
         for net in frozen:
             net.requires_grad_(True)
-        return {f"mage_{critic}_action_grad": sq.detach().sqrt()}
+        return {
+            f"mage_{critic}_action_grad": sq.detach().sqrt(),
+            f"mage_{critic}_param_grad_norm": norm.detach(),
+            f"mage_{critic}_dropped": (~finite).float(),
+        }
 
     def _update_imagined_actor(
         self, starts: TensorDict, z: torch.Tensor, cov_obs: TensorDict, horizon: int

@@ -69,6 +69,8 @@ class ReplayBuffer:
             next_terminated: torch.Tensor | None = None,
             effective_n_steps: torch.Tensor | None = None,
             hidden: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
+            bootstrap_observations: TensorDict | None = None,
+            bootstrap_hidden: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict = observations
@@ -96,6 +98,10 @@ class ReplayBuffer:
             """Per-sample number of steps actually aggregated (<= n_steps; 1-step or capped at an episode end)."""
             self.hidden = hidden
             """Stored recurrent state before each step, ``(layers, N, hidden)``; ``None`` if the buffer stores none."""
+            self.bootstrap_observations = bootstrap_observations
+            """Observation of the step whose next observation is bootstrapped from (n-step); ``None`` = this step's."""
+            self.bootstrap_hidden = bootstrap_hidden
+            """Stored recurrent state before that bootstrap step; ``None`` = ``hidden``."""
 
     class SequenceBatch:
         """A time-major batch of contiguous per-env windows, for recurrent updates.
@@ -376,10 +382,21 @@ class ReplayBuffer:
             self.context[start_flat].to(device),
             self.next_terminated[final_flat].to(device),
             effective_n.to(device),
+            hidden=self._gather_hidden(start_flat, device) if self.hidden is not None else None,
+            bootstrap_observations=self._read(self.observations, final_flat, device),
+            bootstrap_hidden=self._gather_hidden(final_flat, device) if self.hidden is not None else None,
         )
 
     def sample_sequences(
-        self, seq_len: int, burn_in: int = 0, device: str | None = None, num_windows: int | None = None
+        self,
+        seq_len: int,
+        burn_in: int = 0,
+        device: str | None = None,
+        num_windows: int | None = None,
+        priority_group: str | None = None,
+        priority: float = 1.0,
+        episode_start: bool = False,
+        oversample: int = 4,
     ) -> SequenceBatch | None:
         """Sample contiguous per-env windows for a recurrent update.
 
@@ -396,6 +413,13 @@ class ReplayBuffer:
             num_windows: Windows per batch. Defaults to ``batch_size // (burn_in + seq_len)`` so the
                 flattened steps match the configured mini-batch; a window batch otherwise multiplies
                 the mini-batch by the window length, which with image observations is an easy OOM.
+            priority_group: Observation group whose last column is a 0/1 seen flag; windows whose loss
+                segment contains a seen-to-unseen step within one episode are drawn ``priority`` times as often.
+            priority: Relative weight of those windows; 1 samples uniformly.
+            episode_start: Start every window on an episode's first step, whose stored state is zero, so the
+                window's recurrent state is exact instead of re-derived from a stored (stale) state.
+            oversample: Candidate windows drawn per kept window when weighting; it caps how far the weight can
+                raise the share of those windows.
 
         Returns:
             A :class:`SequenceBatch` of ``L = burn_in + seq_len`` steps, or ``None`` while no window of
@@ -420,9 +444,33 @@ class ReplayBuffer:
         if valid_rows.numel() == 0:
             return None
 
-        start_rows = valid_rows[torch.randint(valid_rows.numel(), (batch_size,), device=self.device)]
-        envs = torch.randint(self.num_envs, (batch_size,), device=self.device)
+        weighted = priority_group is not None and priority != 1.0
+        draws = batch_size * max(oversample, 1) if weighted else batch_size
+        if episode_start:
+            # keep the candidates whose previous stored step ended an episode; redraw from them to fill the batch
+            cand = valid_rows[torch.randint(valid_rows.numel(), (draws * 16,), device=self.device)]
+            cand_envs = torch.randint(self.num_envs, (draws * 16,), device=self.device)
+            prev_flat = ((cand - 1) % cap_rows) * self.num_envs + cand_envs
+            starts = self.dones[prev_flat].view(-1).bool()  # an unfilled predecessor row reads as no done
+            if self._is_full:  # the oldest row's predecessor slot holds the newest step, not its previous one
+                starts &= cand != write_row
+            if not starts.any():
+                return None
+            pick = torch.randint(int(starts.sum()), (draws,), device=self.device)
+            start_rows, envs = cand[starts][pick], cand_envs[starts][pick]
+        else:
+            start_rows = valid_rows[torch.randint(valid_rows.numel(), (draws,), device=self.device)]
+            envs = torch.randint(self.num_envs, (draws,), device=self.device)
         offsets = torch.arange(total_len, device=self.device)
+        if weighted:
+            rows_c = (start_rows.unsqueeze(-1) + offsets) % cap_rows
+            flat_c = (rows_c * self.num_envs + envs.unsqueeze(-1)).reshape(-1)
+            seen = (self.observations[priority_group][flat_c][..., -1] > 0.5).reshape(draws, total_len)
+            done = self.dones[flat_c].reshape(draws, total_len).bool()
+            lost = seen[:, :-1] & ~seen[:, 1:] & ~done[:, :-1]
+            has = lost[:, max(burn_in - 1, 0) :].any(dim=1)
+            keep = torch.multinomial(1.0 + (priority - 1.0) * has.float(), batch_size, replacement=False)
+            start_rows, envs = start_rows[keep], envs[keep]
         step_rows = (start_rows.unsqueeze(-1) + offsets) % cap_rows  # [B, L]
         step_flat = (step_rows * self.num_envs + envs.unsqueeze(-1)).reshape(-1)  # [B*L]
 

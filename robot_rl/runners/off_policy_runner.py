@@ -64,7 +64,7 @@ class OffPolicyRunner(CheckpointHooks):
         self.current_learning_iteration = 0
         self._resumed = False
 
-    def learn(self, num_learning_iterations: int, **kwargs: Any) -> None:
+    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False, **kwargs: Any) -> None:
         """Run the learning loop: per iteration, collect env steps, then run agent updates, then log/save."""
         is_url = hasattr(self.alg, "expert_buffer")
         start_it = self.current_learning_iteration
@@ -98,6 +98,11 @@ class OffPolicyRunner(CheckpointHooks):
         else:
             num_updates = 1
             obs = self.env.get_observations().to(self.device)
+        # without early terminations, episodes that start together time out together for the whole run
+        if init_at_random_ep_len:
+            self.env.episode_length_buf = torch.randint_like(
+                self.env.episode_length_buf, high=int(self.env.max_episode_length)
+            )
 
         # Switch models to train mode (for dropout etc.) and sync parameters across ranks
         self.alg.train_mode()

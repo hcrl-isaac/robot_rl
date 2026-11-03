@@ -87,14 +87,29 @@ class TestCrefModel:
         assert torch.allclose(log_p.exp(), alg.actor._last_attn[:, -1], atol=1e-6)
 
     def test_attention_supervision_raises_target_mass(self) -> None:
-        """Training with an attention target reports its loss, and the attended mass on the target grows."""
+        """Supervising attention onto the image cell that holds a bright blob raises the attended mass on it."""
         torch.manual_seed(0)
         alg, env = _build(attn_target_group="pixel")
+        random_obs = env._obs
+        width = random_obs()["image"].shape[-1]
+
+        def blob_obs() -> TensorDict:
+            # the token grid is one row of two cells; the target is visible content, as the ball is, not a place
+            obs = random_obs()
+            right = torch.rand(NUM_ENVS) < 0.5
+            obs["image"][:] = 0.0
+            obs["image"][right, ..., width // 2 :] = 1.0
+            obs["image"][~right, ..., : width // 2] = 1.0
+            obs["pixel"][:, 0] = torch.where(right, 0.75, 0.25)
+            obs["pixel"][:, 1] = 0.5
+            return obs
+
+        env._obs = blob_obs
         _collect(alg, env, 12)
         first = alg.update()[1]["Actor/attn_target_prob"]
         for _ in range(15):
             last = alg.update()[1]["Actor/attn_target_prob"]
-        assert first > 0.0 and last > first
+        assert first > 0.0 and last > first + 0.05
 
     def test_aux_readout_appends_prediction_to_head_input(self) -> None:
         """With aux_readout the head input ends with the aux prediction, and the update still trains."""

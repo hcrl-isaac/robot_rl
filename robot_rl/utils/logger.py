@@ -19,6 +19,29 @@ import robot_rl
 from robot_rl.utils.log_writer import LogWriter
 from robot_rl.utils.utils import resolve_callable
 
+# the policy's own statistics keep their W&B section, apart from the training internals
+KEPT_SECTIONS = ("Train", "Policy")
+
+
+def train_key(tag: str) -> str:
+    """Move a scalar name under ``Train/``: ``Actor/grad_norm`` becomes ``Train/actor/grad_norm``.
+
+    Args:
+        tag: A ``<Section>/<name>`` scalar name; one already under ``Train/`` or in ``Policy/`` is kept.
+
+    Returns:
+        The name W&B groups in its ``Train`` section.
+    """
+    section, _, name = tag.partition("/")
+    if section in KEPT_SECTIONS or not name:
+        return tag
+    return f"Train/{section.lower()}/{name}"
+
+
+def _repeat(value: float | torch.Tensor, n: int) -> torch.Tensor:
+    """Repeat a scalar episode-log value ``n`` times, so a mean over steps weights each step by its resets."""
+    return torch.as_tensor(value, dtype=torch.float).reshape(-1).repeat(n)
+
 
 class Logger:
     """Logger to save the learning metrics to different logging services."""
@@ -95,7 +118,7 @@ class Logger:
                 self.logger_type = "WandbLogWriter"
                 logger_cfg = {
                     "project_name": self.cfg.get("wandb_project"),
-                    "run_name": self.cfg.get("wandb_run_name"),
+                    "run_name": self.cfg.get("wandb_run_name") or self.cfg.get("run_name"),
                     "group": self.cfg.get("wandb_group"),
                     "entity": self.cfg.get("wandb_entity"),
                     "shared": self.cfg.get("shared", False),
@@ -153,8 +176,10 @@ class Logger:
             # Store episode extras
             if "episode" in extras:
                 self.ep_extras.append(extras["episode"])
-            elif "log" in extras:
-                self.ep_extras.append(extras["log"])
+            elif "log" in extras and (num_done := int((dones > 0).sum())) > 0:
+                # the env rewrites "log" only on steps that reset envs, as a mean over them: skip the stale
+                # dict on other steps and weight each step by its resets
+                self.ep_extras.append({k: _repeat(v, num_done) for k, v in extras["log"].items()})
             # Store evaluation extras
             if eval_extras:
                 self.eval_extras.extend(eval_extras)
@@ -245,7 +270,7 @@ class Logger:
 
             # Log episode extras
             extras_string = self._log_extras(self.ep_extras, it, pad, "Episode", "Mean episode {}")
-            extras_string += self._log_extras(self.algo_extras, it, pad, "Train", "Train/{}")
+            extras_string += self._log_extras(self.algo_extras, it, pad, "Train", "Train/{}", train=True)
             eval_string = self._log_extras(self.eval_extras, it, pad, "Evaluation", "Mean evaluation {}")
             # Log losses
             if loss_dict:
@@ -255,19 +280,19 @@ class Logger:
                     # A slash in the key picks its own scalar group (e.g. Train/kl_mean); bare keys -> Loss/.
                     scalar_key = key if "/" in key else f"Loss/{key}"
                     label = key.rsplit("/", 1)[-1]
-                    self.writer.add_scalar(scalar_key, value, it)
+                    self.writer.add_scalar(train_key(scalar_key), value, it)
                     loss_string += f"""{f"Mean {label} loss:":>{pad}} {value:.4f}\n"""
                 if learning_rate is not None:
-                    self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
+                    self.writer.add_scalar(train_key("Loss/learning_rate"), learning_rate, it)
             else:
                 # Use loss extras buffer for off-policy (multiple updates per log)
                 loss_string = self._log_extras(
-                    self.loss_extras, it, pad, "Loss", "Mean {}", override_console_format=False
+                    self.loss_extras, it, pad, "Loss", "Mean {}", override_console_format=False, train=True
                 )
 
             # Log std
             if action_std is not None:
-                self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
+                self.writer.add_scalar(train_key("Policy/mean_std"), action_std.mean().item(), it)
 
             # Log performance
             fps = int(collection_size / iteration_time)
@@ -280,9 +305,9 @@ class Logger:
             # Log rewards and episode length
             if len(self.rewbuffer) > 0:
                 if self.cfg["algorithm"].get("rnd_cfg", None):
-                    self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(self.erewbuffer), it)
-                    self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(self.irewbuffer), it)
-                    self.writer.add_scalar("Rnd/weight", rnd_weight, it)  # type: ignore
+                    self.writer.add_scalar(train_key("Rnd/mean_extrinsic_reward"), statistics.mean(self.erewbuffer), it)
+                    self.writer.add_scalar(train_key("Rnd/mean_intrinsic_reward"), statistics.mean(self.irewbuffer), it)
+                    self.writer.add_scalar(train_key("Rnd/weight"), rnd_weight, it)  # type: ignore
                 self.writer.add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
                 if self.logger_type != "WandbLogWriter":
@@ -409,7 +434,22 @@ class Logger:
         scalar_prefix: str,
         console_format: str,
         override_console_format: bool = True,
+        train: bool = False,
     ) -> str:
+        """Write each extra's mean as a scalar and return its console lines.
+
+        Args:
+            extras: Per-step dicts of scalars or tensors, averaged per key.
+            it: Training iteration the scalars are logged at.
+            pad: Console label width.
+            scalar_prefix: Section a key without a slash is written under.
+            console_format: Console label pattern for a key.
+            override_console_format: Whether a key with a slash is printed as is.
+            train: Whether the extras are training internals, written under ``Train/`` (:func:`train_key`).
+
+        Returns:
+            The console lines.
+        """
         extras_string = ""
         if extras:
             # Iterate over all keys in the episode info dictionary
@@ -427,12 +467,13 @@ class Logger:
                     infotensor = torch.cat((infotensor, info[key].to(self.device)))
                 value = torch.nan_to_num(torch.mean(infotensor), nan=0.0)
                 if "/" in key:
-                    self.writer.add_scalar(key, value, it)  # type: ignore
+                    self.writer.add_scalar(train_key(key) if train else key, value, it)  # type: ignore
                     if override_console_format:
                         extras_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
                     else:
                         extras_string += f"""{f"{console_format.format(key)}:":>{pad}} {value:.4f}\n"""
                 else:
-                    self.writer.add_scalar(f"{scalar_prefix}/" + key, value, it)  # type: ignore
+                    tag = f"{scalar_prefix}/" + key
+                    self.writer.add_scalar(train_key(tag) if train else tag, value, it)  # type: ignore
                     extras_string += f"""{f"{console_format.format(key)}:":>{pad}} {value:.4f}\n"""
         return extras_string

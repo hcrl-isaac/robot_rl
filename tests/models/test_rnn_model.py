@@ -15,6 +15,7 @@ import onnx
 import pytest
 
 from robot_rl.models import RNNModel
+from robot_rl.utils import split_and_pad_trajectories
 from tests.conftest import make_obs
 
 NUM_ENVS = 4
@@ -228,6 +229,44 @@ class TestRNNModelJITExport:
         assert torch.allclose(original_out, jit_out, atol=1e-5), f"JIT sequential mismatch for {rnn_type}"
 
 
+class TestHeadReadsFeatures:
+    """With head_reads_features the head sees the current features beside the recurrent output."""
+
+    @pytest.mark.parametrize("rnn_type", ["gru", "lstm"])
+    def test_head_width_and_exports(self, rnn_type: str) -> None:
+        """With head_reads_features the head reads features and recurrent output; both exports match eager."""
+        obs = make_obs(1, OBS_DIM)
+        model = RNNModel(
+            obs,
+            {"actor": ["policy"]},
+            "actor",
+            NUM_ACTIONS,
+            hidden_dims=[32, 32],
+            activation="elu",
+            rnn_type=rnn_type,
+            rnn_hidden_dim=16,
+            rnn_num_layers=1,
+            head_reads_features=True,
+            distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
+        )
+        model.eval()
+        assert model.latent_dim == OBS_DIM + 16
+        assert model.mlp[0].in_features == OBS_DIM + 16
+
+        jit_model = torch.jit.script(model.as_jit())
+        jit_model.reset()
+        onnx_model = model.as_onnx()
+        state = onnx_model.get_dummy_inputs()[1:]
+        obs_concat = torch.cat([obs[g] for g in model.obs_groups], dim=-1)
+        for _ in range(3):
+            original_out = model(obs, stochastic_output=False).detach()
+            jit_out = jit_model(obs_concat)
+            onnx_out, *state = onnx_model(obs_concat, *state)
+            state = [st for st in state if st is not None]
+        assert torch.allclose(original_out, jit_out, atol=1e-5)
+        assert torch.allclose(original_out, onnx_out, atol=1e-5)
+
+
 @pytest.mark.filterwarnings("ignore:.*legacy TorchScript.*:DeprecationWarning")
 @pytest.mark.filterwarnings("ignore:.*will be removed.*:DeprecationWarning")
 @pytest.mark.filterwarnings("ignore::torch.jit.TracerWarning")
@@ -271,3 +310,26 @@ class TestRNNModelONNXExport:
 
             assert [i.name for i in loaded.graph.input] == onnx_model.input_names
             assert [o.name for o in loaded.graph.output] == onnx_model.output_names
+
+
+def test_a_padded_batch_with_head_reads_features_unpads_the_features() -> None:
+    """With head_reads_features, a padded trajectory batch gives head inputs aligned with the unpadded RNN output."""
+    obs = make_obs(1, OBS_DIM)
+    model = RNNModel(
+        obs,
+        {"actor": ["policy"]},
+        "actor",
+        NUM_ACTIONS,
+        hidden_dims=[32],
+        rnn_type="gru",
+        rnn_hidden_dim=16,
+        head_reads_features=True,
+        distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
+    )
+    steps, envs = 5, 2
+    dones = torch.zeros(steps, envs)
+    dones[1, 0] = 1.0  # env 0's rollout splits into two episodes, so the batch is padded
+    padded_obs, masks = split_and_pad_trajectories(torch.randn(steps, envs, OBS_DIM), dones)
+    padded = TensorDict({"policy": padded_obs}, batch_size=padded_obs.shape[:2])
+    latent = model.get_latent(padded, masks=masks, hidden_state=torch.zeros(1, padded_obs.shape[1], 16))
+    assert latent.shape == (steps, envs, OBS_DIM + 16)

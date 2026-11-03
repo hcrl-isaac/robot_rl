@@ -170,3 +170,10 @@ def test_priority_group_oversamples_windows_where_the_flag_drops() -> None:
     uniform, weighted = frac_with_drop(1.0), frac_with_drop(20.0)
     assert 0.1 < uniform < 0.4
     assert weighted > 2.0 * uniform
+
+
+def test_a_full_buffer_does_not_read_the_newest_row_as_the_oldest_rows_predecessor() -> None:
+    """Once the buffer wraps, the oldest row's predecessor slot holds the newest step, so it marks no episode start."""
+    buffer = _make_buffer()
+    _fill(buffer, CAPACITY_PER_ENV + 5, done_at={CAPACITY_PER_ENV + 4})  # only the newest step ends an episode
+    assert buffer.sample_sequences(seq_len=4, burn_in=2, episode_start=True) is None

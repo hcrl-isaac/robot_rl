@@ -339,37 +339,67 @@ class FbCpr:
         st.gammas.copy_(self.gamma * (1 - st.next_terminated).float())
 
     def update_rollout_z(self, z: torch.Tensor | None, cur_episode_length: torch.Tensor, num_envs: int) -> torch.Tensor:
-        """Refresh the per-environment latent ``z`` used for rollout based on episode progress."""
-        if not torch.all(cur_episode_length == cur_episode_length[0]):
-            raise ValueError("Expected episode lengths to be uniform.")
-        step = int(cur_episode_length[0].item())
+        """Refresh the per-environment latent ``z`` used for rollout based on each env's own episode progress.
+
+        When every env is at the same step (resets only on time-out), each refresh draws exactly as a uniform schedule
+        would; envs reset at different steps refresh on their own schedules.
+        """
+        due_z = cur_episode_length % self.steps_per_z_update == 0
         # Update from z buffer
         # the z buffer is empty until the first update, e.g. when an eval resets rollouts during the seed phase
-        if z is None or (step % self.steps_per_z_update == 0 and len(self.z_buffer) == 0):
+        if z is None:
             z = self._sample_random_z(num_envs)
-        elif step % self.steps_per_z_update == 0:
-            z = self.z_buffer.sample(num_envs, device=self.device)
+        elif due_z.any():
+            fresh = (
+                self._sample_random_z(num_envs)
+                if len(self.z_buffer) == 0
+                else self.z_buffer.sample(num_envs, self.device)
+            )
+            z = fresh if due_z.all() else torch.where(due_z.unsqueeze(-1), fresh, z)
 
         # Update from expert buffer
-        rollout_idx = step % self.expert_rollout_length
-        if rollout_idx == 0 or self.expert_rollout_envs is None or self.expert_rollout_z is None:
+        rollout_idx = cur_episode_length % self.expert_rollout_length
+        due_e = rollout_idx == 0
+        if due_e.all() or self.expert_rollout_envs is None or self.expert_rollout_z is None:
             # Use constant num_expert_updates to avoid torch recompile
             num_expert_updates = int(num_envs * self.expert_rollout_ratio)
             self.expert_rollout_envs = torch.randperm(num_envs, device=self.device)[:num_expert_updates]
-
-            _, expert_next_obs = self.expert_buffer.sample(
-                num_expert_updates * self.expert_rollout_length,
-                device=self.device,
-                seq_length=self.expert_rollout_length,
-            )
-            with eval_mode(self.obs_normalizer):
-                expert_next_obs = self.obs_normalizer(expert_next_obs)
-            expert_z = self.backward_map(expert_next_obs).view(num_expert_updates, self.expert_rollout_length, -1)
-            expert_z = forward_sliding_mean(expert_z, self.expert_sequence_length, dim=1)
-            self.expert_rollout_z = self.project_z(expert_z)
-        z[self.expert_rollout_envs] = self.expert_rollout_z[:, rollout_idx]
+            self.expert_rollout_z = self._sample_expert_windows(num_expert_updates)
+        elif due_e.any():
+            self._refresh_expert_windows(due_e.nonzero().flatten())
+        owned = self.expert_rollout_envs >= 0
+        envs = self.expert_rollout_envs[owned]
+        z[envs] = self.expert_rollout_z[owned, rollout_idx[envs]]
 
         return z
+
+    def _sample_expert_windows(self, count: int) -> torch.Tensor:
+        """Latent sequences of ``count`` expert windows, ``(count, expert_rollout_length, z_dim)``."""
+        _, expert_next_obs = self.expert_buffer.sample(
+            count * self.expert_rollout_length,
+            device=self.device,
+            seq_length=self.expert_rollout_length,
+        )
+        with eval_mode(self.obs_normalizer):
+            expert_next_obs = self.obs_normalizer(expert_next_obs)
+        expert_z = self.backward_map(expert_next_obs).view(count, self.expert_rollout_length, -1)
+        expert_z = forward_sliding_mean(expert_z, self.expert_sequence_length, dim=1)
+        return self.project_z(expert_z)
+
+    def _refresh_expert_windows(self, due: torch.Tensor) -> None:
+        """Release the expert windows of envs starting a new window and hand the free rows to a random subset of them.
+
+        Args:
+            due: Envs whose expert window starts now, while others are mid-window.
+        """
+        self.expert_rollout_envs[torch.isin(self.expert_rollout_envs, due)] = -1
+        free = (self.expert_rollout_envs < 0).nonzero().flatten()
+        taken = due[torch.randperm(due.numel(), device=self.device)[: free.numel()]]
+        if taken.numel() == 0:
+            return
+        rows = free[: taken.numel()]
+        self.expert_rollout_envs[rows] = taken
+        self.expert_rollout_z[rows] = self._sample_expert_windows(taken.numel())
 
     def update(self) -> tuple[dict[str, torch.Tensor], dict]:
         """Run optimization epochs over stored batches and return mean losses."""

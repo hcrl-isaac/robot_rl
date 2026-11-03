@@ -110,7 +110,7 @@ class TestSAC:
 
     def test_backup_entropy_switch(self) -> None:
         """The critic target charges alpha * logp by default and nothing with backup_entropy off; both update."""
-        alg, env = _build()
+        alg, _ = _build()
         assert float(alg._backup_alpha()) == float(alg.log_alpha.exp())
         off, off_env = _build(backup_entropy=False)
         assert off._backup_alpha() == 0.0

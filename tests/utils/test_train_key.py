@@ -30,11 +30,12 @@ def _logger() -> Logger:
 
 
 def test_training_sections_move_under_train() -> None:
-    """Training sections move under Train/, lowercased; Train/ names and bare names are kept."""
+    """Training sections move under Train/, lowercased; Train/ and Policy/ names and bare names are kept."""
     assert train_key("Actor/grad_norm") == "Train/actor/grad_norm"
     assert train_key("Critic_Loss/td") == "Train/critic_loss/td"
     assert train_key("Buffer/size") == "Train/buffer/size"
     assert train_key("Loss/value_function") == "Train/loss/value_function"
+    assert train_key("Policy/mean_std") == "Policy/mean_std"
     assert train_key("Train/mean_reward") == "Train/mean_reward"
     assert train_key("bare") == "bare"
 

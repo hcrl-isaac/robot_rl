@@ -760,22 +760,7 @@ class FbCpr:
         }).to(device)
         print(f"Observation Normalizer: {obs_normalizer}")
 
-        # Initialize the storage
-        max_episode_length = env.max_episode_length
-        if isinstance(max_episode_length, torch.Tensor):
-            max_episode_length = int(max_episode_length.max().item())
-        # inference never samples the storage: keep it at one row per env rather than
-        # storage_scale * max_episode_length, which explodes on never-resetting play envs
-        replay_buffer = ReplayBuffer(
-            env.num_envs,
-            cfg["algorithm"]["storage_scale"] * max_episode_length if not inference else 1,
-            obs,
-            [env.num_actions],
-            z_dim,
-            cfg["algorithm"]["batch_size"],
-            cfg["storage_device"],
-            obs_dtypes={k: getattr(torch, v) for k, v in (cfg["algorithm"].get("replay_obs_dtypes") or {}).items()},
-        )
+        storage = alg_class._build_storage(obs, env, cfg, device, inference)
         # A large corpus can exceed VRAM on its own, so it is placed independently of the replay buffer.
         expert_device = _expert_storage_device(cfg, device)
         expert_buffer = (
@@ -794,10 +779,10 @@ class FbCpr:
             aux_critic,
             discriminator,
             obs_normalizer,
-            replay_buffer,
-            expert_buffer,
-            z_buffer,
+            expert_buffer=expert_buffer,
+            z_buffer=z_buffer,
             device=device,
+            **storage,
             **cfg["algorithm"],
             multi_gpu_cfg=cfg["multi_gpu"],
             clip_actions=cfg.get("clip_actions"),
@@ -805,6 +790,37 @@ class FbCpr:
         )
 
         return alg
+
+    @staticmethod
+    def _build_storage(obs: TensorDict, env: URLVecEnv, cfg: dict, device: str, inference: bool) -> dict[str, Any]:
+        """Build the replay storage, returned as constructor kwargs (``replay_buffer``).
+
+        Args:
+            obs: An observation sample.
+            env: The env.
+            cfg: The resolved runner cfg; entries only the storage reads may be popped from ``cfg["algorithm"]``.
+            device: Training device.
+            inference: Keep one row per env, as nothing samples the storage.
+
+        Returns:
+            The storage kwargs of the algorithm constructor.
+        """
+        max_episode_length = env.max_episode_length
+        if isinstance(max_episode_length, torch.Tensor):
+            max_episode_length = int(max_episode_length.max().item())
+        # inference never samples the storage: keep it at one row per env rather than
+        # storage_scale * max_episode_length, which explodes on never-resetting play envs
+        replay_buffer = ReplayBuffer(
+            env.num_envs,
+            cfg["algorithm"]["storage_scale"] * max_episode_length if not inference else 1,
+            obs,
+            [env.num_actions],
+            cfg["algorithm"]["z_dim"],
+            cfg["algorithm"]["batch_size"],
+            cfg["storage_device"],
+            obs_dtypes={k: getattr(torch, v) for k, v in (cfg["algorithm"].get("replay_obs_dtypes") or {}).items()},
+        )
+        return {"replay_buffer": replay_buffer}
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""
@@ -927,15 +943,39 @@ class FbCpr:
 
         return loss_dict, extras
 
-    def _update_forward_backward(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict]:
+    def _update_forward_backward(
+        self,
+        batch: ReplayBuffer.Batch,
+        bootstrap_obs: TensorDict | None = None,
+        bootstrap_gammas: torch.Tensor | None = None,
+        credit_backward: torch.Tensor | None = None,
+        keep_grads: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], dict]:
+        """Update F and B on the FB loss (and the orthonormality and value regularizers).
+
+        The optional arguments let a subclass expand the targets k steps (e.g. through a world model); left at None
+        the update is the one-step FB loss.
+
+        Args:
+            batch: Normalized replay transitions.
+            bootstrap_obs: Observations the target is bootstrapped from; None is ``batch.next_observations``.
+            bootstrap_gammas: Discount of the bootstrap, ``(B, 1)``; None is ``batch.gammas``.
+            credit_backward: Extra discounted ``B`` credit added to each row's own successor term, ``(B, z_dim)``.
+            keep_grads: Keep gradients already accumulated on F (an auxiliary loss's) instead of zeroing them.
+
+        Returns:
+            The loss and extras dicts.
+        """
+        bootstrap_obs = batch.next_observations if bootstrap_obs is None else bootstrap_obs
+        bootstrap_gammas = batch.gammas if bootstrap_gammas is None else bootstrap_gammas
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             # Forward-Backward loss
             with torch.no_grad():
                 # Compute successor measure from target networks
                 next_actions = self.actor(
-                    batch.next_observations, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
+                    bootstrap_obs, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
                 )
-                target_Fs = self.target_forward_map(batch.next_observations, batch.context, next_actions)
+                target_Fs = self.target_forward_map(bootstrap_obs, batch.context, next_actions)
                 target_B = self.target_backward_map(batch.next_observations)
                 target_Ms = torch.matmul(target_Fs, target_B.T)
                 target_M = compute_td_targets(target_Ms, self.forward_backward_pessimism)
@@ -945,9 +985,12 @@ class FbCpr:
             Ms = torch.matmul(Fs, B.T)
 
             # FB loss
-            diff = Ms - batch.gammas * target_M
+            diff = Ms - bootstrap_gammas * target_M
             fb_offdiag = 0.5 * (diff * self._off_diag).pow(2).sum() / self._off_diag_sum
-            fb_diag = -torch.diagonal(diff, dim1=1, dim2=2).mean() * Ms.shape[0]
+            own = torch.diagonal(diff, dim1=1, dim2=2)
+            if credit_backward is not None:
+                own = own + (Fs * credit_backward).sum(dim=-1)
+            fb_diag = -own.mean() * Ms.shape[0]
             fb_loss = fb_offdiag + fb_diag
 
             # Orthonormality loss
@@ -975,7 +1018,8 @@ class FbCpr:
             loss = fb_loss + orth_loss + q_loss
 
         # Compute the gradients
-        self.forward_optimizer.zero_grad()
+        if not keep_grads:
+            self.forward_optimizer.zero_grad()
         self.backward_optimizer.zero_grad()
         loss.backward()
 
@@ -1011,7 +1055,28 @@ class FbCpr:
 
         return loss_dict, extras
 
-    def _update_disc_critic(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    def _update_disc_critic(
+        self,
+        batch: ReplayBuffer.Batch,
+        bootstrap_obs: TensorDict | None = None,
+        bootstrap_gammas: torch.Tensor | None = None,
+        extra_rewards: torch.Tensor | None = None,
+        keep_grads: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Update the discriminator critic on its TD loss (arguments as :meth:`_update_forward_backward`).
+
+        Args:
+            batch: Normalized replay transitions.
+            bootstrap_obs: Observations the target is bootstrapped from; None is ``batch.next_observations``.
+            bootstrap_gammas: Discount of the bootstrap, ``(B, 1)``; None is ``batch.gammas``.
+            extra_rewards: Discounted rewards between the transition and the bootstrap, ``(B, 1)``.
+            keep_grads: Keep gradients already accumulated on the critic instead of zeroing them.
+
+        Returns:
+            The loss and extras dicts.
+        """
+        bootstrap_obs = batch.next_observations if bootstrap_obs is None else bootstrap_obs
+        bootstrap_gammas = batch.gammas if bootstrap_gammas is None else bootstrap_gammas
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             with torch.no_grad():
                 # Compute discriminator reward
@@ -1019,19 +1084,24 @@ class FbCpr:
                     self.discriminator_reward_eps, 1 - self.discriminator_reward_eps
                 )
                 discriminator_reward = torch.log(logits) - torch.log(1 - logits)
+                if extra_rewards is not None:
+                    discriminator_reward = discriminator_reward + extra_rewards
                 # Compute target value
                 next_actions = self.actor(
-                    batch.next_observations, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
+                    bootstrap_obs, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
                 )
-                next_Qs = self.target_disc_critic(batch.next_observations, batch.context, next_actions)
-                target_Q = discriminator_reward + batch.gammas * compute_td_targets(next_Qs, self.disc_critic_pessimism)
+                next_Qs = self.target_disc_critic(bootstrap_obs, batch.context, next_actions)
+                target_Q = discriminator_reward + bootstrap_gammas * compute_td_targets(
+                    next_Qs, self.disc_critic_pessimism
+                )
                 target_Q = target_Q.expand(self.disc_critic.num_parallel, -1, -1)
             # Compute critic loss
             Qs = self.disc_critic(batch.observations, batch.context, batch.actions)
             loss = 0.5 * self.disc_critic.num_parallel * nn.functional.mse_loss(Qs, target_Q)
 
         # Compute the gradients
-        self.disc_critic_optimizer.zero_grad()
+        if not keep_grads:
+            self.disc_critic_optimizer.zero_grad()
         loss.backward()
 
         # Collect gradients from all GPUs
@@ -1054,24 +1124,47 @@ class FbCpr:
 
         return loss_dict, extras_dict
 
-    def _update_aux_critic(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    def _update_aux_critic(
+        self,
+        batch: ReplayBuffer.Batch,
+        bootstrap_obs: TensorDict | None = None,
+        bootstrap_gammas: torch.Tensor | None = None,
+        extra_rewards: torch.Tensor | None = None,
+        keep_grads: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Update the auxiliary critic on its TD loss (arguments as :meth:`_update_disc_critic`).
+
+        Args:
+            batch: Normalized replay transitions with normalized auxiliary rewards.
+            bootstrap_obs: Observations the target is bootstrapped from; None is ``batch.next_observations``.
+            bootstrap_gammas: Discount of the bootstrap, ``(B, 1)``; None is ``batch.gammas``.
+            extra_rewards: Discounted rewards between the transition and the bootstrap, ``(B, 1)``.
+            keep_grads: Keep gradients already accumulated on the critic instead of zeroing them.
+
+        Returns:
+            The loss and extras dicts.
+        """
+        bootstrap_obs = batch.next_observations if bootstrap_obs is None else bootstrap_obs
+        bootstrap_gammas = batch.gammas if bootstrap_gammas is None else bootstrap_gammas
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             with torch.no_grad():
                 # Compute target value
                 next_actions = self.actor(
-                    batch.next_observations, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
+                    bootstrap_obs, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
                 )
-                next_Qs = self.target_aux_critic(batch.next_observations, batch.context, next_actions)
-                target_Q = batch.rewards.unsqueeze(1) + batch.gammas * compute_td_targets(
-                    next_Qs, self.aux_critic_pessimism
-                )
+                next_Qs = self.target_aux_critic(bootstrap_obs, batch.context, next_actions)
+                rewards = batch.rewards.unsqueeze(1)
+                if extra_rewards is not None:
+                    rewards = rewards + extra_rewards
+                target_Q = rewards + bootstrap_gammas * compute_td_targets(next_Qs, self.aux_critic_pessimism)
                 target_Q = target_Q.expand(self.aux_critic.num_parallel, -1, -1)
             # Compute critic loss
             Qs = self.aux_critic(batch.observations, batch.context, batch.actions)
             loss = 0.5 * self.aux_critic.num_parallel * nn.functional.mse_loss(Qs, target_Q)
 
         # Compute the gradients
-        self.aux_critic_optimizer.zero_grad()
+        if not keep_grads:
+            self.aux_critic_optimizer.zero_grad()
         loss.backward()
 
         # Collect gradients from all GPUs

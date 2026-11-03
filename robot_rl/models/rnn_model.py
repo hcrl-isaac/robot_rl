@@ -14,6 +14,7 @@ from typing import Any
 
 from robot_rl.models.mlp_model import MLPModel
 from robot_rl.modules import RNN, HiddenState
+from robot_rl.utils import unpad_trajectories
 
 
 class RNNModel(MLPModel):
@@ -74,7 +75,10 @@ class RNNModel(MLPModel):
     ) -> torch.Tensor:
         """Rollout-mode latent advancing the internal hidden state, or a padded trajectory batch with ``masks``."""
         feats = self._features(obs, *args)
-        return self._head_input(feats, self.rnn(feats, masks, hidden_state).squeeze(0))
+        out = self.rnn(feats, masks, hidden_state).squeeze(0)
+        if masks is not None and self.head_reads_features:
+            feats = unpad_trajectories(feats, masks)  # the padded batch's RNN output is unpadded already
+        return self._head_input(feats, out)
 
     def encode_sequence(
         self, obs: TensorDict, hidden_state: HiddenState, resets: torch.Tensor | None = None

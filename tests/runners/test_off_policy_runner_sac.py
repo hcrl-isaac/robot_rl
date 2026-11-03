@@ -106,6 +106,16 @@ class TestOffPolicyRunnerSAC:
         assert runner.current_learning_iteration == 2  # ran iters 0,1,2
         assert len(runner.alg.replay_buffer) == 3 * 4 * NUM_ENVS  # 3 iters * 4 steps * num_envs
 
+    def test_random_initial_episode_lengths(self) -> None:
+        """init_at_random_ep_len staggers the episodes, which otherwise time out together for the whole run."""
+        torch.manual_seed(0)
+        env = DummyEnv()
+        OffPolicyRunner(env, _make_cfg(), log_dir=None, device="cpu").learn(0, init_at_random_ep_len=True)
+        assert env.episode_length_buf.unique().numel() > 1
+        env = DummyEnv()
+        OffPolicyRunner(env, _make_cfg(), log_dir=None, device="cpu").learn(0)
+        assert (env.episode_length_buf == 0).all()
+
     def test_learn_updates_policy(self) -> None:
         """After several iterations past the seed phase, the actor parameters have changed (learning occurred)."""
         runner = OffPolicyRunner(DummyEnv(), _make_cfg(), log_dir=None, device="cpu")

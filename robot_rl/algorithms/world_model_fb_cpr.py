@@ -374,7 +374,8 @@ class WorldModelFbCpr(FbCpr):
         optimizer.zero_grad()
         for p, g in zip(params, grads, strict=True):
             if g is not None:
-                p.grad = torch.nan_to_num(g) * scale
+                # in the parameter's own layout, as the fused optimizer step requires
+                p.grad = torch.zeros_like(p).copy_(torch.nan_to_num(g) * scale)
         for net in frozen:
             net.requires_grad_(True)
         return {

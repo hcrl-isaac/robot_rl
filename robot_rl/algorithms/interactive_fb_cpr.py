@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import torch
+import torch.nn as nn
 from tensordict import TensorDict
 from typing import Any
 
@@ -39,6 +40,54 @@ def sphere_log_map(base: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) 
     return radius * theta * v / v_norm.clamp(min=eps)
 
 
+class SphereLogActor(nn.Module):
+    """An actor commanded by the tangent from the state's own embedding toward its latent, not the latent itself.
+
+    The backward map is held unregistered: it is read, never trained through the actor. Saving and loading pass to the
+    wrapped actor, so checkpoints and exports keep the plain actor and its ``(obs, command)`` signature.
+    """
+
+    def __init__(self, actor: nn.Module, backward_map: nn.Module) -> None:
+        """Wrap ``actor``, reading the state embedding from ``backward_map``.
+
+        Args:
+            actor: The actor, called as ``actor(obs, command, **kwargs)``.
+            backward_map: The backward map ``B(obs)``.
+        """
+        super().__init__()
+        self.actor = actor
+        object.__setattr__(self, "_backward_map", backward_map)
+
+    def __getattr__(self, name: str) -> Any:
+        """Fall back to the wrapped actor's attributes."""
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._modules["actor"], name)
+
+    def prompt(self, obs: TensorDict, z: torch.Tensor) -> torch.Tensor:
+        """Return ``log_map(P(B(s)), P(z))``, the command the actor sees for latent ``z`` at state ``s``."""
+        with torch.no_grad():
+            here = _project(self._backward_map(obs))
+        return sphere_log_map(here, _project(z))
+
+    def forward(self, obs: TensorDict, z: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Run the actor on the log-map command for latent ``z``."""
+        return self.actor(obs, self.prompt(obs, z), **kwargs)
+
+    def state_dict(self, *args: Any, **kwargs: Any) -> dict:
+        """Return the wrapped actor's state."""
+        return self.actor.state_dict(*args, **kwargs)
+
+    def load_state_dict(self, *args: Any, **kwargs: Any) -> Any:
+        """Load into the wrapped actor."""
+        return self.actor.load_state_dict(*args, **kwargs)
+
+
+def _project(z: torch.Tensor) -> torch.Tensor:
+    return math.sqrt(z.shape[-1]) * nn.functional.normalize(z, dim=-1)
+
+
 class InteractiveFbCpr(FbCpr):
     """FB-CPR for robot-object interaction: an Interactive Behavioral Foundation Model.
 
@@ -61,6 +110,7 @@ class InteractiveFbCpr(FbCpr):
         logo_horizon: int = 8,
         logo_local_weight: float = 4.0 / 7.0,
         expert_absent_groups: list[str] | None = None,
+        sphere_log_actor: bool = True,
         **kwargs: Any,
     ) -> None:
         """Initialize FB-CPR and the local-goal objective.
@@ -71,9 +121,15 @@ class InteractiveFbCpr(FbCpr):
             logo_horizon: Steps from a clip's anchor state to its goal state.
             logo_local_weight: Share of the residual on the local target; the goal target takes the rest.
             expert_absent_groups: Observation groups the expert motions lack, filled with zeros.
+            sphere_log_actor: Command the actor with the log map from the state's embedding toward the latent, in
+                rollouts, targets and losses alike (the released I-BFM's actor input).
             **kwargs: Keyword arguments of :class:`FbCpr`.
         """
         super().__init__(*args, **kwargs)
+        self.sphere_log_actor = sphere_log_actor
+        if sphere_log_actor:
+            # the optimizer already holds the inner actor's parameters
+            self.actor = SphereLogActor(self.actor, self.backward_map)
         self.logo_coef = logo_coef
         self.logo_horizon = logo_horizon
         self.logo_local_weight = logo_local_weight
@@ -185,8 +241,11 @@ class InteractiveFbCpr(FbCpr):
                 z_anchor = self.project_z(self.backward_map(anchor))
                 z_local = self.project_z(self.backward_map(local))
                 z_goal = self.project_z(self.backward_map(goal))
-            local_loss, _ = self._actor_objective(anchor, sphere_log_map(z_anchor, z_local), z_local)
-            goal_loss, _ = self._actor_objective(anchor, sphere_log_map(z_anchor, z_goal), z_goal)
+            # a sphere-log actor turns the target latent into its log map itself
+            local_cmd = z_local if self.sphere_log_actor else sphere_log_map(z_anchor, z_local)
+            goal_cmd = z_goal if self.sphere_log_actor else sphere_log_map(z_anchor, z_goal)
+            local_loss, _ = self._actor_objective(anchor, local_cmd, z_local)
+            goal_loss, _ = self._actor_objective(anchor, goal_cmd, z_goal)
             residual = self.logo_local_weight * local_loss + (1.0 - self.logo_local_weight) * goal_loss
             actor_loss = base_loss + self.logo_coef * residual
         self._step_actor(actor_loss)

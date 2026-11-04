@@ -134,3 +134,16 @@ def test_an_update_runs_and_logs_the_local_goal_residual(alg: InteractiveFbCpr) 
     assert torch.isfinite(loss_dict["Actor_Loss/logo_goal_loss"])
     assert "logo_goal_angle" in extras
     assert any(not torch.equal(a, b) for a, b in zip(before, alg.actor.parameters(), strict=True))
+
+
+def test_the_actor_is_commanded_by_the_log_map_from_its_own_embedding(alg: InteractiveFbCpr) -> None:
+    """The wrapper feeds the actor log_map(P(B(s)), P(z)) and exposes only the actor's parameters and state."""
+    inner = alg.actor.actor
+    backward_params = {id(p) for p in alg.backward_map.parameters()}
+    assert not backward_params & {id(p) for p in alg.actor.parameters()}
+    assert alg.actor.state_dict().keys() == inner.state_dict().keys()
+    obs = alg.obs_normalizer(_obs())
+    z = torch.randn(NUM_ENVS, alg.z_dim)
+    here = alg.project_z(alg.backward_map(obs))
+    expected = inner(obs, sphere_log_map(here, alg.project_z(z)))
+    torch.testing.assert_close(alg.actor(obs, z), expected)

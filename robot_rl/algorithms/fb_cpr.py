@@ -1008,9 +1008,11 @@ class FbCpr:
                     # disable autocast to ensure that cov and B have the same type
                     with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=False):
                         cov = torch.matmul(B.T, B) / B.shape[0]  # z_dim x z_dim
-                    B_inv_cov = torch.linalg.solve(cov, B, left=False)
+                    # An expanded target adds the imagined states' implicit rewards (credit_backward is their B)
+                    successors = B if credit_backward is None else B + credit_backward
+                    B_inv_cov = torch.linalg.solve(cov, successors, left=False)
                     implicit_reward = (B_inv_cov * batch.context).sum(dim=-1)  # batch_size
-                    target_Q = implicit_reward.detach() + batch.gammas.squeeze() * next_Q  # batch_size
+                    target_Q = implicit_reward.detach() + bootstrap_gammas.squeeze(-1) * next_Q  # batch_size
                     target_Q = target_Q.expand(Fs.shape[0], -1)  # num_parallel x batch_size
                 Qs = (Fs * batch.context).sum(dim=-1)  # num_parallel x batch_size
                 q_loss = self.value_loss_coef * 0.5 * Fs.shape[0] * nn.functional.mse_loss(Qs, target_Q)

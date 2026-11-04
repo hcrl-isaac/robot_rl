@@ -280,3 +280,22 @@ def test_mve_can_leave_the_forward_backward_loss_one_step() -> None:
     win, batch = _normalized_batch(alg)
     fb_kwargs, disc_kwargs, aux_kwargs, _ = alg._model_critic_inputs(win, batch)
     assert fb_kwargs == {} and "extra_rewards" in disc_kwargs and "extra_rewards" in aux_kwargs
+
+
+def test_value_regularizer_takes_the_expanded_target() -> None:
+    """The Fz target adds the credited states' implicit rewards and bootstraps with the expanded discount."""
+    alg = _model_cfg_alg(value_loss_coef=0.1)
+    _, batch = _normalized_batch(alg)
+    credit = torch.randn(BATCH, Z_DIM)
+    zero_gammas = torch.zeros(BATCH, 1)
+    with torch.no_grad():
+        Fs = alg.forward_map(batch.observations, batch.context, batch.actions)
+        B = alg.backward_map(batch.next_observations)
+        cov = B.T @ B / B.shape[0]
+        target = (torch.linalg.solve(cov, B + credit, left=False) * batch.context).sum(dim=-1)
+        Qs = (Fs * batch.context).sum(dim=-1)
+        expected = 0.1 * 0.5 * Fs.shape[0] * torch.nn.functional.mse_loss(Qs, target.expand_as(Qs))
+    losses, _ = alg._update_forward_backward(
+        batch, bootstrap_obs=batch.next_observations, bootstrap_gammas=zero_gammas, credit_backward=credit
+    )
+    torch.testing.assert_close(losses["Forward_Backward_Loss/value_reg_loss"], expected)

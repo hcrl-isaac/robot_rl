@@ -65,6 +65,7 @@ class WorldModelFbCpr(FbCpr):
         tf32: bool = True,
         imagination_compile_mode: str | None = "max-autotune",
         mve_k: int = 1,
+        mve_critics: tuple[str, ...] = ("forward", "disc", "aux"),
         mage_beta: float = 0.0,
         mage_q_beta: float | None = None,
         mage_batch_size: int | None = None,
@@ -88,6 +89,7 @@ class WorldModelFbCpr(FbCpr):
             tf32: Allow TF32 matmuls (a process-wide torch setting).
             imagination_compile_mode: ``torch.compile`` mode of the imagined loss; None runs it eagerly.
             mve_k: Steps of the critics' targets: the real next state plus ``k - 1`` imagined ones (1 = FB-CPR's).
+            mve_critics: Which critics take the k-step targets: ``"forward"`` (F and B), ``"disc"``, ``"aux"``.
             mage_beta: Weight of F's action-gradient (MAGE) loss through the world model (0 = off).
             mage_q_beta: Weight of the discriminator and aux critics' MAGE losses; None uses ``mage_beta``.
             mage_batch_size: Rows of the update's batch MAGE differentiates on; None uses all of them.
@@ -107,7 +109,11 @@ class WorldModelFbCpr(FbCpr):
             raise ValueError("mve_k > 1 does not expand the F value regularizer's target; set value_loss_coef = 0.")
         if mage_action not in ("policy", "buffer"):
             raise ValueError(f"mage_action must be 'policy' or 'buffer', got '{mage_action}'.")
+        unknown = set(mve_critics) - {"forward", "disc", "aux"}
+        if unknown:
+            raise ValueError(f"mve_critics may name 'forward', 'disc' and 'aux', got {sorted(unknown)}.")
         self.mve_k = mve_k
+        self.mve_critics = tuple(mve_critics)
         self.mage_beta = mage_beta
         self.mage_q_beta = mage_beta if mage_q_beta is None else mage_q_beta
         self.mage_batch_size = mage_batch_size
@@ -253,9 +259,12 @@ class WorldModelFbCpr(FbCpr):
             return fb_kwargs, disc_kwargs, aux_kwargs, extras
         if self.mve_k > 1:
             exp = self._critic_expansion(win.obs[1], batch)
-            fb_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, credit_backward=exp.credit)
-            disc_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, extra_rewards=exp.disc_rewards)
-            aux_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, extra_rewards=exp.aux_rewards)
+            if "forward" in self.mve_critics:
+                fb_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, credit_backward=exp.credit)
+            if "disc" in self.mve_critics:
+                disc_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, extra_rewards=exp.disc_rewards)
+            if "aux" in self.mve_critics:
+                aux_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, extra_rewards=exp.aux_rewards)
             extras["mve_fb_credit_norm"] = exp.credit.norm(dim=-1).mean()
             extras["mve_disc_reward"] = exp.disc_rewards.mean()
             extras["mve_aux_reward"] = exp.aux_rewards.mean()

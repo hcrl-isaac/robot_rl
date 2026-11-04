@@ -272,3 +272,11 @@ def test_finite_difference_mage_matches_the_exact_slope() -> None:
     torch.manual_seed(0)
     estimate = alg._mage_backward("disc", win, batch)["mage_disc_action_grad"]
     torch.testing.assert_close(estimate, exact, rtol=0.15, atol=1e-4)
+
+
+def test_mve_can_leave_the_forward_backward_loss_one_step() -> None:
+    """With F excluded from mve_critics, the FB update gets no expansion while the scalar critics do."""
+    alg = _model_cfg_alg(mve_k=3, mve_critics=("disc", "aux"), value_loss_coef=0.0)
+    win, batch = _normalized_batch(alg)
+    fb_kwargs, disc_kwargs, aux_kwargs, _ = alg._model_critic_inputs(win, batch)
+    assert fb_kwargs == {} and "extra_rewards" in disc_kwargs and "extra_rewards" in aux_kwargs

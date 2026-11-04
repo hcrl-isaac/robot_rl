@@ -448,6 +448,8 @@ class ReplayBuffer:
             cand_envs = torch.randint(self.num_envs, (draws * 16,), device=self.device)
             prev_flat = ((cand - 1) % cap_rows) * self.num_envs + cand_envs
             starts = self.dones[prev_flat].view(-1).bool()  # an unfilled predecessor row reads as no done
+            if self._is_full:  # the oldest row's predecessor slot holds the newest step, not its previous one
+                starts &= cand != write_row
             if not starts.any():
                 return None
             pick = torch.randint(int(starts.sum()), (draws,), device=self.device)

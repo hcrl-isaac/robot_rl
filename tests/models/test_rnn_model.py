@@ -15,6 +15,7 @@ import onnx
 import pytest
 
 from robot_rl.models import RNNModel
+from robot_rl.utils import split_and_pad_trajectories
 from tests.conftest import make_obs
 
 NUM_ENVS = 4
@@ -309,3 +310,26 @@ class TestRNNModelONNXExport:
 
             assert [i.name for i in loaded.graph.input] == onnx_model.input_names
             assert [o.name for o in loaded.graph.output] == onnx_model.output_names
+
+
+def test_a_padded_batch_with_head_reads_features_unpads_the_features() -> None:
+    """With head_reads_features, a padded trajectory batch gives head inputs aligned with the unpadded RNN output."""
+    obs = make_obs(1, OBS_DIM)
+    model = RNNModel(
+        obs,
+        {"actor": ["policy"]},
+        "actor",
+        NUM_ACTIONS,
+        hidden_dims=[32],
+        rnn_type="gru",
+        rnn_hidden_dim=16,
+        head_reads_features=True,
+        distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
+    )
+    steps, envs = 5, 2
+    dones = torch.zeros(steps, envs)
+    dones[1, 0] = 1.0  # env 0's rollout splits into two episodes, so the batch is padded
+    padded_obs, masks = split_and_pad_trajectories(torch.randn(steps, envs, OBS_DIM), dones)
+    padded = TensorDict({"policy": padded_obs}, batch_size=padded_obs.shape[:2])
+    latent = model.get_latent(padded, masks=masks, hidden_state=torch.zeros(1, padded_obs.shape[1], 16))
+    assert latent.shape == (steps, envs, OBS_DIM + 16)

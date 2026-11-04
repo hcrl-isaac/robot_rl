@@ -208,7 +208,7 @@ def test_critic_hooks_at_their_defaults_are_fb_cprs_updates() -> None:
 def test_mve_and_mage_update_and_log(mage_action: str) -> None:
     """With k-step targets and the action-gradient loss on, an update trains every critic and logs both."""
     alg = _model_cfg_alg(
-        mve_k=3, mage_beta=0.1, mage_q_beta=1.0, mage_batch_size=16, mage_action=mage_action, value_loss_coef=0.0
+        mve_k=3, mage_beta=0.1, mage_q_beta=1.0, mage_batch_size=16, mage_action=mage_action, value_loss_coef=0.1
     )
     loss_dict, extras = alg.update()
     for key in ("Forward_Backward_Loss/fb_loss", "Critic_Loss/discriminator_critic_loss", "Actor_Loss/total_loss"):

@@ -105,8 +105,6 @@ class WorldModelFbCpr(FbCpr):
         super().__init__(*args, **kwargs)
         if mve_k < 1:
             raise ValueError(f"mve_k must be at least 1, got {mve_k}.")
-        if mve_k > 1 and self.value_loss_coef > 0:
-            raise ValueError("mve_k > 1 does not expand the F value regularizer's target; set value_loss_coef = 0.")
         if mage_action not in ("policy", "buffer"):
             raise ValueError(f"mage_action must be 'policy' or 'buffer', got '{mage_action}'.")
         unknown = set(mve_critics) - {"forward", "disc", "aux"}

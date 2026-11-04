@@ -217,10 +217,11 @@ def test_mve_and_mage_update_and_log(mage_action: str) -> None:
         assert key in extras and torch.isfinite(extras[key]), (key, extras)
 
 
+@pytest.mark.parametrize("directions", [None, 2])
 @pytest.mark.parametrize("critic", ["forward", "disc", "aux"])
-def test_mage_trains_only_its_critic(critic: str) -> None:
-    """The action-gradient loss reaches the trained critic's parameters and nothing else."""
-    alg = _model_cfg_alg(mage_beta=1.0)
+def test_mage_trains_only_its_critic(critic: str, directions: int | None) -> None:
+    """The action-gradient loss (exact or finite-difference) reaches the trained critic's parameters only."""
+    alg = _model_cfg_alg(mage_beta=1.0, mage_directions=directions)
     win, batch = _normalized_batch(alg)
     for m in (alg.actor, alg.backward_map, alg.discriminator, alg.world_model, alg.forward_map, alg.disc_critic):
         m.zero_grad(set_to_none=True)
@@ -259,3 +260,15 @@ def test_mage_gradient_is_clipped_and_a_non_finite_one_dropped() -> None:
     out = alg._mage_backward("forward", win, batch)
     assert float(out["mage_forward_dropped"]) == 1.0
     assert all(p.grad is None or float(p.grad.abs().sum()) == 0 for p in alg.forward_map.parameters())
+
+
+def test_finite_difference_mage_matches_the_exact_slope() -> None:
+    """With many directions and a small step, the finite-difference |∂δ/∂a| agrees with double backprop."""
+    alg = _model_cfg_alg(mage_beta=1.0)
+    win, batch = _normalized_batch(alg)
+    torch.manual_seed(0)
+    exact = alg._mage_backward("disc", win, batch)["mage_disc_action_grad"]
+    alg.mage_directions, alg.mage_fd_eps = 256, 1e-3
+    torch.manual_seed(0)
+    estimate = alg._mage_backward("disc", win, batch)["mage_disc_action_grad"]
+    torch.testing.assert_close(estimate, exact, rtol=0.15, atol=1e-4)

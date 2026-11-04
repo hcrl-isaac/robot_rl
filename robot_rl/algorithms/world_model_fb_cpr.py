@@ -69,6 +69,8 @@ class WorldModelFbCpr(FbCpr):
         mage_q_beta: float | None = None,
         mage_batch_size: int | None = None,
         mage_max_grad_norm: float | None = 1.0,
+        mage_directions: int | None = None,
+        mage_fd_eps: float = 0.01,
         mage_action: str = "policy",
         critic_model_start_update: int = 0,
         **kwargs: Any,
@@ -91,6 +93,9 @@ class WorldModelFbCpr(FbCpr):
             mage_batch_size: Rows of the update's batch MAGE differentiates on; None uses all of them.
             mage_max_grad_norm: Norm clip of each critic's MAGE parameter gradient (FB-CPR's critics run unclipped,
                 and a second-order gradient can be large); None disables it.
+            mage_directions: Random unit directions of a central finite-difference estimate of ||∂δ/∂a||²
+                (first-order in the critic's parameters); None differentiates exactly by double backprop.
+            mage_fd_eps: Finite-difference step in action units.
             mage_action: Where MAGE differentiates: ``"policy"`` (the actor's action) or ``"buffer"`` (the logged one).
             critic_model_start_update: Updates before MVE and MAGE start (the world model's warm-up).
             **kwargs: :class:`FbCpr` keyword arguments.
@@ -107,6 +112,8 @@ class WorldModelFbCpr(FbCpr):
         self.mage_q_beta = mage_beta if mage_q_beta is None else mage_q_beta
         self.mage_batch_size = mage_batch_size
         self.mage_max_grad_norm = mage_max_grad_norm
+        self.mage_directions = mage_directions
+        self.mage_fd_eps = mage_fd_eps
         self.mage_action = mage_action
         self.critic_model_start_update = critic_model_start_update
         self.learner = learner
@@ -297,10 +304,12 @@ class WorldModelFbCpr(FbCpr):
     def _mage_backward(
         self, critic: str, win: SequenceReplayBuffer.Window, batch: ReplayBuffer.Batch
     ) -> dict[str, torch.Tensor]:
-        """Accumulate ``mage_beta`` E||∂δ/∂a||² on one critic's gradients (its optimizer's gradients reset first).
+        """Write the gradient of ``beta`` E||∂δ/∂a||² into one critic (its optimizer's gradients reset first).
 
-        δ is the critic's one-step TD residual with the next state from one differentiable world-model step, so the
-        model's action Jacobian shapes the critic's action slope. Only the trained critic gets gradient.
+        δ is the critic's one-step TD residual with the next state from one world-model step, so the model's action
+        Jacobian shapes the critic's action slope. The squared slope comes exactly (double backprop) or from central
+        finite differences along ``mage_directions`` random unit directions. Only the trained critic gets gradient,
+        norm-clipped, and a non-finite one is dropped.
 
         Args:
             critic: ``"forward"`` (F, through ``F^T z`` and B's implicit reward), ``"disc"`` or ``"aux"``.
@@ -308,7 +317,7 @@ class WorldModelFbCpr(FbCpr):
             batch: The same transitions, normalized, with their latents and normalized aux rewards.
 
         Returns:
-            The mean action-gradient norm, for logging.
+            The action-slope and parameter-gradient norms and whether the gradient was dropped, for logging.
         """
         trained, optimizer = {
             "forward": (self.forward_map, self.forward_optimizer),
@@ -325,42 +334,49 @@ class WorldModelFbCpr(FbCpr):
             rows = torch.randperm(self.batch_size, device=self.device)[: self.mage_batch_size]
             z, obs, alive, actions = z[rows], obs[rows], alive[rows], actions[rows]
             starts, next_real = starts[rows], next_real[rows]
+        with torch.no_grad():
+            reward_z = self._implicit_reward_weights(batch.next_observations, z) if critic == "forward" else None
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             if self.mage_action == "policy":
                 with torch.no_grad():
-                    action = self.actor(obs, z, stochastic_output=True, std_clip=self.clip_actor_std)
-            else:
-                action = actions
-            action = action.detach().clone().requires_grad_(True)
-            goals = self.learner.start_goals(starts, 1)
-            step = self.learner.imagine(
-                lambda _: action, starts, goals, self.learner.noise_bank(), freeze_model=False, horizon=1
-            )
-            next_raw = step.obs[1]
+                    actions = self.actor(obs, z, stochastic_output=True, std_clip=self.clip_actor_std)
+            actions = actions.detach()
+            # the noise does not depend on the action: a noise-free step keeps paired differences exact
+            bank = {g: torch.zeros_like(b[:1]) for g, b in self.learner.noise_bank().items()}
+            base = None
             if self.mage_action == "buffer":
-                # the real next state's value, the model's derivative
-                next_raw = next_real.select(*next_raw.keys()) + (next_raw - next_raw.detach())
-            next_obs = self._normalize(next_raw)
-            next_action = self.actor(next_obs, z)
-            if critic == "forward":
-                q = (self.forward_map(obs, z, action) * z).sum(dim=-1)
                 with torch.no_grad():
-                    reward_z = self._implicit_reward_weights(batch.next_observations, z)
-                reward = (self.backward_map(next_obs).float() * reward_z).sum(dim=-1)
-                q_next = (self.target_forward_map.target(next_obs, z, next_action) * z).sum(dim=-1).mean(dim=0)
-            elif critic == "disc":
-                q = self.disc_critic(obs, z, action).squeeze(-1)
-                reward = torch.zeros_like(alive)
-                q_next = self.target_disc_critic.target(next_obs, z, next_action).squeeze(-1).mean(dim=0)
+                    base = self._model_step(starts, actions, bank)[0]
+            if self.mage_directions is None:
+                action = actions.clone().requires_grad_(True)
+                delta = self._mage_residual(critic, obs, z, alive, action, starts, next_real, base, bank, reward_z)
+                sq = torch.stack([
+                    torch.autograd.grad(delta[p].sum(), action, create_graph=True)[0].pow(2).sum(dim=-1)
+                    for p in range(delta.shape[0])
+                ]).mean()
             else:
-                q = self.aux_critic(obs, z, action).squeeze(-1)
-                reward = step.rewards[0] * self.aux_reward_normalizer.S.sqrt().reciprocal()
-                q_next = self.target_aux_critic.target(next_obs, z, next_action).squeeze(-1).mean(dim=0)
-            delta = q - (reward + self.gamma * alive * q_next)
-            sq = torch.stack([
-                torch.autograd.grad(delta[p].sum(), action, create_graph=True)[0].pow(2).sum(dim=-1)
-                for p in range(delta.shape[0])
-            ]).mean()
+                k, n, eps = self.mage_directions, actions.shape[0], self.mage_fd_eps
+                u = nn.functional.normalize(torch.randn(k, n, actions.shape[-1], device=self.device), dim=-1)
+                shifted = torch.cat([actions + eps * u, actions - eps * u]).reshape(2 * k * n, -1)
+
+                def rep(x: Any) -> Any:
+                    return None if x is None else torch.cat([x] * (2 * k), dim=0)
+
+                delta = self._mage_residual(
+                    critic,
+                    rep(obs),
+                    rep(z),
+                    rep(alive),
+                    shifted,
+                    rep(starts),
+                    rep(next_real),
+                    rep(base),
+                    bank,
+                    rep(reward_z),
+                ).view(-1, 2, k, n)
+                slope = (delta[:, 0] - delta[:, 1]) / (2 * eps)
+                # a random unit direction u has E[(u . g)^2] = |g|^2 / d
+                sq = actions.shape[-1] * slope.pow(2).mean()
             loss = (self.mage_beta if critic == "forward" else self.mage_q_beta) * sq
         params = [p for p in trained.parameters() if p.requires_grad]
         grads = torch.autograd.grad(loss, params, allow_unused=True)
@@ -383,6 +399,50 @@ class WorldModelFbCpr(FbCpr):
             f"mage_{critic}_param_grad_norm": norm.detach(),
             f"mage_{critic}_dropped": (~finite).float(),
         }
+
+    def _model_step(
+        self, starts: TensorDict, actions: torch.Tensor, bank: dict[str, torch.Tensor]
+    ) -> tuple[TensorDict, torch.Tensor]:
+        """One world-model step from raw ``starts`` under ``actions``: the next raw groups and the reward."""
+        goals = self.learner.start_goals(starts, 1)
+        step = self.learner.imagine(lambda _: actions, starts, goals, bank, freeze_model=False, horizon=1)
+        return step.obs[1], step.rewards[0]
+
+    def _mage_residual(
+        self,
+        critic: str,
+        obs: TensorDict,
+        z: torch.Tensor,
+        alive: torch.Tensor,
+        action: torch.Tensor,
+        starts: TensorDict,
+        next_real: TensorDict,
+        base: TensorDict | None,
+        bank: dict[str, torch.Tensor],
+        reward_z: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return one critic's TD residual per member, ``(P, N)``, with the next state from a model step at ``action``.
+
+        With ``base`` (buffer mode) the next state is the real one moved by the model's change from ``base``.
+        """
+        next_raw, reward_model = self._model_step(starts, action, bank)
+        if base is not None:
+            next_raw = next_real.select(*next_raw.keys()) + (next_raw - base)
+        next_obs = self._normalize(next_raw)
+        next_action = self.actor(next_obs, z)
+        if critic == "forward":
+            q = (self.forward_map(obs, z, action) * z).sum(dim=-1)
+            reward = (self.backward_map(next_obs).float() * reward_z).sum(dim=-1)
+            q_next = (self.target_forward_map.target(next_obs, z, next_action) * z).sum(dim=-1).mean(dim=0)
+        elif critic == "disc":
+            q = self.disc_critic(obs, z, action).squeeze(-1)
+            reward = torch.zeros_like(alive)
+            q_next = self.target_disc_critic.target(next_obs, z, next_action).squeeze(-1).mean(dim=0)
+        else:
+            q = self.aux_critic(obs, z, action).squeeze(-1)
+            reward = reward_model * self.aux_reward_normalizer.S.sqrt().reciprocal()
+            q_next = self.target_aux_critic.target(next_obs, z, next_action).squeeze(-1).mean(dim=0)
+        return q - (reward + self.gamma * alive * q_next)
 
     def _update_imagined_actor(
         self, starts: TensorDict, z: torch.Tensor, cov_obs: TensorDict, horizon: int

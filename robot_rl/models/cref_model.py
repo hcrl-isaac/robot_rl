@@ -46,6 +46,7 @@ class CrefModel(CNNRNNModel):
         aux_target_dim: int = 0,
         aux_readout: bool = False,
         token_positions: bool = False,
+        spatial_readout: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the CReF model.
@@ -65,6 +66,8 @@ class CrefModel(CNNRNNModel):
                 supervised quantity reaches the policy as an explicit feature.
             token_positions: Add a learned embedding per feature-map cell to its token, so the attended
                 feature says where in the image it came from, not only what it saw.
+            spatial_readout: Add each tokenizer channel's spatial-softmax keypoint (its expected image ``(u, v)``),
+                projected to the token width, to the attended feature: a direct path for where things are.
             **kwargs: Forwarded to :class:`CNNModel` (``hidden_dims``, ``cnn_cfg``, ``distribution_cfg``, ...).
         """
         self.token_dim = token_dim
@@ -117,6 +120,11 @@ class CrefModel(CNNRNNModel):
             if token_positions
             else None
         )
+        self.spatial_readout = spatial_readout
+        if spatial_readout:
+            widths = {g: int(self.cnns[g].output_channels) for g in self.obs_groups_2d}  # type: ignore[arg-type]
+            self.keypoint_log_temp = nn.ParameterDict({g: nn.Parameter(torch.zeros(c)) for g, c in widths.items()})
+            self.keypoint_proj = nn.Linear(2 * sum(widths.values()), token_dim)
         self._last_attn: torch.Tensor | None = None
         self._attn_weights: torch.Tensor | None = None
 
@@ -124,18 +132,32 @@ class CrefModel(CNNRNNModel):
         """Fused per-step feature for a flat ``(N,)`` batch, shape ``(N, 2 * token_dim)``."""
         proprio = MLPModel.get_latent(self, obs)
         query = self.proprio_tokenizer(proprio)
-        tokens = []
+        tokens, keypoints = [], []
         for group in self.obs_groups_2d:
             fmap = self.cnns[group](obs[group])  # (N, C, H, W)
+            if self.spatial_readout:
+                keypoints.append(self._keypoints(fmap, group))
             tok = self.token_proj[group](fmap.flatten(2).transpose(1, 2))  # (N, H*W, token_dim)
             tokens.append(tok + self.token_pos[group] if self.token_pos is not None else tok)
         keys = self.token_norm(torch.cat(tokens, dim=1))
         attended, weights = self.attn(self.query_norm(query).unsqueeze(1), keys, keys, need_weights=True)
         self._attn_weights = weights.squeeze(1)  # (N, num_tokens), heads averaged, differentiable
         self._last_attn = self._attn_weights.detach()
-        x = torch.cat([query, attended.squeeze(1)], dim=-1)
+        attended = attended.squeeze(1)
+        if self.spatial_readout:
+            attended = attended + self.keypoint_proj(torch.cat(keypoints, dim=-1))
+        x = torch.cat([query, attended], dim=-1)
         content, gate = self.fusion_out(nn.functional.elu(self.fusion_hidden(self.fusion_norm(x)))).chunk(2, dim=-1)
         return x + content * torch.sigmoid(gate)
+
+    def _keypoints(self, fmap: torch.Tensor, group: str) -> torch.Tensor:
+        """Each channel's softmax-weighted mean cell centre in ``(-1, 1)``, shape ``(N, 2 * C)`` as ``(u..., v...)``."""
+        _, c, h, w = fmap.shape
+        temp = self.keypoint_log_temp[group].exp().view(1, c, 1)
+        weights = torch.softmax(fmap.flatten(2) * temp, dim=-1)  # (N, C, H*W)
+        v = ((torch.arange(h, device=fmap.device) + 0.5) * 2.0 / h - 1.0).repeat_interleave(w)
+        u = ((torch.arange(w, device=fmap.device) + 0.5) * 2.0 / w - 1.0).repeat(h)
+        return torch.cat([(weights * u).sum(-1), (weights * v).sum(-1)], dim=-1)
 
     def _head_input(self, feats: torch.Tensor, rnn_out: torch.Tensor) -> torch.Tensor:
         """Highway gate between the recurrent feature and the current fused feature."""

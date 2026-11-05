@@ -13,7 +13,10 @@ from tests.algorithms.test_sac_recurrent import NUM_ENVS, _collect, _DummyImageV
 
 
 def _build(
-    aux_obs_group: str | None = None, attn_target_group: str | None = None, aux_readout: bool = False
+    aux_obs_group: str | None = None,
+    attn_target_group: str | None = None,
+    aux_readout: bool = False,
+    spatial_readout: bool = False,
 ) -> tuple[SAC, _DummyImageVecEnv]:
     env = _DummyImageVecEnv()
     cfg = _make_cfg(aux_obs_group=aux_obs_group)
@@ -30,6 +33,7 @@ def _build(
         "cnn_cfg": {"output_channels": [4, 4], "kernel_size": 3, "stride": 2, "activation": "elu"},
         "distribution_cfg": {"class_name": "SquashedTanhGaussianDistribution", "init_noise_std": 1.0},
         "aux_readout": aux_readout,
+        "spatial_readout": spatial_readout,
     }
     alg = SAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu")
     return alg, env
@@ -124,3 +128,20 @@ class TestCrefModel:
         _collect(alg, env, 12)
         losses, diag = alg.update()
         assert torch.isfinite(torch.tensor(losses["actor"])) and diag["Actor/aux_loss"] > 0
+
+    def test_spatial_readout_finds_a_peak_and_trains(self) -> None:
+        """Each channel's keypoint lands on its activation peak, and the readout gets gradient from the update."""
+        torch.manual_seed(0)
+        alg, env = _build(spatial_readout=True)
+        actor = alg.actor
+        group = actor.obs_groups_2d[0]
+        rows, cols = actor.token_grids[0]
+        fmap = torch.full((1, actor.cnns[group].output_channels, rows, cols), -10.0)
+        fmap[:, :, rows - 1, 0] = 10.0
+        kp = actor._keypoints(fmap, group)
+        c = fmap.shape[1]
+        assert torch.allclose(kp[:, :c], torch.full((1, c), 1.0 / cols - 1.0), atol=1e-3)
+        assert torch.allclose(kp[:, c:], torch.full((1, c), 1.0 - 1.0 / rows), atol=1e-3)
+        _collect(alg, env, 12)
+        alg.update()
+        assert actor.keypoint_proj.weight.grad is not None and actor.keypoint_proj.weight.grad.abs().sum() > 0

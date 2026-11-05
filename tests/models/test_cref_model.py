@@ -13,7 +13,10 @@ from tests.algorithms.test_sac_recurrent import NUM_ENVS, _collect, _DummyImageV
 
 
 def _build(
-    aux_obs_group: str | None = None, attn_target_group: str | None = None, aux_readout: bool = False
+    aux_obs_group: str | None = None,
+    attn_target_group: str | None = None,
+    aux_readout: bool = False,
+    token_positions: bool = True,
 ) -> tuple[SAC, _DummyImageVecEnv]:
     env = _DummyImageVecEnv()
     cfg = _make_cfg(aux_obs_group=aux_obs_group)
@@ -30,6 +33,7 @@ def _build(
         "cnn_cfg": {"output_channels": [4, 4], "kernel_size": 3, "stride": 2, "activation": "elu"},
         "distribution_cfg": {"class_name": "SquashedTanhGaussianDistribution", "init_noise_std": 1.0},
         "aux_readout": aux_readout,
+        "token_positions": token_positions,
     }
     alg = SAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu")
     return alg, env
@@ -124,3 +128,20 @@ class TestCrefModel:
         _collect(alg, env, 12)
         losses, diag = alg.update()
         assert torch.isfinite(torch.tensor(losses["actor"])) and diag["Actor/aux_loss"] > 0
+
+    def test_token_positions_tell_cells_apart(self) -> None:
+        """Identical cell features give identical keys without positions and distinct keys with them."""
+        for positions in (False, True):
+            torch.manual_seed(0)
+            alg, _ = _build(token_positions=positions)
+            actor = alg.actor
+            assert (actor.token_pos is not None) == positions
+            group = actor.obs_groups_2d[0]
+            rows, cols = actor.token_grids[0]
+            if positions:
+                assert actor.token_pos[group].shape == (rows * cols, 16)
+            fmap = torch.ones(NUM_ENVS, actor.token_proj[group].in_features, rows, cols)
+            tok = actor.token_proj[group](fmap.flatten(2).transpose(1, 2))
+            keys = actor.token_norm(tok + actor.token_pos[group] if positions else tok)
+            spread = float((keys - keys[:, :1]).abs().max())
+            assert (spread > 1e-3) == positions

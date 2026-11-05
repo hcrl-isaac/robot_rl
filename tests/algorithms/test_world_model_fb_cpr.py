@@ -299,3 +299,25 @@ def test_value_regularizer_takes_the_expanded_target() -> None:
         batch, bootstrap_obs=batch.next_observations, bootstrap_gammas=zero_gammas, credit_backward=credit
     )
     torch.testing.assert_close(losses["Forward_Backward_Loss/value_reg_loss"], expected)
+
+
+@pytest.mark.parametrize("ridge", [0.0, 0.5])
+def test_credit_ridge_shrinks_the_weak_directions_of_real_backward_covariance(ridge: float) -> None:
+    """Each covariance eigendirection keeps eig / (eig + ridge * mean eig) of the credit; 0 leaves it untouched."""
+    alg = _model_cfg_alg(mve_k=3, mve_credit_ridge=ridge)
+    _, batch = _normalized_batch(alg)
+    with torch.no_grad():
+        own = alg.backward_map(batch.next_observations)
+        _, vec = torch.linalg.eigh(own.T @ own / own.shape[0])
+    credit = torch.stack([vec[:, -1], vec[:, 0]])
+    batch.next_observations = batch.next_observations[:2]
+    shrunk, extras = alg._shrink_credit(credit, batch)
+    if ridge == 0:
+        assert shrunk is credit
+    else:
+        eig2, vec2 = torch.linalg.eigh((lambda b: b.T @ b / b.shape[0])(own[:2]))
+        gain = eig2.clamp_min(0) / (eig2.clamp_min(0) + ridge * eig2.clamp_min(0).mean())
+        expected = ((credit @ vec2) * gain) @ vec2.T
+        torch.testing.assert_close(shrunk, expected, atol=1e-5, rtol=1e-4)
+        assert shrunk.norm(dim=-1).le(credit.norm(dim=-1) + 1e-6).all()
+    assert {"mve_cov_eig_p1", "mve_credit_weak_share_0.01", "mve_own_inv_cov_norm"} <= set(extras)

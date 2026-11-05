@@ -66,6 +66,7 @@ class WorldModelFbCpr(FbCpr):
         imagination_compile_mode: str | None = "max-autotune",
         mve_k: int = 1,
         mve_critics: tuple[str, ...] = ("forward", "disc", "aux"),
+        mve_credit_ridge: float = 0.0,
         mage_beta: float = 0.0,
         mage_q_beta: float | None = None,
         mage_batch_size: int | None = None,
@@ -90,6 +91,8 @@ class WorldModelFbCpr(FbCpr):
             imagination_compile_mode: ``torch.compile`` mode of the imagined loss; None runs it eagerly.
             mve_k: Steps of the critics' targets: the real next state plus ``k - 1`` imagined ones (1 = FB-CPR's).
             mve_critics: Which critics take the k-step targets: ``"forward"`` (F and B), ``"disc"``, ``"aux"``.
+            mve_credit_ridge: Shrinks F's imagined credit by ``C (C + r mean_eig(C) I)^-1``, ``C`` the real next
+                states' ``B`` covariance, so directions real states barely span cannot grow F; 0 leaves it as is.
             mage_beta: Weight of F's action-gradient (MAGE) loss through the world model (0 = off).
             mage_q_beta: Weight of the discriminator and aux critics' MAGE losses; None uses ``mage_beta``.
             mage_batch_size: Rows of the update's batch MAGE differentiates on; None uses all of them.
@@ -112,6 +115,7 @@ class WorldModelFbCpr(FbCpr):
             raise ValueError(f"mve_critics may name 'forward', 'disc' and 'aux', got {sorted(unknown)}.")
         self.mve_k = mve_k
         self.mve_critics = tuple(mve_critics)
+        self.mve_credit_ridge = mve_credit_ridge
         self.mage_beta = mage_beta
         self.mage_q_beta = mage_beta if mage_q_beta is None else mage_q_beta
         self.mage_batch_size = mage_batch_size
@@ -258,7 +262,9 @@ class WorldModelFbCpr(FbCpr):
         if self.mve_k > 1:
             exp = self._critic_expansion(win.obs[1], batch)
             if "forward" in self.mve_critics:
-                fb_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, credit_backward=exp.credit)
+                credit, spectrum = self._shrink_credit(exp.credit, batch)
+                fb_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, credit_backward=credit)
+                extras.update(spectrum)
             if "disc" in self.mve_critics:
                 disc_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, extra_rewards=exp.disc_rewards)
             if "aux" in self.mve_critics:
@@ -270,6 +276,37 @@ class WorldModelFbCpr(FbCpr):
             extras.update(self._mage_backward("forward", win, batch))
             extras["forward"] = torch.ones(())
         return fb_kwargs, disc_kwargs, aux_kwargs, extras
+
+    @torch.no_grad()
+    def _shrink_credit(
+        self, credit: torch.Tensor, batch: ReplayBuffer.Batch
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Shrink the imagined credit along the real ``B`` covariance's weak directions, and log where it lies.
+
+        Args:
+            credit: The expansion's discounted ``B`` at imagined states, ``(B, z_dim)``.
+            batch: The transitions, normalized; their real next states give the covariance.
+
+        Returns:
+            The credit to apply and its spectrum diagnostics (relative to the real next states' own ``B``).
+        """
+        own = self.backward_map(batch.next_observations).float()
+        eig, vec = torch.linalg.eigh(own.T @ own / own.shape[0])
+        eig = eig.clamp_min(0.0)
+        mean = eig.mean()
+        rel = eig / mean
+        extras = {f"mve_cov_eig_p{q}": torch.quantile(rel, q / 100) for q in (1, 10, 50)}
+        for name, x in (("credit", credit.float()), ("own", own)):
+            energy = (x @ vec).pow(2)
+            share = energy / energy.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            for cut in (0.01, 0.1):
+                extras[f"mve_{name}_weak_share_{cut}"] = share[:, rel < cut].sum(dim=-1).mean()
+            # Norm of C^-1 x: the size of the F that answers x when only real states constrain it
+            extras[f"mve_{name}_inv_cov_norm"] = (energy / (eig + 1e-6 * mean).pow(2)).sum(dim=-1).sqrt().mean()
+        if self.mve_credit_ridge <= 0:
+            return credit, extras
+        gain = eig / (eig + self.mve_credit_ridge * mean)
+        return ((credit.float() @ vec) * gain) @ vec.T, extras
 
     @torch.no_grad()
     def _critic_expansion(self, next_raw: TensorDict, batch: ReplayBuffer.Batch) -> CriticExpansion:

@@ -321,3 +321,19 @@ def test_credit_ridge_shrinks_the_weak_directions_of_real_backward_covariance(ri
         torch.testing.assert_close(shrunk, expected, atol=1e-5, rtol=1e-4)
         assert shrunk.norm(dim=-1).le(credit.norm(dim=-1) + 1e-6).all()
     assert {"mve_cov_eig_p1", "mve_credit_weak_share_0.01", "mve_own_inv_cov_norm"} <= set(extras)
+
+
+@pytest.mark.parametrize("credit_grad", [False, True])
+def test_credit_grad_trains_backward_on_imagined_states_but_not_the_model(credit_grad: bool) -> None:
+    """With mve_credit_grad the credit carries B's gradient (none reaches the world model); off, it is detached."""
+    alg = _model_cfg_alg(mve_k=3, mve_credit_grad=credit_grad, value_loss_coef=0.0)
+    alg.update_step = alg.critic_model_start_update
+    win, batch = _normalized_batch(alg)
+    fb_kwargs, _, _, _ = alg._model_critic_inputs(win, batch)
+    credit = fb_kwargs["credit_backward"]
+    assert credit.requires_grad == credit_grad
+    if credit_grad:
+        alg.backward_map.zero_grad()
+        credit.sum().backward()
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in alg.backward_map.parameters())
+        assert all(p.grad is None for p in alg.world_model.parameters())

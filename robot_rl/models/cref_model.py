@@ -45,6 +45,7 @@ class CrefModel(CNNRNNModel):
         rnn_num_layers: int = 1,
         aux_target_dim: int = 0,
         aux_readout: bool = False,
+        token_positions: bool = True,
         **kwargs: Any,
     ) -> None:
         """Initialize the CReF model.
@@ -62,6 +63,8 @@ class CrefModel(CNNRNNModel):
             aux_target_dim: Width of an auxiliary linear head on the fused feature; ``0`` adds none.
             aux_readout: Append the auxiliary head's (detached) prediction to the head input, so the
                 supervised quantity reaches the policy as an explicit feature.
+            token_positions: Add a learned embedding per feature-map cell to its token, so the attended
+                feature says where in the image it came from, not only what it saw.
             **kwargs: Forwarded to :class:`CNNModel` (``hidden_dims``, ``cnn_cfg``, ``distribution_cfg``, ...).
         """
         self.token_dim = token_dim
@@ -106,6 +109,14 @@ class CrefModel(CNNRNNModel):
         self.highway_gate = nn.Linear(2 * fused, fused)
         # token grids (rows, cols) per image group, in the order tokens are concatenated
         self.token_grids = [tuple(int(v) for v in tokenizers[g].output_dim) for g in self.obs_groups_2d]  # type: ignore[union-attr]
+        self.token_pos = (
+            nn.ParameterDict({
+                g: nn.Parameter(0.02 * torch.randn(math.prod(grid), token_dim))
+                for g, grid in zip(self.obs_groups_2d, self.token_grids, strict=True)
+            })
+            if token_positions
+            else None
+        )
         self._last_attn: torch.Tensor | None = None
         self._attn_weights: torch.Tensor | None = None
 
@@ -116,7 +127,8 @@ class CrefModel(CNNRNNModel):
         tokens = []
         for group in self.obs_groups_2d:
             fmap = self.cnns[group](obs[group])  # (N, C, H, W)
-            tokens.append(self.token_proj[group](fmap.flatten(2).transpose(1, 2)))  # (N, H*W, token_dim)
+            tok = self.token_proj[group](fmap.flatten(2).transpose(1, 2))  # (N, H*W, token_dim)
+            tokens.append(tok + self.token_pos[group] if self.token_pos is not None else tok)
         keys = self.token_norm(torch.cat(tokens, dim=1))
         attended, weights = self.attn(self.query_norm(query).unsqueeze(1), keys, keys, need_weights=True)
         self._attn_weights = weights.squeeze(1)  # (N, num_tokens), heads averaged, differentiable

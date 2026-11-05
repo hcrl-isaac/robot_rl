@@ -35,6 +35,7 @@ class CNN(nn.Sequential):
         global_pool: str = "none",
         flatten: bool = True,
         token_attention_heads: int = 0,
+        flatten_proj_dim: int = 0,
     ) -> None:
         """Initialize the CNN.
 
@@ -55,6 +56,8 @@ class CNN(nn.Sequential):
             flatten: Whether to flatten the output tensor.
             token_attention_heads: Heads of a residual self-attention block over the last feature map's cells
                 (position-tagged, starting as the identity), before pooling; 0 adds none.
+            flatten_proj_dim: Width of a linear projection of the flattened output, followed by LayerNorm and
+                tanh; 0 adds none. Requires ``flatten``.
         """
         super().__init__()
 
@@ -138,6 +141,13 @@ class CNN(nn.Sequential):
         # Store final output dimension
         self._output_channels = last_channels if not flatten else None
         self._output_dim = last_dim if not flatten else last_channels * last_dim[0] * last_dim[1]
+
+        if flatten_proj_dim:
+            if not flatten:
+                raise ValueError("flatten_proj_dim requires flatten=True.")
+            # a compact, normalized image code instead of every raw cell feeding the next network
+            layers += [nn.Linear(self._output_dim, flatten_proj_dim), nn.LayerNorm(flatten_proj_dim), nn.Tanh()]
+            self._output_dim = flatten_proj_dim
 
         # Register the layers
         for idx, layer in enumerate(layers):

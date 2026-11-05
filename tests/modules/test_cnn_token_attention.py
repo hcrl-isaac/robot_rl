@@ -50,3 +50,19 @@ def test_cnn_rnn_with_block_exports() -> None:
     inputs = onnx_model.get_dummy_inputs()
     out = onnx_model(*inputs)
     assert out[0].shape == (1, 3)
+
+
+def test_flatten_projection_sets_output_dim() -> None:
+    """The flatten projection maps the flattened cells to a bounded code of the requested width."""
+    cnn = CNN(
+        input_dim=(54, 96),
+        input_channels=4,
+        output_channels=[16, 32, 64],
+        kernel_size=3,
+        stride=2,
+        token_attention_heads=4,
+        flatten_proj_dim=256,
+    )
+    out = cnn(torch.randn(3, 4, 54, 96))
+    assert cnn.output_dim == 256 and out.shape == (3, 256)
+    assert out.abs().max() <= 1.0

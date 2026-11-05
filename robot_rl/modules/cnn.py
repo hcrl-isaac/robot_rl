@@ -34,6 +34,7 @@ class CNN(nn.Sequential):
         max_pool: bool | tuple[bool] | list[bool] = False,
         global_pool: str = "none",
         flatten: bool = True,
+        token_attention_heads: int = 0,
     ) -> None:
         """Initialize the CNN.
 
@@ -52,6 +53,8 @@ class CNN(nn.Sequential):
                 single boolean for all layers.
             global_pool: Global pooling type to apply at the end. Either 'none', 'max', or 'avg'.
             flatten: Whether to flatten the output tensor.
+            token_attention_heads: Heads of a residual self-attention block over the last feature map's cells
+                (position-tagged, starting as the identity), before pooling; 0 adds none.
         """
         super().__init__()
 
@@ -110,6 +113,9 @@ class CNN(nn.Sequential):
             # Update last channels and dimensions
             last_channels = output_channels[idx]
             last_dim = _compute_output_dim(last_dim, k, s, d, p, is_max_pool=get_param(max_pool, idx))
+
+        if token_attention_heads:
+            layers.append(TokenSelfAttention(last_channels, last_dim[0] * last_dim[1], token_attention_heads))
 
         # Apply global pooling if specified
         if global_pool == "none":
@@ -191,3 +197,38 @@ def _compute_output_dim(
         w = math.ceil(w / 2)
 
     return (h, w)
+
+
+class TokenSelfAttention(nn.Module):
+    """Pre-LN residual self-attention and feed-forward over a feature map's cells, shape-preserving.
+
+    Each cell is a token tagged with a learned position embedding; the output projections start at zero, so the
+    block starts as the identity and only adds what the cells learn to exchange.
+    """
+
+    def __init__(self, channels: int, cells: int, heads: int) -> None:
+        """Initialize the block.
+
+        Args:
+            channels: Feature channels per cell (the token width; divisible by ``heads``).
+            cells: Number of cells in the feature map.
+            heads: Attention heads.
+        """
+        super().__init__()
+        self.pos = nn.Parameter(0.02 * torch.randn(cells, channels))
+        self.norm_attn = nn.LayerNorm(channels)
+        self.norm_ff = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(channels, heads, batch_first=True)
+        self.ff = nn.Sequential(nn.Linear(channels, 2 * channels), nn.ELU(), nn.Linear(2 * channels, channels))
+        for layer in (self.attn.out_proj, self.ff[-1]):
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, fmap: torch.Tensor) -> torch.Tensor:
+        """Mix information across cells of an ``(N, C, H, W)`` map; returns the same shape."""
+        n, c, h, w = fmap.shape
+        x = fmap.flatten(2).transpose(1, 2)
+        y = self.norm_attn(x + self.pos)
+        x = x + self.attn(y, y, y, need_weights=False)[0]
+        x = x + self.ff(self.norm_ff(x))
+        return x.transpose(1, 2).reshape(n, c, h, w)

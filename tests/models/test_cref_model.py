@@ -16,7 +16,7 @@ def _build(
     aux_obs_group: str | None = None,
     attn_target_group: str | None = None,
     aux_readout: bool = False,
-    token_positions: bool = True,
+    token_positions: bool = False,
 ) -> tuple[SAC, _DummyImageVecEnv]:
     env = _DummyImageVecEnv()
     cfg = _make_cfg(aux_obs_group=aux_obs_group)
@@ -145,3 +145,14 @@ class TestCrefModel:
             keys = actor.token_norm(tok + actor.token_pos[group] if positions else tok)
             spread = float((keys - keys[:, :1]).abs().max())
             assert (spread > 1e-3) == positions
+
+    def test_checkpoint_without_positions_loads_strictly(self) -> None:
+        """A state dict saved before token positions existed loads strictly into the default model."""
+        torch.manual_seed(0)
+        old, _ = _build()
+        state = {k: v for k, v in old.actor.state_dict().items() if not k.startswith("token_pos")}
+        assert state.keys() == old.actor.state_dict().keys()
+        new, _ = _build()
+        new.actor.load_state_dict(state, strict=True)
+        with_pos, _ = _build(token_positions=True)
+        assert any(k.startswith("token_pos") for k in with_pos.actor.state_dict())

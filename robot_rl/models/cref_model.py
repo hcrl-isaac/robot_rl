@@ -45,7 +45,7 @@ class CrefModel(CNNRNNModel):
         rnn_num_layers: int = 1,
         aux_target_dim: int = 0,
         aux_readout: bool = False,
-        token_positions: bool = True,
+        token_positions: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the CReF model.

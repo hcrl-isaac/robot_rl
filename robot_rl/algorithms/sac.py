@@ -86,6 +86,7 @@ class SAC:
         estimator_learning_rate: float = 1e-3,
         compile_mode: str | None = None,
         encoder_bf16: bool = False,
+        compile_encoder: bool = False,
         device: str = "cpu",
         rnd_cfg: dict | None = None,
         symmetry_cfg: dict | None = None,
@@ -114,6 +115,10 @@ class SAC:
 
         # Models
         self.actor = actor.to(device)
+        if compile_encoder and str(device).startswith("cuda"):
+            # in place, so the state-dict keys and checkpoints are unchanged
+            for cnn in getattr(self.actor, "cnns", {}).values():
+                cnn.compile()
         self.critic_1 = critic_1.to(device)
         self.critic_2 = critic_2.to(device)
         self.critic_1_target = TargetNetwork(self.critic_1, tau).to(device)
@@ -365,8 +370,14 @@ class SAC:
         counts: dict[str, int] = {}
 
         def _acc(key: str, value: torch.Tensor | float) -> None:
-            diag[key] = diag.get(key, 0.0) + float(value)
+            # sums stay on the device and are read once at the end: a read per minibatch stalls the host
+            value = value.detach() if isinstance(value, torch.Tensor) else value
+            diag[key] = diag.get(key, 0.0) + value
             counts[key] = counts.get(key, 0) + 1
+
+        def _acc_diag(key: str, value: torch.Tensor | float) -> None:
+            if num_updates == 0:
+                _acc(key, value)
 
         num_updates = 0
         num_actor_updates = 0
@@ -404,7 +415,9 @@ class SAC:
                     with self._encoder_autocast():
                         _, h0 = self.actor.encode_sequence(obs[:burn], h0, resets[:burn])
                     h0 = _to_float(h0)
-                self._recurrent_state_diagnostics(batch, h0, _acc)
+                if num_updates == 0:
+                    # diagnostics only: one window batch per call measures the same quantities
+                    self._recurrent_state_diagnostics(batch, h0, _acc)
             if self.critic_sees_hidden:
                 self._update_critics_on_windows(batch, h0, _acc)
 
@@ -429,8 +442,7 @@ class SAC:
                     torch.distributed.all_reduce(self.log_alpha.grad, op=torch.distributed.ReduceOp.SUM)
                     self.log_alpha.grad /= self.gpu_world_size
                 self.alpha_optimizer.step()
-                self.alpha = self.log_alpha.exp().item()
-                sums["alpha"] += alpha_loss.item()
+                sums["alpha"] += alpha_loss.detach()
             if self.update_step % self.policy_frequency == 0:
                 for p in self.critic_parameters:
                     p.requires_grad_(False)
@@ -462,18 +474,19 @@ class SAC:
                 if self.is_multi_gpu:
                     self.reduce_parameters(self.actor_parameters)
                 _acc("Actor/grad_norm", nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm))
-                _acc("Actor/grad_norm_rnn", _param_grad_norm(self.actor.rnn.parameters()))  # type: ignore[attr-defined]
+                _acc_diag("Actor/grad_norm_rnn", _param_grad_norm(self.actor.rnn.parameters()))  # type: ignore[attr-defined]
                 if hasattr(self.actor, "cnns"):
-                    _acc("Actor/grad_norm_cnn", _param_grad_norm(self.actor.cnns.parameters()))
+                    _acc_diag("Actor/grad_norm_cnn", _param_grad_norm(self.actor.cnns.parameters()))
                 self.actor_optimizer.step()
                 for p in self.critic_parameters:
                     p.requires_grad_(True)
-                with torch.no_grad():
-                    # policy-action Q minus data-action Q: a growing gap is the actor exploiting critic error
-                    data_in = self._critic_input(actions_b, latent)
-                    q_data = torch.min(self.critic_1(flat_obs, data_in), self.critic_2(flat_obs, data_in)).view(-1)
-                    _acc("Critic/q_pi_gap", (min_q_pi - q_data).mean())
-                sums["actor"] += actor_loss.item()
+                if num_updates == 0:
+                    with torch.no_grad():
+                        # policy-action Q minus data-action Q: a growing gap is the actor exploiting critic error
+                        data_in = self._critic_input(actions_b, latent)
+                        q_data = torch.min(self.critic_1(flat_obs, data_in), self.critic_2(flat_obs, data_in)).view(-1)
+                        _acc("Critic/q_pi_gap", (min_q_pi - q_data).mean())
+                sums["actor"] += actor_loss.detach()
                 num_actor_updates += 1
             self.critic_1_target.update()
             self.critic_2_target.update()
@@ -498,6 +511,9 @@ class SAC:
             _acc("Recurrent/hidden_abs_rollout", self._rollout_hidden_abs / self._rollout_hidden_steps)
             self._rollout_hidden_abs.zero_()
             self._rollout_hidden_steps = 0
+        if self.auto_alpha:
+            self.alpha = self.log_alpha.exp().item()
+        sums = {k: float(v) for k, v in sums.items()}
         n = max(num_updates, 1)
         losses = {
             "critic_1": sums["critic_1"] / n,
@@ -506,7 +522,7 @@ class SAC:
             "alpha": sums["alpha"] / n if self.auto_alpha else 0.0,
             "alpha_value": self.alpha,
         }
-        return losses, {k: v / counts[k] for k, v in diag.items()}
+        return losses, {k: float(v) / counts[k] for k, v in diag.items()}
 
     def _current_window_priority(self) -> float:
         """Return the window-priority weight for this update, annealed linearly to 1."""
@@ -563,7 +579,7 @@ class SAC:
             self.reduce_parameters(self.critic_parameters)
         acc("Critic/grad_norm", nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm))
         self.critic_optimizer.step()
-        self._last_critic_losses = (critic_1_loss.item(), critic_2_loss.item())
+        self._last_critic_losses = (critic_1_loss.detach(), critic_2_loss.detach())
         with torch.no_grad():
             acc("Critic/q_data", q1.mean())
             acc("Critic/q_target", target_q.mean())
@@ -611,7 +627,7 @@ class SAC:
             self.reduce_parameters(self.critic_parameters)
         acc("Critic/grad_norm", nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm))
         self.critic_optimizer.step()
-        self._last_critic_losses = (critic_1_loss.item(), critic_2_loss.item())
+        self._last_critic_losses = (critic_1_loss.detach(), critic_2_loss.detach())
         with torch.no_grad():
             acc("Critic/q_data", q1.mean())
             acc("Critic/q_target", target_q.mean())

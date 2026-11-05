@@ -7,6 +7,7 @@ slot, so it exports through the standard ``as_jit()``/``as_onnx()`` API regardle
 from __future__ import annotations
 
 import copy
+import math
 import os
 import re
 import torch
@@ -65,7 +66,19 @@ def _num_actions(model_cfg: dict, sd: dict[str, torch.Tensor], default_class: st
     """
     width = resolve_callable(model_cfg.get("class_name", default_class)).head_output_width(sd)
     dist_cfg = model_cfg.get("distribution_cfg")
-    return width if dist_cfg is None else _distribution_class(dist_cfg).output_dim_for_input_width(width)
+    if dist_cfg is None:
+        return width
+    dist_class = _distribution_class(dist_cfg)
+    kwargs = {k: v for k, v in dist_cfg.items() if k != "class_name"}
+    # per-state heads (log kappa, tail std) widen the layer by an amount the class alone cannot tell; build to match
+    for output_dim in range(dist_class.output_dim_for_input_width(width), 0, -1):
+        try:
+            input_dim = dist_class(output_dim, **kwargs).input_dim
+        except ValueError:
+            continue
+        if (math.prod(input_dim) if isinstance(input_dim, list) else input_dim) == width:
+            return output_dim
+    raise ValueError(f"No {dist_class.__name__} output_dim gives a {width}-wide head with the logged distribution_cfg.")
 
 
 def _extend_bn_identity(bn: nn.BatchNorm1d, extra_dims: int) -> nn.BatchNorm1d:

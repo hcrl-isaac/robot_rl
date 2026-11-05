@@ -13,7 +13,14 @@ from robot_rl.modules.cnn import TokenSelfAttention
 
 def _cnn(heads: int) -> CNN:
     torch.manual_seed(0)
-    return CNN(input_dim=(54, 96), input_channels=4, output_channels=[16, 32, 64], kernel_size=3, stride=2, token_attention_heads=heads)
+    return CNN(
+        input_dim=(54, 96),
+        input_channels=4,
+        output_channels=[16, 32, 64],
+        kernel_size=3,
+        stride=2,
+        token_attention_heads=heads,
+    )
 
 
 def test_block_starts_as_identity_and_trains() -> None:
@@ -36,7 +43,9 @@ def test_cnn_rnn_with_block_exports() -> None:
 
     obs = TensorDict({"policy": torch.zeros(1, 10), "image": torch.zeros(1, 4, 54, 96)}, batch_size=[1])
     cnn_cfg = {"output_channels": [16, 32, 64], "kernel_size": 3, "stride": 2, "token_attention_heads": 4}
-    model = CNNRNNModel(obs, {"actor": ["policy", "image"]}, "actor", 3, hidden_dims=[32], cnn_cfg=cnn_cfg, rnn_hidden_dim=16)
+    model = CNNRNNModel(
+        obs, {"actor": ["policy", "image"]}, "actor", 3, hidden_dims=[32], cnn_cfg=cnn_cfg, rnn_hidden_dim=16
+    )
     onnx_model = model.as_onnx()
     inputs = onnx_model.get_dummy_inputs()
     out = onnx_model(*inputs)

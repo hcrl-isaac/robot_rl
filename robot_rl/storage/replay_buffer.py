@@ -162,6 +162,7 @@ class ReplayBuffer:
         hidden_layers: int = 1,
         hidden_is_lstm: bool = False,
         obs_dtypes: dict[str, torch.dtype] | None = None,
+        obs_quantize: dict[str, tuple[float, float]] | None = None,
     ) -> None:
         """Initialize the buffer storage.
 
@@ -184,6 +185,8 @@ class ReplayBuffer:
             hidden_is_lstm: Store two slots per step (``h`` and ``c``) instead of one.
             obs_dtypes: Storage dtype of the named observation groups (e.g. ``float16`` for a long history); each is
                 sampled back in the group's own dtype. Groups not named are stored as given.
+            obs_quantize: ``(low, high)`` value range of the named observation groups, stored as ``uint8`` in 256
+                levels over that range and read back in the group's own dtype; values outside it are clamped.
         """
         # store inputs
         self.num_envs = num_envs
@@ -199,7 +202,8 @@ class ReplayBuffer:
         # Core
         # We only take value.shape[1:] to ignore num_envs dimension
         self._obs_dtypes = {key: value.dtype for key, value in obs.items()}
-        stored = obs_dtypes or {}
+        self._quantize = dict(obs_quantize or {})
+        stored = {**(obs_dtypes or {}), **{key: torch.uint8 for key in self._quantize}}
         self.observations = TensorDict(
             {
                 key: torch.zeros(self.capacity, *value.shape[1:], dtype=stored.get(key, value.dtype), device=device)
@@ -286,7 +290,10 @@ class ReplayBuffer:
         """``observations`` on the storage device, each group in its storage dtype."""
         out = observations.to(self.device)
         for key, value in self.observations.items():
-            if out[key].dtype != value.dtype:
+            if key in self._quantize:
+                low, high = self._quantize[key]
+                out[key] = ((out[key] - low) * (255.0 / (high - low))).round().clamp(0, 255).to(torch.uint8)
+            elif out[key].dtype != value.dtype:
                 out[key] = out[key].to(value.dtype)
         return out
 
@@ -294,7 +301,10 @@ class ReplayBuffer:
         """``observations[idx]`` on ``device``, each group back in its own dtype."""
         out = observations[idx].to(device)
         for key, dtype in self._obs_dtypes.items():
-            if out[key].dtype != dtype:
+            if key in self._quantize:
+                low, high = self._quantize[key]
+                out[key] = out[key].to(dtype) * ((high - low) / 255.0) + low
+            elif out[key].dtype != dtype:
                 out[key] = out[key].to(dtype)
         return out
 

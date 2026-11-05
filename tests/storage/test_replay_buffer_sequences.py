@@ -177,3 +177,46 @@ def test_a_full_buffer_does_not_read_the_newest_row_as_the_oldest_rows_predecess
     buffer = _make_buffer()
     _fill(buffer, CAPACITY_PER_ENV + 5, done_at={CAPACITY_PER_ENV + 4})  # only the newest step ends an episode
     assert buffer.sample_sequences(seq_len=4, burn_in=2, episode_start=True) is None
+
+
+def test_quantized_group_is_stored_as_uint8_and_read_back_within_a_step() -> None:
+    """A quantized group is stored in 256 levels over its range and sampled back in its own dtype."""
+    obs = TensorDict({"policy": torch.zeros(NUM_ENVS, 3), "image": torch.zeros(NUM_ENVS, 2, 3)}, batch_size=NUM_ENVS)
+    buffer = ReplayBuffer(
+        NUM_ENVS,
+        CAPACITY_PER_ENV,
+        obs,
+        [2],
+        z_dim=0,
+        batch_size=16,
+        device="cpu",
+        keep_terminal=True,
+        hidden_dim=HIDDEN,
+        hidden_layers=LAYERS,
+        obs_quantize={"image": (0.0, 1.0)},
+    )
+    assert buffer.observations["image"].dtype == torch.uint8
+    torch.manual_seed(0)
+    images = []
+    for step in range(CAPACITY_PER_ENV):
+        image = torch.rand(NUM_ENVS, 2, 3) * 1.2 - 0.1  # a little outside the range on both sides
+        images.append(image)
+        transition = ReplayBuffer.Transition()
+        transition.observations = TensorDict(
+            {"policy": torch.full((NUM_ENVS, 3), float(step)), "image": image}, batch_size=NUM_ENVS
+        )
+        transition.next_observations = transition.observations.clone()
+        transition.actions = torch.zeros(NUM_ENVS, 2)
+        transition.rewards = torch.zeros(NUM_ENVS)
+        transition.context = torch.zeros(NUM_ENVS, 0)
+        transition.next_terminated = torch.zeros(NUM_ENVS).byte()
+        transition.dones = torch.zeros(NUM_ENVS)
+        transition.hidden_state = torch.zeros(LAYERS, NUM_ENVS, HIDDEN)
+        buffer.add_transitions(transition)
+    batch = buffer.sample_mini_batch()
+    assert batch.observations["image"].dtype == torch.float32
+    steps = batch.observations["policy"][:, 0].long()
+    stored = torch.stack(images)  # (steps, envs, 2, 3)
+    match = stored[steps].clamp(0.0, 1.0)  # every env shares the step's policy value, so compare over envs
+    err = (batch.observations["image"].unsqueeze(1) - match).abs().amin(dim=1)
+    assert float(err.max()) <= 0.5 / 255 + 1e-6

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import torch
 import torch.nn as nn
@@ -84,6 +85,7 @@ class SAC:
         window_priority_anneal_updates: int = 0,
         estimator_learning_rate: float = 1e-3,
         compile_mode: str | None = None,
+        encoder_bf16: bool = False,
         device: str = "cpu",
         rnd_cfg: dict | None = None,
         symmetry_cfg: dict | None = None,
@@ -92,6 +94,8 @@ class SAC:
     ) -> None:
         """Initialize the SAC algorithm. See the module docstring for the design."""
         self.device = device
+        # bf16 autocast of the recurrent actor's encoding in the updates (image encoders); heads and log-probs stay fp32
+        self.encoder_bf16 = encoder_bf16 and str(device).startswith("cuda")
         self.is_multi_gpu = multi_gpu_cfg is not None
         if multi_gpu_cfg is not None:
             self.gpu_global_rank = multi_gpu_cfg["global_rank"]
@@ -397,14 +401,17 @@ class SAC:
             with torch.no_grad():
                 h0 = batch.init_hidden
                 if burn > 0:
-                    _, h0 = self.actor.encode_sequence(obs[:burn], h0, resets[:burn])
+                    with self._encoder_autocast():
+                        _, h0 = self.actor.encode_sequence(obs[:burn], h0, resets[:burn])
+                    h0 = _to_float(h0)
                 self._recurrent_state_diagnostics(batch, h0, _acc)
             if self.critic_sees_hidden:
                 self._update_critics_on_windows(batch, h0, _acc)
 
             # Alpha and actor on the window; gradients stop at the burn-in boundary.
-            latent, _ = self.actor.encode_sequence(train_obs, h0, train_resets)
-            latent = latent.reshape(flat, -1)
+            with self._encoder_autocast():
+                latent, _ = self.actor.encode_sequence(train_obs, h0, train_resets)
+            latent = latent.float().reshape(flat, -1)
             new_actions, logp = self.actor.act_and_log_prob_from_latent(latent)
             logp = logp.reshape(-1)
             with torch.no_grad():
@@ -563,6 +570,10 @@ class SAC:
             acc("Critic/td_abs", (q1 - target_q).abs().mean())
             acc("Critic/reward", rewards.mean())
 
+    def _encoder_autocast(self) -> contextlib.AbstractContextManager:
+        """bf16 autocast for the actor's encoding when ``encoder_bf16`` is on; a no-op otherwise."""
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.encoder_bf16)
+
     def _update_critics_recurrent(self, acc: Callable[[str, torch.Tensor | float], None]) -> None:
         """One twin-critic step on independent transitions, bootstrapping through the recurrent actor.
 
@@ -577,15 +588,18 @@ class SAC:
         boot_obs = batch.bootstrap_observations if batch.bootstrap_observations is not None else obs_b
         boot_hidden = batch.bootstrap_hidden if batch.bootstrap_hidden is not None else batch.hidden
         with torch.no_grad():
-            h_next = self.actor.step_state(boot_obs, boot_hidden)
-            next_latent = self.actor.encode_step(next_obs_b, h_next)
+            with self._encoder_autocast():
+                h_next = self.actor.step_state(boot_obs, boot_hidden)
+                next_latent = self.actor.encode_step(next_obs_b, h_next)
+            h_next, next_latent = _to_float(h_next), next_latent.float()
             next_actions, next_logp = self.actor.act_and_log_prob_from_latent(next_latent)
             next_in = self._critic_input(next_actions, next_latent)
             q1_t = self.critic_1_target(next_obs_b, next_in).view(-1)
             q2_t = self.critic_2_target(next_obs_b, next_in).view(-1)
             min_q_t = torch.min(q1_t, q2_t) - self._backup_alpha() * next_logp
             target_q = rewards_b + self._bootstrap_discount(batch) * not_terminated * min_q_t
-            latent_b = self.actor.encode_step(obs_b, batch.hidden) if self.critic_sees_hidden else None
+            with self._encoder_autocast():
+                latent_b = self.actor.encode_step(obs_b, batch.hidden).float() if self.critic_sees_hidden else None
         data_in = self._critic_input(actions_b, latent_b)
         q1 = self.critic_1(obs_b, data_in).view(-1)
         q2 = self.critic_2(obs_b, data_in).view(-1)
@@ -945,6 +959,7 @@ class SAC:
             keep_terminal=True,
             n_steps=cfg["algorithm"].get("n_steps", 1),
             gamma=cfg["algorithm"].get("gamma", 0.99),
+            obs_quantize=cfg["algorithm"].get("replay_obs_quantize"),
             **hidden_kwargs,
         )
 
@@ -959,3 +974,12 @@ class SAC:
             **cfg["algorithm"],
             multi_gpu_cfg=cfg.get("multi_gpu"),
         )
+
+
+def _to_float(state: HiddenState) -> HiddenState:
+    """Return a recurrent state (a tensor, or an LSTM's ``(h, c)``) in fp32."""
+    if state is None:
+        return None
+    if isinstance(state, tuple):
+        return tuple(x.float() for x in state)  # type: ignore[return-value]
+    return state.float()

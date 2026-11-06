@@ -1053,7 +1053,16 @@ class FbCpr:
                 "fb_forward": Fs[0].mean().detach(),
                 "fb_backward": B.mean().detach(),
                 "fb_forward_norm": Fs[0].norm(dim=-1).mean().detach(),
+                "fb_target_forward_norm": target_Fs[0].norm(dim=-1).mean(),
             }
+            if bootstrap_obs is not batch.next_observations:
+                # The same target F at the real next state: its gap shows the bootstrap state's extrapolation
+                with torch.autocast(device_type=self.device, dtype=self.dtype):
+                    real_actions = self.actor(
+                        batch.next_observations, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
+                    )
+                    real_Fs = self.target_forward_map(batch.next_observations, batch.context, real_actions)
+                extras["fb_target_forward_norm_real_next"] = real_Fs[0].norm(dim=-1).mean()
 
         return loss_dict, extras
 

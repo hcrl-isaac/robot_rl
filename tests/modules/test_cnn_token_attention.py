@@ -66,3 +66,57 @@ def test_flatten_projection_sets_output_dim() -> None:
     out = cnn(torch.randn(3, 4, 54, 96))
     assert cnn.output_dim == 256 and out.shape == (3, 256)
     assert out.abs().max() <= 1.0
+
+
+def test_attention_pool_shape_and_gradients() -> None:
+    """Attention pooling returns queries x channels, and the loss reaches the convs, queries and null token."""
+    import pytest
+
+    torch.manual_seed(0)
+    cnn = CNN(
+        input_dim=(54, 96),
+        input_channels=4,
+        output_channels=[16, 32, 64],
+        kernel_size=3,
+        stride=2,
+        token_attention_heads=4,
+        attention_pool_queries=4,
+        attention_pool_heads=4,
+    )
+    out = cnn(torch.randn(3, 4, 54, 96))
+    assert cnn.output_dim == 256 and out.shape == (3, 256)
+    out.pow(2).sum().backward()
+    pool = cnn[-1]
+    assert cnn[0].weight.grad.abs().sum() > 0
+    assert pool.queries.grad.abs().sum() > 0 and pool.null.grad.abs().sum() > 0
+    with pytest.raises(ValueError):
+        CNN(
+            input_dim=(54, 96),
+            input_channels=4,
+            output_channels=[16],
+            kernel_size=3,
+            attention_pool_queries=4,
+            flatten_proj_dim=256,
+        )
+
+
+def test_cnn_rnn_with_attention_pool_exports() -> None:
+    """A CNN-RNN model whose CNN ends in attention pooling exports to ONNX."""
+    from tensordict import TensorDict
+
+    from robot_rl.models import CNNRNNModel
+
+    obs = TensorDict({"policy": torch.zeros(1, 10), "image": torch.zeros(1, 4, 54, 96)}, batch_size=[1])
+    cnn_cfg = {
+        "output_channels": [16, 32, 64],
+        "kernel_size": 3,
+        "stride": 2,
+        "token_attention_heads": 4,
+        "attention_pool_queries": 4,
+    }
+    model = CNNRNNModel(
+        obs, {"actor": ["policy", "image"]}, "actor", 3, hidden_dims=[32], cnn_cfg=cnn_cfg, rnn_hidden_dim=16
+    )
+    onnx_model = model.as_onnx()
+    out = onnx_model(*onnx_model.get_dummy_inputs())
+    assert out[0].shape == (1, 3)

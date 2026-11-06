@@ -36,6 +36,8 @@ class CNN(nn.Sequential):
         flatten: bool = True,
         token_attention_heads: int = 0,
         flatten_proj_dim: int = 0,
+        attention_pool_queries: int = 0,
+        attention_pool_heads: int = 4,
     ) -> None:
         """Initialize the CNN.
 
@@ -58,6 +60,9 @@ class CNN(nn.Sequential):
                 (position-tagged, starting as the identity), before pooling; 0 adds none.
             flatten_proj_dim: Width of a linear projection of the flattened output, followed by LayerNorm and
                 tanh; 0 adds none. Requires ``flatten``.
+            attention_pool_queries: Learned queries of an attention pooling of the last feature map's cells (plus a
+                null token), replacing global pooling and flattening; 0 adds none. Output width is queries x channels.
+            attention_pool_heads: Attention heads of that pooling.
         """
         super().__init__()
 
@@ -119,6 +124,18 @@ class CNN(nn.Sequential):
 
         if token_attention_heads:
             layers.append(TokenSelfAttention(last_channels, last_dim[0] * last_dim[1], token_attention_heads))
+
+        if attention_pool_queries:
+            if global_pool != "none" or flatten_proj_dim:
+                raise ValueError("attention_pool_queries replaces global_pool and flatten_proj_dim.")
+            layers.append(
+                AttentionPool(last_channels, last_dim[0] * last_dim[1], attention_pool_queries, attention_pool_heads)
+            )
+            self._output_channels = None
+            self._output_dim = attention_pool_queries * last_channels
+            for idx, layer in enumerate(layers):
+                self.add_module(f"{idx}", layer)
+            return
 
         # Apply global pooling if specified
         if global_pool == "none":
@@ -242,3 +259,36 @@ class TokenSelfAttention(nn.Module):
         x = x + self.attn(y, y, y, need_weights=False)[0]
         x = x + self.ff(self.norm_ff(x))
         return x.transpose(1, 2).reshape(n, c, h, w)
+
+
+class AttentionPool(nn.Module):
+    """Learned queries attend over a feature map's cells and a null token; outputs concatenated and LayerNormed.
+
+    Each cell carries a learned position embedding into its key and value, so a query's output says where its
+    attention landed as well as what is there; the null token, with no position, lets a query report nothing in view.
+    """
+
+    def __init__(self, channels: int, cells: int, queries: int, heads: int) -> None:
+        """Initialize the pooling.
+
+        Args:
+            channels: Feature channels per cell (the token width; divisible by ``heads``).
+            cells: Number of cells in the feature map.
+            queries: Learned queries, each returning one ``channels``-wide vector.
+            heads: Attention heads.
+        """
+        super().__init__()
+        self.pos = nn.Parameter(0.02 * torch.randn(cells, channels))
+        self.queries = nn.Parameter(0.02 * torch.randn(queries, channels))
+        self.null = nn.Parameter(0.02 * torch.randn(1, channels))
+        self.norm_in = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(channels, heads, batch_first=True)
+        self.norm_out = nn.LayerNorm(queries * channels)
+
+    def forward(self, fmap: torch.Tensor) -> torch.Tensor:
+        """Pool an ``(N, C, H, W)`` map into ``(N, queries * C)``."""
+        n = fmap.shape[0]
+        cells = self.norm_in(fmap.flatten(2).transpose(1, 2)) + self.pos
+        keys = torch.cat([cells, self.null.expand(n, -1, -1)], dim=1)
+        pooled = self.attn(self.queries.expand(n, -1, -1), keys, keys, need_weights=False)[0]
+        return self.norm_out(pooled.flatten(1))

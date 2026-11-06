@@ -6,7 +6,9 @@
 """CNN token self-attention: starts as the identity, learns, and survives the CNN-RNN export."""
 
 import torch
+from tensordict import TensorDict
 
+from robot_rl.models import CNNRNNModel
 from robot_rl.modules import CNN
 from robot_rl.modules.cnn import TokenSelfAttention
 
@@ -120,3 +122,104 @@ def test_cnn_rnn_with_attention_pool_exports() -> None:
     onnx_model = model.as_onnx()
     out = onnx_model(*onnx_model.get_dummy_inputs())
     assert out[0].shape == (1, 3)
+
+
+def _memory_model(latent_layers: int = 0) -> CNNRNNModel:
+    from tensordict import TensorDict
+
+    from robot_rl.models import CNNRNNModel
+
+    obs = TensorDict({"policy": torch.zeros(1, 10), "image": torch.zeros(1, 4, 54, 96)}, batch_size=[1])
+    cnn_cfg = {
+        "output_channels": [16, 32, 64],
+        "kernel_size": 3,
+        "stride": 2,
+        "token_attention_heads": 4,
+        "attention_pool_queries": 4,
+        "attention_pool_memory_dim": 16,
+        "attention_pool_latent_layers": latent_layers,
+    }
+    model = CNNRNNModel(
+        obs, {"actor": ["policy", "image"]}, "actor", 3, hidden_dims=[32], cnn_cfg=cnn_cfg, rnn_hidden_dim=16
+    )
+    # the memory projection starts at zero; perturb it so the tests see the state steer the queries
+    torch.nn.init.normal_(model.cnns["image"][-1].memory.weight, std=0.5)
+    return model
+
+
+def _window(seq_len: int, batch: int) -> TensorDict:
+    from tensordict import TensorDict
+
+    return TensorDict(
+        {"policy": torch.randn(seq_len, batch, 10), "image": torch.rand(seq_len, batch, 4, 54, 96)},
+        batch_size=[seq_len, batch],
+    )
+
+
+def test_memory_pool_sequence_matches_rollout_steps() -> None:
+    """A window encoded at once equals stepping the rollout path, resets included; the state changes the features."""
+    torch.manual_seed(0)
+    model = _memory_model(latent_layers=1)
+    assert model.memory_pool
+    obs = _window(5, 3)
+    resets = torch.zeros(5, 3)
+    resets[2, 1] = 1.0
+    seq, state = model.encode_sequence(obs, None, resets)
+    model.reset()
+    steps = []
+    for t in range(5):
+        if t:
+            model.reset(resets[t].bool())
+        steps.append(model.get_latent(obs[t]))
+    torch.testing.assert_close(seq, torch.stack(steps), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(state, model.rnn.hidden_state, atol=1e-5, rtol=1e-5)
+    stepped = model.encode_step(obs[0], torch.randn(1, 3, 16))
+    assert not torch.allclose(stepped[:, :-16], seq[0][:, :-16])
+
+
+def test_memory_pool_gradients_reach_the_memory_projection() -> None:
+    """The window loss trains the projection that turns the state into query shifts."""
+    model = _memory_model()
+    seq, _ = model.encode_sequence(_window(4, 2), None)
+    seq.square().sum().backward()
+    assert model.cnns["image"][-1].memory.weight.grad.abs().sum() > 0
+
+
+def test_memory_pool_exports_match_the_model() -> None:
+    """ONNX and TorchScript exports read the state before each step, as the rollout does."""
+    torch.manual_seed(0)
+    model = _memory_model(latent_layers=1).eval()
+    obs = _window(3, 1)
+    model.reset()
+    with torch.no_grad():
+        expected = [model(obs[t]) for t in range(3)]
+    onnx_model = model.as_onnx()
+    jit_model = torch.jit.script(model.as_jit())
+    h = torch.zeros(1, 1, 16)
+    for t in range(3):
+        a_onnx, h = onnx_model(obs[t]["policy"], obs[t]["image"], h)
+        a_jit = jit_model(obs[t]["policy"], [obs[t]["image"]])
+        torch.testing.assert_close(a_onnx, a_jit, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(a_onnx, expected[t], atol=1e-5, rtol=1e-5)
+
+
+def test_memory_pool_rejects_mismatched_state_width() -> None:
+    """The pooling's memory width must equal the GRU's."""
+    from tensordict import TensorDict
+
+    import pytest
+
+    from robot_rl.models import CNNRNNModel
+
+    obs = TensorDict({"policy": torch.zeros(1, 10), "image": torch.zeros(1, 4, 54, 96)}, batch_size=[1])
+    cnn_cfg = {
+        "output_channels": [16, 32, 64],
+        "kernel_size": 3,
+        "stride": 2,
+        "attention_pool_queries": 4,
+        "attention_pool_memory_dim": 8,
+    }
+    with pytest.raises(ValueError, match="memory-conditioned"):
+        CNNRNNModel(
+            obs, {"actor": ["policy", "image"]}, "actor", 3, hidden_dims=[32], cnn_cfg=cnn_cfg, rnn_hidden_dim=16
+        )

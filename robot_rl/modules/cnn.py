@@ -38,6 +38,8 @@ class CNN(nn.Sequential):
         flatten_proj_dim: int = 0,
         attention_pool_queries: int = 0,
         attention_pool_heads: int = 4,
+        attention_pool_memory_dim: int = 0,
+        attention_pool_latent_layers: int = 0,
     ) -> None:
         """Initialize the CNN.
 
@@ -63,6 +65,9 @@ class CNN(nn.Sequential):
             attention_pool_queries: Learned queries of an attention pooling of the last feature map's cells (plus a
                 null token), replacing global pooling and flattening; 0 adds none. Output width is queries x channels.
             attention_pool_heads: Attention heads of that pooling.
+            attention_pool_memory_dim: Width of the recurrent state that shifts the pooling's queries, passed to
+                :meth:`forward` as ``cond``; 0 keeps the queries fixed.
+            attention_pool_latent_layers: Self-attention blocks over the pooled queries, after the pooling.
         """
         super().__init__()
 
@@ -125,12 +130,22 @@ class CNN(nn.Sequential):
         if token_attention_heads:
             layers.append(TokenSelfAttention(last_channels, last_dim[0] * last_dim[1], token_attention_heads))
 
+        if not attention_pool_queries and (attention_pool_memory_dim or attention_pool_latent_layers):
+            raise ValueError("attention_pool_memory_dim and attention_pool_latent_layers need attention_pool_queries.")
         if attention_pool_queries:
             if global_pool != "none" or flatten_proj_dim:
                 raise ValueError("attention_pool_queries replaces global_pool and flatten_proj_dim.")
             layers.append(
-                AttentionPool(last_channels, last_dim[0] * last_dim[1], attention_pool_queries, attention_pool_heads)
+                AttentionPool(
+                    last_channels,
+                    last_dim[0] * last_dim[1],
+                    attention_pool_queries,
+                    attention_pool_heads,
+                    memory_dim=attention_pool_memory_dim,
+                    latent_layers=attention_pool_latent_layers,
+                )
             )
+            self.memory_dim = attention_pool_memory_dim
             self._output_channels = None
             self._output_dim = attention_pool_queries * last_channels
             for idx, layer in enumerate(layers):
@@ -156,6 +171,7 @@ class CNN(nn.Sequential):
             layers.append(nn.Flatten(start_dim=1))
 
         # Store final output dimension
+        self.memory_dim = 0
         self._output_channels = last_channels if not flatten else None
         self._output_dim = last_dim if not flatten else last_channels * last_dim[0] * last_dim[1]
 
@@ -187,11 +203,26 @@ class CNN(nn.Sequential):
                 torch.nn.init.kaiming_normal_(module.weight)
                 torch.nn.init.zeros_(module.bias)  # type: ignore
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the CNN."""
+    def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None, pool: bool = True) -> torch.Tensor:
+        """Forward pass of the CNN.
+
+        Args:
+            x: Images ``(N, C, H, W)``.
+            cond: Recurrent state ``(N, memory_dim)`` for a memory-conditioned attention pooling.
+            pool: False stops before an attention pooling and returns its feature map.
+        """
         for layer in self:
-            x = layer(x)
+            # hasattr resolves per layer when TorchScript compiles, which isinstance on a module class does not
+            if hasattr(layer, "num_queries"):
+                if pool:
+                    x = layer(x, cond)
+            else:
+                x = layer(x)
         return x
+
+    def attention_pool(self, fmap: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
+        """Apply the attention pooling alone to a feature map from ``forward(x, pool=False)``."""
+        return self[len(self) - 1](fmap, cond)
 
 
 def _compute_padding(input_hw: tuple[int, int], kernel: int, stride: int, dilation: int) -> tuple[int, int]:
@@ -266,9 +297,13 @@ class AttentionPool(nn.Module):
 
     Each cell carries a learned position embedding into its key and value, so a query's output says where its
     attention landed as well as what is there; the null token, with no position, lets a query report nothing in view.
+    A recurrent state can shift the queries (starting at no shift), so memory steers where they look, and
+    self-attention blocks over the pooled queries let what they found combine before the output.
     """
 
-    def __init__(self, channels: int, cells: int, queries: int, heads: int) -> None:
+    def __init__(
+        self, channels: int, cells: int, queries: int, heads: int, memory_dim: int = 0, latent_layers: int = 0
+    ) -> None:
         """Initialize the pooling.
 
         Args:
@@ -276,19 +311,35 @@ class AttentionPool(nn.Module):
             cells: Number of cells in the feature map.
             queries: Learned queries, each returning one ``channels``-wide vector.
             heads: Attention heads.
+            memory_dim: Width of the recurrent state shifting the queries; 0 keeps them fixed.
+            latent_layers: Self-attention blocks over the pooled queries.
         """
         super().__init__()
+        self.num_queries = queries
+        self.memory_dim = memory_dim
         self.pos = nn.Parameter(0.02 * torch.randn(cells, channels))
         self.queries = nn.Parameter(0.02 * torch.randn(queries, channels))
         self.null = nn.Parameter(0.02 * torch.randn(1, channels))
         self.norm_in = nn.LayerNorm(channels)
         self.attn = nn.MultiheadAttention(channels, heads, batch_first=True)
+        self.memory = nn.Linear(memory_dim, queries * channels) if memory_dim else None
+        if self.memory is not None:
+            nn.init.zeros_(self.memory.weight)
+            nn.init.zeros_(self.memory.bias)
+        self.latent = nn.ModuleList([TokenSelfAttention(channels, queries, heads) for _ in range(latent_layers)])
         self.norm_out = nn.LayerNorm(queries * channels)
 
-    def forward(self, fmap: torch.Tensor) -> torch.Tensor:
-        """Pool an ``(N, C, H, W)`` map into ``(N, queries * C)``."""
-        n = fmap.shape[0]
+    def forward(self, fmap: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
+        """Pool an ``(N, C, H, W)`` map into ``(N, queries * C)``; ``cond`` ``(N, memory_dim)`` shifts the queries."""
+        n, c = fmap.shape[0], fmap.shape[1]
         cells = self.norm_in(fmap.flatten(2).transpose(1, 2)) + self.pos
         keys = torch.cat([cells, self.null.expand(n, -1, -1)], dim=1)
-        pooled = self.attn(self.queries.expand(n, -1, -1), keys, keys, need_weights=False)[0]
+        queries = self.queries.expand(n, -1, -1)
+        if self.memory is not None:
+            if cond is None:
+                raise ValueError("A memory-conditioned attention pooling needs the recurrent state as cond.")
+            queries = queries + self.memory(cond).view(n, self.num_queries, c)
+        pooled = self.attn(queries, keys, keys, need_weights=False)[0]
+        for block in self.latent:
+            pooled = block(pooled.transpose(1, 2).unsqueeze(-1)).squeeze(-1).transpose(1, 2)
         return self.norm_out(pooled.flatten(1))

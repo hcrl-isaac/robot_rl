@@ -74,6 +74,7 @@ class WorldModelFbCpr(FbCpr):
         mve_critics: tuple[str, ...] = ("forward", "disc", "aux"),
         mve_credit_ridge: float = 0.0,
         mve_credit_grad: bool = False,
+        mve_imagined_negative_weight: float = 0.0,
         mage_beta: float = 0.0,
         mage_q_beta: float | None = None,
         mage_batch_size: int | None = None,
@@ -102,6 +103,8 @@ class WorldModelFbCpr(FbCpr):
                 states' ``B`` covariance, so directions real states barely span cannot grow F; 0 leaves it as is.
             mve_credit_grad: Train ``B`` on the imagined credit as on the real next state (the exact k-step FB
                 loss) instead of detaching it; imagined states still never enter the orthonormality loss.
+            mve_imagined_negative_weight: Share of F's off-diagonal FB penalty taken by the other rows' imagined
+                states, so the credit they earn is paid back in the quadratic; 0 keeps the penalty on real states.
             mage_beta: Weight of F's action-gradient (MAGE) loss through the world model (0 = off).
             mage_q_beta: Weight of the discriminator and aux critics' MAGE losses; None uses ``mage_beta``.
             mage_batch_size: Rows of the update's batch MAGE differentiates on; None uses all of them.
@@ -126,6 +129,9 @@ class WorldModelFbCpr(FbCpr):
         self.mve_critics = tuple(mve_critics)
         self.mve_credit_ridge = mve_credit_ridge
         self.mve_credit_grad = mve_credit_grad
+        if not 0.0 <= mve_imagined_negative_weight < 1.0:
+            raise ValueError(f"mve_imagined_negative_weight must be in [0, 1), got {mve_imagined_negative_weight}.")
+        self.mve_imagined_negative_weight = mve_imagined_negative_weight
         self.mage_beta = mage_beta
         self.mage_q_beta = mage_beta if mage_q_beta is None else mage_q_beta
         self.mage_batch_size = mage_batch_size
@@ -279,6 +285,16 @@ class WorldModelFbCpr(FbCpr):
                     credit = (exp.credit_weights * B_imag).sum(dim=0)
                 credit, spectrum = self._shrink_credit(credit, batch)
                 fb_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, credit_backward=credit)
+                if self.mve_imagined_negative_weight > 0:
+                    steps, n = exp.credit_weights.shape[:2]
+                    # Column t * n + r is row r's t-th imagined state: skip a row's own rollout (its credit), dead ones
+                    other = 1 - torch.eye(n, device=self.device).repeat(1, steps)
+                    alive = (exp.credit_weights[0, :, 0] > 0).float().repeat(steps)
+                    fb_kwargs.update(
+                        negatives=exp.imagined,
+                        negative_mask=other * alive,
+                        negative_weight=self.mve_imagined_negative_weight,
+                    )
                 extras.update(spectrum)
             if "disc" in self.mve_critics:
                 disc_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, extra_rewards=exp.disc_rewards)

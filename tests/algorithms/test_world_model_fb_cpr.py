@@ -337,3 +337,35 @@ def test_credit_grad_trains_backward_on_imagined_states_but_not_the_model(credit
         credit.sum().backward()
         assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in alg.backward_map.parameters())
         assert all(p.grad is None for p in alg.world_model.parameters())
+
+
+def test_real_states_as_negatives_leave_the_fb_loss_unchanged() -> None:
+    """A mixture of the real off-diagonal penalty with itself is the one-step FB loss."""
+    alg = _model_cfg_alg()
+    _, batch = _normalized_batch(alg)
+    plain, mixed = copy.deepcopy(alg), copy.deepcopy(alg)
+    torch.manual_seed(0)
+    a, _ = plain._update_forward_backward(copy.deepcopy(batch))
+    torch.manual_seed(0)
+    b, _ = mixed._update_forward_backward(
+        copy.deepcopy(batch),
+        negatives=batch.next_observations,
+        negative_mask=1 - torch.eye(BATCH),
+        negative_weight=0.5,
+    )
+    torch.testing.assert_close(a["Forward_Backward_Loss/fb_loss"], b["Forward_Backward_Loss/fb_loss"])
+
+
+def test_imagined_negatives_skip_each_rows_own_rollout() -> None:
+    """Each row is penalized against every other live row's imagined states, never its own."""
+    alg = _model_cfg_alg(mve_k=3, mve_credit_grad=True, mve_imagined_negative_weight=0.5)
+    alg.update_step = alg.critic_model_start_update
+    win, batch = _normalized_batch(alg)
+    fb_kwargs, _, _, _ = alg._model_critic_inputs(win, batch)
+    mask = fb_kwargs["negative_mask"].view(BATCH, 2, BATCH)
+    assert fb_kwargs["negatives"].shape[0] == 2 * BATCH
+    assert mask.diagonal(dim1=0, dim2=2).abs().sum() == 0
+    alive = (batch.gammas.squeeze(-1) > 0).float()
+    torch.testing.assert_close(mask[:, 0, :], (1 - torch.eye(BATCH)) * alive)
+    losses, _ = alg._update_forward_backward(batch, **fb_kwargs)
+    assert torch.isfinite(losses["Forward_Backward_Loss/fb_loss"])

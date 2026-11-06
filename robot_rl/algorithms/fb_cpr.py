@@ -950,6 +950,9 @@ class FbCpr:
         bootstrap_gammas: torch.Tensor | None = None,
         credit_backward: torch.Tensor | None = None,
         keep_grads: bool = False,
+        negatives: TensorDict | None = None,
+        negative_mask: torch.Tensor | None = None,
+        negative_weight: float = 0.0,
     ) -> tuple[dict[str, torch.Tensor], dict]:
         """Update F and B on the FB loss (and the orthonormality and value regularizers).
 
@@ -962,6 +965,10 @@ class FbCpr:
             bootstrap_gammas: Discount of the bootstrap, ``(B, 1)``; None is ``batch.gammas``.
             credit_backward: Extra discounted ``B`` credit added to each row's own successor term, ``(B, z_dim)``.
             keep_grads: Keep gradients already accumulated on F (an auxiliary loss's) instead of zeroing them.
+            negatives: Extra off-diagonal target states (normalized); the FB measure's reference becomes the mixture
+                ``(1 - negative_weight)`` real next states + ``negative_weight`` these.
+            negative_mask: Which ``(row, negative)`` pairs enter the penalty, ``(B, N)``.
+            negative_weight: The negatives' share of the off-diagonal penalty; 0 ignores them.
 
         Returns:
             The loss and extras dicts.
@@ -987,6 +994,15 @@ class FbCpr:
             # FB loss
             diff = Ms - bootstrap_gammas * target_M
             fb_offdiag = 0.5 * (diff * self._off_diag).pow(2).sum() / self._off_diag_sum
+            neg_offdiag = torch.zeros((), device=Fs.device)
+            if negatives is not None and negative_weight > 0:
+                with torch.no_grad():
+                    target_Mn = compute_td_targets(
+                        torch.matmul(target_Fs, self.target_backward_map(negatives).T), self.forward_backward_pessimism
+                    )
+                diff_n = torch.matmul(Fs, self.backward_map(negatives).T) - bootstrap_gammas * target_Mn
+                neg_offdiag = 0.5 * (diff_n * negative_mask).pow(2).sum() / negative_mask.sum().clamp_min(1)
+                fb_offdiag = (1 - negative_weight) * fb_offdiag + negative_weight * neg_offdiag
             own = torch.diagonal(diff, dim1=1, dim2=2)
             if credit_backward is not None:
                 own = own + (Fs * credit_backward).sum(dim=-1)
@@ -1054,6 +1070,7 @@ class FbCpr:
                 "fb_backward": B.mean().detach(),
                 "fb_forward_norm": Fs[0].norm(dim=-1).mean().detach(),
                 "fb_target_forward_norm": target_Fs[0].norm(dim=-1).mean(),
+                "fb_negative_offdiag": neg_offdiag.detach(),
             }
             if bootstrap_obs is not batch.next_observations:
                 # The same target F at the real next state: its gap shows the bootstrap state's extrapolation

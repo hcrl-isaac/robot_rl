@@ -554,3 +554,32 @@ def test_a_reference_student_with_an_aux_readout_rebuilds_with_its_aux_head() ->
     model.reset()
     with torch.inference_mode():
         torch.testing.assert_close(policy(step, stochastic_output=False), model(step, stochastic_output=False))
+
+
+def test_rebuild_an_image_sac_actor_from_its_image_shape() -> None:
+    """A CNN+GRU SAC actor (no distillation student) rebuilds from obs_shapes and matches the trained actor."""
+    from tensordict import TensorDict
+
+    from robot_rl.models import CNNRNNModel
+
+    torch.manual_seed(0)
+    obs = TensorDict({"policy": torch.zeros(1, 10), "image": torch.zeros(1, 4, 54, 96)}, batch_size=[1])
+    actor_cfg = {
+        "class_name": "CNNRNNModel",
+        "hidden_dims": [32],
+        "obs_normalization": True,
+        "rnn_hidden_dim": 16,
+        "cnn_cfg": {"output_channels": [16, 32, 64], "kernel_size": 3, "stride": 2, "attention_pool_queries": 4},
+    }
+    model_cfg = {k: v for k, v in actor_cfg.items() if k != "class_name"}
+    actor = CNNRNNModel(obs, {"actor": ["policy", "image"]}, "actor", 3, **copy.deepcopy(model_cfg)).eval()
+    train_cfg = {"actor": copy.deepcopy(actor_cfg), "obs_groups": {"actor": ["policy", "image"]}, "clip_actions": 1.0}
+    ckpt = {"actor_state_dict": actor.state_dict()}
+    rebuilt = rebuild_models(train_cfg, ckpt, obs_shapes={"image": (4, 54, 96)})["policy"]
+    step = TensorDict({"policy": torch.randn(1, 10), "image": torch.rand(1, 4, 54, 96)}, batch_size=[1])
+    with torch.no_grad():
+        actor.reset()
+        rebuilt.reset()
+        torch.testing.assert_close(rebuilt(step), actor(step))
+    with pytest.raises(ValueError, match="encodes images"):
+        rebuild_models(train_cfg, ckpt)

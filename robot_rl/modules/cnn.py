@@ -41,6 +41,7 @@ class CNN(nn.Sequential):
         attention_pool_memory_dim: int = 0,
         attention_pool_latent_layers: int = 0,
         attention_pool_memory_norm: bool = False,
+        attention_pool_memory_share: float = 0.0,
     ) -> None:
         """Initialize the CNN.
 
@@ -71,6 +72,8 @@ class CNN(nn.Sequential):
             attention_pool_latent_layers: Self-attention blocks over the pooled queries, after the pooling.
             attention_pool_memory_norm: LayerNorm the state into the shift and the shifted queries, with the shift
                 behind a gate that starts at 0, so memory cannot outgrow the learned queries or sharpen attention.
+            attention_pool_memory_share: If above 0, queries are LN(learned) + share * LN(shift) instead: memory can
+                only tilt each learned query by this fraction of its length. Overrides ``attention_pool_memory_norm``.
         """
         super().__init__()
 
@@ -147,6 +150,7 @@ class CNN(nn.Sequential):
                     memory_dim=attention_pool_memory_dim,
                     latent_layers=attention_pool_latent_layers,
                     memory_norm=attention_pool_memory_norm,
+                    memory_share=attention_pool_memory_share,
                 )
             )
             self.memory_dim = attention_pool_memory_dim
@@ -314,6 +318,7 @@ class AttentionPool(nn.Module):
         memory_dim: int = 0,
         latent_layers: int = 0,
         memory_norm: bool = False,
+        memory_share: float = 0.0,
     ) -> None:
         """Initialize the pooling.
 
@@ -325,6 +330,7 @@ class AttentionPool(nn.Module):
             memory_dim: Width of the recurrent state shifting the queries; 0 keeps them fixed.
             latent_layers: Self-attention blocks over the pooled queries.
             memory_norm: LayerNorm the state and the shifted queries, and gate the shift (gate starts at 0).
+            memory_share: Queries LN(learned) + share * LN(shift), bounding memory's tilt; 0 keeps the other modes.
         """
         super().__init__()
         self.num_queries = queries
@@ -335,12 +341,18 @@ class AttentionPool(nn.Module):
         self.norm_in = nn.LayerNorm(channels)
         self.attn = nn.MultiheadAttention(channels, heads, batch_first=True)
         self.memory = nn.Linear(memory_dim, queries * channels) if memory_dim else None
-        normed = memory_norm and memory_dim > 0
+        shared = memory_share > 0.0 and memory_dim > 0
+        self.memory_share = float(memory_share) if shared else 0.0
+        normed = memory_norm and memory_dim > 0 and not shared
         self.memory_in = nn.LayerNorm(memory_dim) if normed else None
         self.query_norm = nn.LayerNorm(channels) if normed else None
         # the gate holds the shift at 0 at first; the default-initialized projection still gets a gradient through it
         self.memory_gate = nn.Parameter(torch.zeros(1)) if normed else None
-        if self.memory is not None and not normed:
+        self.base_norm = nn.LayerNorm(channels) if shared else None
+        self.shift_norm = nn.LayerNorm(channels) if shared else None
+        if shared:
+            self.memory_in = nn.LayerNorm(memory_dim)
+        if self.memory is not None and not normed and not shared:
             nn.init.zeros_(self.memory.weight)
             nn.init.zeros_(self.memory.bias)
         self.latent = nn.ModuleList([TokenSelfAttention(channels, queries, heads) for _ in range(latent_layers)])
@@ -355,7 +367,10 @@ class AttentionPool(nn.Module):
         if self.memory is not None:
             if cond is None:
                 raise ValueError("A memory-conditioned attention pooling needs the recurrent state as cond.")
-            if self.memory_in is not None and self.query_norm is not None and self.memory_gate is not None:
+            if self.base_norm is not None and self.shift_norm is not None and self.memory_in is not None:
+                shift = self.shift_norm(self.memory(self.memory_in(cond)).view(n, self.num_queries, c))
+                queries = self.base_norm(queries) + self.memory_share * shift
+            elif self.memory_in is not None and self.query_norm is not None and self.memory_gate is not None:
                 shift = self.memory_gate * self.memory(self.memory_in(cond)).view(n, self.num_queries, c)
                 queries = self.query_norm(queries + shift)
             else:

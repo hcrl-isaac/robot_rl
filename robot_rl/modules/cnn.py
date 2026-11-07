@@ -40,6 +40,7 @@ class CNN(nn.Sequential):
         attention_pool_heads: int = 4,
         attention_pool_memory_dim: int = 0,
         attention_pool_latent_layers: int = 0,
+        attention_pool_memory_norm: bool = False,
     ) -> None:
         """Initialize the CNN.
 
@@ -68,6 +69,8 @@ class CNN(nn.Sequential):
             attention_pool_memory_dim: Width of the recurrent state that shifts the pooling's queries, passed to
                 :meth:`forward` as ``cond``; 0 keeps the queries fixed.
             attention_pool_latent_layers: Self-attention blocks over the pooled queries, after the pooling.
+            attention_pool_memory_norm: LayerNorm the state into the shift and the shifted queries, with the shift
+                behind a gate that starts at 0, so memory cannot outgrow the learned queries or sharpen attention.
         """
         super().__init__()
 
@@ -143,6 +146,7 @@ class CNN(nn.Sequential):
                     attention_pool_heads,
                     memory_dim=attention_pool_memory_dim,
                     latent_layers=attention_pool_latent_layers,
+                    memory_norm=attention_pool_memory_norm,
                 )
             )
             self.memory_dim = attention_pool_memory_dim
@@ -302,7 +306,14 @@ class AttentionPool(nn.Module):
     """
 
     def __init__(
-        self, channels: int, cells: int, queries: int, heads: int, memory_dim: int = 0, latent_layers: int = 0
+        self,
+        channels: int,
+        cells: int,
+        queries: int,
+        heads: int,
+        memory_dim: int = 0,
+        latent_layers: int = 0,
+        memory_norm: bool = False,
     ) -> None:
         """Initialize the pooling.
 
@@ -313,6 +324,7 @@ class AttentionPool(nn.Module):
             heads: Attention heads.
             memory_dim: Width of the recurrent state shifting the queries; 0 keeps them fixed.
             latent_layers: Self-attention blocks over the pooled queries.
+            memory_norm: LayerNorm the state and the shifted queries, and gate the shift (gate starts at 0).
         """
         super().__init__()
         self.num_queries = queries
@@ -323,7 +335,12 @@ class AttentionPool(nn.Module):
         self.norm_in = nn.LayerNorm(channels)
         self.attn = nn.MultiheadAttention(channels, heads, batch_first=True)
         self.memory = nn.Linear(memory_dim, queries * channels) if memory_dim else None
-        if self.memory is not None:
+        normed = memory_norm and memory_dim > 0
+        self.memory_in = nn.LayerNorm(memory_dim) if normed else None
+        self.query_norm = nn.LayerNorm(channels) if normed else None
+        # the gate holds the shift at 0 at first; the default-initialized projection still gets a gradient through it
+        self.memory_gate = nn.Parameter(torch.zeros(1)) if normed else None
+        if self.memory is not None and not normed:
             nn.init.zeros_(self.memory.weight)
             nn.init.zeros_(self.memory.bias)
         self.latent = nn.ModuleList([TokenSelfAttention(channels, queries, heads) for _ in range(latent_layers)])
@@ -338,7 +355,11 @@ class AttentionPool(nn.Module):
         if self.memory is not None:
             if cond is None:
                 raise ValueError("A memory-conditioned attention pooling needs the recurrent state as cond.")
-            queries = queries + self.memory(cond).view(n, self.num_queries, c)
+            if self.memory_in is not None and self.query_norm is not None and self.memory_gate is not None:
+                shift = self.memory_gate * self.memory(self.memory_in(cond)).view(n, self.num_queries, c)
+                queries = self.query_norm(queries + shift)
+            else:
+                queries = queries + self.memory(cond).view(n, self.num_queries, c)
         pooled = self.attn(queries, keys, keys, need_weights=False)[0]
         for block in self.latent:
             pooled = block(pooled.transpose(1, 2).unsqueeze(-1)).squeeze(-1).transpose(1, 2)

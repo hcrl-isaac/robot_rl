@@ -223,3 +223,41 @@ def test_memory_pool_rejects_mismatched_state_width() -> None:
         CNNRNNModel(
             obs, {"actor": ["policy", "image"]}, "actor", 3, hidden_dims=[32], cnn_cfg=cnn_cfg, rnn_hidden_dim=16
         )
+
+
+def test_normalized_memory_pool_trains_and_exports() -> None:
+    """The normalized memory pooling starts with no shift, trains its gate, and exports like the model."""
+    torch.manual_seed(0)
+    obs = TensorDict({"policy": torch.zeros(1, 10), "image": torch.zeros(1, 4, 54, 96)}, batch_size=[1])
+    cnn_cfg = {
+        "output_channels": [16, 32, 64],
+        "kernel_size": 3,
+        "stride": 2,
+        "attention_pool_queries": 4,
+        "attention_pool_memory_dim": 16,
+        "attention_pool_memory_norm": True,
+    }
+    model = CNNRNNModel(
+        obs, {"actor": ["policy", "image"]}, "actor", 3, hidden_dims=[32], cnn_cfg=cnn_cfg, rnn_hidden_dim=16
+    )
+    pool = model.cnns["image"][-1]
+    assert float(pool.memory_gate) == 0.0
+    seq, _ = model.encode_sequence(_window(4, 2), None)
+    seq.square().sum().backward()
+    assert pool.memory_gate.grad.abs().sum() > 0
+    with torch.no_grad():
+        pool.memory_gate.fill_(0.5)
+    model.eval()
+    window = _window(3, 1)
+    model.reset()
+    with torch.no_grad():
+        expected = [model(window[t]) for t in range(3)]
+    onnx_model = model.as_onnx()
+    jit_model = torch.jit.script(model.as_jit())
+    h = torch.zeros(1, 1, 16)
+    for t in range(3):
+        a_onnx, h = onnx_model(window[t]["policy"], window[t]["image"], h)
+        torch.testing.assert_close(a_onnx, expected[t], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            jit_model(window[t]["policy"], [window[t]["image"]]), expected[t], atol=1e-5, rtol=1e-5
+        )

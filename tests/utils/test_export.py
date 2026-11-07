@@ -430,12 +430,29 @@ def test_all_models_says_so_for_a_checkpoint_without_a_single_critic() -> None:
         rebuild_models(train_cfg, ckpt, all_models=True)
 
 
-def test_rebuild_distillation_rejects_a_recurrent_student() -> None:
-    """A recurrent 1D student raises instead of failing on a state-dict size mismatch."""
+def test_a_recurrent_student_exports_to_onnx_with_its_state(tmp_path: Path) -> None:
+    """A recurrent 1D student's ONNX export, fed back its own state each step, acts as the trained student does."""
+    from tensordict import TensorDict
+
+    import onnxruntime as ort
+
     student_cfg = {"class_name": "RNNModel", "hidden_dims": [32, 32], "rnn_hidden_dim": 16, "rnn_type": "gru"}
-    train_cfg, ckpt, _, _ = _distillation_checkpoint(student_cfg)
-    with pytest.raises(NotImplementedError, match="recurrent"):
-        rebuild_models(train_cfg, ckpt)
+    train_cfg, ckpt, _, alg = _distillation_checkpoint(student_cfg)
+    student = alg.student
+    policy = rebuild_models(train_cfg, ckpt)["policy"]
+    session = ort.InferenceSession(save_onnx(policy.as_onnx(), str(tmp_path), "student.onnx"))
+    names = [i.name for i in session.get_inputs()]
+    assert names == ["obs", "h_in"]
+    state = {"h_in": np.zeros((1, 1, 16), dtype=np.float32)}
+    generator = torch.Generator().manual_seed(0)
+    student.reset()
+    with torch.inference_mode():
+        for _ in range(4):
+            obs = torch.randn(1, 8, generator=generator)
+            expected = student(TensorDict({"policy": obs}, batch_size=[1]), stochastic_output=False)
+            outputs = session.run(None, {"obs": obs.numpy(), **state})
+            torch.testing.assert_close(torch.from_numpy(outputs[0]), expected, rtol=1e-4, atol=1e-5)
+            state = {"h_in": outputs[1]}
 
 
 def test_an_image_student_without_a_normalizer_takes_its_1d_shapes() -> None:

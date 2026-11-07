@@ -246,8 +246,7 @@ def _rebuild_distillation(
         # an auxiliary head only supervises the encoder in training; it is not part of the exported policy
         sd = {k: v for k, v in sd.items() if not k.startswith("aux_head.")}
     model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
-    if issubclass(model_class, RNNModel) and not issubclass(model_class, CNNRNNModel):
-        raise NotImplementedError("Export of recurrent (memory-bearing) students is not supported.")
+    recurrent = issubclass(model_class, RNNModel) and not issubclass(model_class, CNNRNNModel)
     groups = cfg["obs_groups"]["student"]
     shapes = {g: tuple(obs_shapes[g]) for g in groups if obs_shapes and g in obs_shapes}
     images = {g: shape for g, shape in shapes.items() if len(shape) == 3}
@@ -258,7 +257,8 @@ def _rebuild_distillation(
         dims = {g: shapes[g][0] for g in flat}
     else:
         if not images:
-            total = _first_mlp_input_dim(sd)
+            # a recurrent student's MLP head reads the recurrent output; its recurrent input is the observation
+            total = sd["rnn.rnn.weight_ih_l0"].shape[-1] if recurrent else _first_mlp_input_dim(sd)
         elif "obs_normalizer._mean" in sd:
             total = sd["obs_normalizer._mean"].shape[-1]
         else:

@@ -90,6 +90,7 @@ class SAC:
         compile_encoder: bool = False,
         cudnn_benchmark: bool = True,
         encoder_channels_last: bool = True,
+        allow_tf32: bool = False,
         device: str = "cpu",
         rnd_cfg: dict | None = None,
         symmetry_cfg: dict | None = None,
@@ -126,6 +127,10 @@ class SAC:
                 # NHWC weights let cuDNN skip the per-call NCHW<->NHWC transposes around every bf16 conv
                 for cnn in self.actor.cnns.values():
                     cnn.to(memory_format=torch.channels_last)
+        if allow_tf32 and on_cuda:
+            # process-wide: TF32 matmuls and convs carry ~1e-3 relative error
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         if compile_encoder and on_cuda:
             # in place, so the state-dict keys and checkpoints are unchanged
             for cnn in getattr(self.actor, "cnns", {}).values():

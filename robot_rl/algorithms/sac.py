@@ -87,6 +87,8 @@ class SAC:
         compile_mode: str | None = None,
         encoder_bf16: bool = False,
         compile_encoder: bool = False,
+        cudnn_benchmark: bool = True,
+        encoder_channels_last: bool = True,
         device: str = "cpu",
         rnd_cfg: dict | None = None,
         symmetry_cfg: dict | None = None,
@@ -115,7 +117,15 @@ class SAC:
 
         # Models
         self.actor = actor.to(device)
-        if compile_encoder and str(device).startswith("cuda"):
+        on_cuda = str(device).startswith("cuda")
+        if on_cuda and getattr(self.actor, "cnns", None):
+            # the update's conv shapes are fixed, so cuDNN's per-shape algorithm search pays for itself at once
+            torch.backends.cudnn.benchmark = torch.backends.cudnn.benchmark or cudnn_benchmark
+            if encoder_channels_last:
+                # NHWC weights let cuDNN skip the per-call NCHW<->NHWC transposes around every bf16 conv
+                for cnn in self.actor.cnns.values():
+                    cnn.to(memory_format=torch.channels_last)
+        if compile_encoder and on_cuda:
             # in place, so the state-dict keys and checkpoints are unchanged
             for cnn in getattr(self.actor, "cnns", {}).values():
                 cnn.compile()
@@ -390,6 +400,7 @@ class SAC:
                 priority_group=self.window_priority_group,
                 priority=self._current_window_priority(),
                 episode_start=self.window_episode_start,
+                next_observations=self.critic_sees_hidden,
             )
             if batch is None:
                 break
@@ -501,9 +512,14 @@ class SAC:
             # the flat and window samplers must agree with the buffer on the mean reward; a gap is a sampling bug
             n = len(self.replay_buffer)
             _acc("Buffer/reward_all", self.replay_buffer.rewards[:n].float().mean())
-            _acc("Buffer/reward_flat_sample", self.replay_buffer.sample_mini_batch(self.device).rewards.float().mean())
+            flat = self.replay_buffer.sample_mini_batch(self.device, obs_groups=())
+            _acc("Buffer/reward_flat_sample", flat.rewards.float().mean())
             win = self.replay_buffer.sample_sequences(
-                self.seq_len, self.burn_in, self.device, episode_start=self.window_episode_start
+                self.seq_len,
+                self.burn_in,
+                self.device,
+                episode_start=self.window_episode_start,
+                next_observations=False,
             )
             if win is not None:
                 _acc("Buffer/reward_window_sample", win.rewards.float().mean())
@@ -597,7 +613,11 @@ class SAC:
         the bootstrap step (the n-th step of an n-step sample) through that step's observation, which is the
         rollout state up to staleness.
         """
-        batch = self.replay_buffer.sample_mini_batch(self.device)
+        # the start step's actor groups are read only when the critics take the actor's latent there
+        groups = set(self.critic_1.obs_groups)
+        if self.critic_sees_hidden:
+            groups |= {*self.actor.obs_groups, *getattr(self.actor, "obs_groups_2d", [])}
+        batch = self.replay_buffer.sample_mini_batch(self.device, obs_groups=groups)
         obs_b, next_obs_b, actions_b = batch.observations, batch.next_observations, batch.actions
         rewards_b = batch.rewards.view(-1)
         not_terminated = 1.0 - batch.next_terminated.view(-1).float()

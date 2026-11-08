@@ -11,6 +11,7 @@ from tensordict import TensorDict
 import pytest
 
 from robot_rl.algorithms import SAC
+from robot_rl.storage import ReplayBuffer
 
 OBS_DIM, ACT_DIM, NUM_ENVS = 6, 3, 8
 IMG = (1, 8, 12)
@@ -439,3 +440,70 @@ class TestSequenceEstimator:
         other.load(saved)
         for a, b in zip(alg.estimator.parameters(), other.estimator.parameters(), strict=True):
             assert torch.equal(a, b)
+
+
+class _TimeoutImageVecEnv(_DummyImageVecEnv):
+    """Half of the dones are timeouts, with a true next observation the buffer stores in place of the reset one."""
+
+    def step(self, actions: torch.Tensor) -> tuple:
+        next_obs, rewards, dones, extras = super().step(actions)
+        extras = {"time_outs": dones & (torch.rand(self.num_envs) < 0.5), "time_outs_obs": self._obs()}
+        return next_obs, rewards, dones, extras
+
+
+def _old_reads(buffer: ReplayBuffer) -> None:
+    """Make ``buffer`` read every group of every batch, dequantizing out of place, as before reads were trimmed."""
+    import types
+
+    sample_mini_batch, sample_sequences = buffer.sample_mini_batch, buffer.sample_sequences
+
+    def _read(
+        self: ReplayBuffer, observations: TensorDict, idx: torch.Tensor, device: str | None, groups: object = None
+    ) -> TensorDict:
+        out = observations[idx].to(device)
+        for key, dtype in self._obs_dtypes.items():
+            if key in self._quantize:
+                low, high = self._quantize[key]
+                out[key] = out[key].to(dtype) * ((high - low) / 255.0) + low
+            elif out[key].dtype != dtype:
+                out[key] = out[key].to(dtype)
+        return out
+
+    buffer._read = types.MethodType(_read, buffer)
+    buffer.sample_mini_batch = lambda device=None, obs_groups=None: sample_mini_batch(device)
+    buffer.sample_sequences = lambda *a, next_observations=True, **k: sample_sequences(*a, **k)
+
+
+class TestTrimmedReads:
+    """Skipping the image groups an update never reads leaves every loss and parameter bit-identical."""
+
+    @pytest.mark.parametrize("n_steps", [1, 5])
+    @pytest.mark.parametrize("critic_sees_hidden", [False, True])
+    def test_update_matches_full_reads(self, n_steps: int, critic_sees_hidden: bool) -> None:
+        """Same seed and buffer: the trimmed and the full-read update agree exactly, over timeouts and resets."""
+        import copy
+
+        torch.manual_seed(0)
+        env = _TimeoutImageVecEnv(done_prob=0.3)
+        cfg = _make_cfg(n_steps=n_steps)
+        cfg["algorithm"] |= {"replay_obs_quantize": {"image": [0.0, 1.0]}, "critic_sees_hidden": critic_sees_hidden}
+        cfg["algorithm"] |= {"seq_len": 4, "burn_in": 2, "mini_batch_size": 16, "num_mini_batches": 3}
+        alg = SAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu")
+        dones = _collect(alg, env, 16)
+        assert torch.stack(dones).any()
+        old = copy.deepcopy(alg)
+        _old_reads(old.replay_buffer)
+        torch.manual_seed(1)
+        losses, diag = alg.update()
+        torch.manual_seed(1)
+        old_losses, old_diag = old.update()
+        assert losses == old_losses
+        assert diag == old_diag
+        for a, b in zip(alg.save().values(), old.save().values(), strict=True):
+            if isinstance(a, torch.Tensor):
+                assert torch.equal(a, b)
+        for a, b in zip(alg.actor.parameters(), old.actor.parameters(), strict=True):
+            assert torch.equal(a, b)
+        for a, b in zip(alg.critic_parameters, old.critic_parameters, strict=True):
+            assert torch.equal(a, b)
+        assert torch.equal(alg.log_alpha, old.log_alpha)

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+from collections.abc import Iterable
 from tensordict import TensorDict
 
 
@@ -115,7 +116,7 @@ class ReplayBuffer:
         def __init__(
             self,
             observations: TensorDict,
-            next_observations: TensorDict,
+            next_observations: TensorDict | None,
             actions: torch.Tensor,
             rewards: torch.Tensor,
             gammas: torch.Tensor,
@@ -129,7 +130,8 @@ class ReplayBuffer:
         ) -> None:
             """Initialize a sequence batch over contiguous rollout windows."""
             self.observations: TensorDict = observations
-            self.next_observations: TensorDict = next_observations
+            self.next_observations: TensorDict | None = next_observations
+            """Stored next observations, ``(L, B)``; None when the sampler was asked to skip them."""
             self.actions: torch.Tensor = actions
             self.rewards: torch.Tensor = rewards
             self.gammas: torch.Tensor = gammas
@@ -297,21 +299,36 @@ class ReplayBuffer:
                 out[key] = out[key].to(value.dtype)
         return out
 
-    def _read(self, observations: TensorDict, idx: torch.Tensor, device: str | None) -> TensorDict:
-        """``observations[idx]`` on ``device``, each group back in its own dtype."""
+    def _read(
+        self, observations: TensorDict, idx: torch.Tensor, device: str | None, groups: Iterable[str] | None = None
+    ) -> TensorDict:
+        """``observations[idx]`` on ``device``, each group back in its own dtype; ``groups`` limits what is read."""
+        if groups is not None:
+            observations = observations.select(*groups)
         out = observations[idx].to(device)
-        for key, dtype in self._obs_dtypes.items():
+        for key in out.keys():  # noqa: SIM118 -- TensorDict iterates its batch dim, not keys
+            dtype = self._obs_dtypes[key]
             if key in self._quantize:
                 low, high = self._quantize[key]
-                out[key] = out[key].to(dtype) * ((high - low) / 255.0) + low
+                # in place: a full-size image batch per op is most of the read
+                out[key] = out[key].to(dtype).mul_((high - low) / 255.0).add_(low)
             elif out[key].dtype != dtype:
                 out[key] = out[key].to(dtype)
         return out
 
-    def sample_mini_batch(self, device: str | None = None) -> Batch:
-        """Randomly sample a mini-batch from the replay buffer (with n-step aggregation when ``n_steps > 1``)."""
+    def sample_mini_batch(self, device: str | None = None, obs_groups: Iterable[str] | None = None) -> Batch:
+        """Randomly sample a mini-batch from the replay buffer (with n-step aggregation when ``n_steps > 1``).
+
+        Args:
+            device: Device to move the batch to.
+            obs_groups: Groups of ``observations`` to read in an n-step batch, whose bootstrap step comes separately
+                as ``bootstrap_observations``; None reads all. A single-step batch always reads all.
+
+        Returns:
+            The sampled :class:`Batch`.
+        """
         if self.n_steps > 1:
-            nstep = self._sample_nstep(device)
+            nstep = self._sample_nstep(device, obs_groups)
             if nstep is not None:
                 return nstep
             # not enough consecutive data for a full n-step yet -> fall through to single-step sampling
@@ -330,7 +347,7 @@ class ReplayBuffer:
             hidden=self._gather_hidden(self._indices, device) if self.hidden is not None else None,
         )
 
-    def _sample_nstep(self, device: str | None = None) -> Batch | None:
+    def _sample_nstep(self, device: str | None = None, obs_groups: Iterable[str] | None = None) -> Batch | None:
         """Sample a mini-batch with n-step returns over the per-env time sequence (keep_terminal layout).
 
         A stored index is ``row * num_envs + env``, so env ``e``'s consecutive steps are ``num_envs`` apart. Start
@@ -380,7 +397,7 @@ class ReplayBuffer:
         final_flat = step_flat.gather(1, first_done.unsqueeze(-1)).squeeze(-1)  # [B]
 
         return ReplayBuffer.Batch(
-            self._read(self.observations, start_flat, device),
+            self._read(self.observations, start_flat, device, obs_groups),
             self._read(self.next_observations, final_flat, device),
             self.actions[start_flat].to(device),
             n_step_rewards.to(device),
@@ -403,6 +420,7 @@ class ReplayBuffer:
         priority: float = 1.0,
         episode_start: bool = False,
         oversample: int = 4,
+        next_observations: bool = True,
     ) -> SequenceBatch | None:
         """Sample contiguous per-env windows for a recurrent update.
 
@@ -426,6 +444,7 @@ class ReplayBuffer:
                 window's recurrent state is exact instead of re-derived from a stored (stale) state.
             oversample: Candidate windows drawn per kept window when weighting; it caps how far the weight can
                 raise the share of those windows.
+            next_observations: False leaves the batch's ``next_observations`` None, for callers that never read them.
 
         Returns:
             A :class:`SequenceBatch` of ``L = burn_in + seq_len`` steps, or ``None`` while no window of
@@ -496,7 +515,10 @@ class ReplayBuffer:
         ages = ((write_row - start_rows) % cap_rows).float() / cap_rows
 
         obs = self._read(self.observations, step_flat, device).reshape(batch_size, total_len).transpose(0, 1)
-        next_obs = self._read(self.next_observations, step_flat, device).reshape(batch_size, total_len).transpose(0, 1)
+        next_obs = None
+        if next_observations:
+            next_obs = self._read(self.next_observations, step_flat, device).reshape(batch_size, total_len)
+            next_obs = next_obs.transpose(0, 1)
         return ReplayBuffer.SequenceBatch(
             obs,
             next_obs,

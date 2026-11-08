@@ -299,3 +299,23 @@ def test_memory_share_bounds_the_query_tilt() -> None:
         torch.testing.assert_close(
             jit_model(window[t]["policy"], [window[t]["image"]]), expected[t], atol=1e-5, rtol=1e-5
         )
+
+
+def test_channels_last_weights_match_and_load_into_a_plain_cnn() -> None:
+    """NHWC weights (the SAC update's layout on CUDA) give the NCHW outputs and gradients, and checkpoint plainly."""
+    torch.manual_seed(1)
+    cnn = CNN((54, 96), 4, [16, 32, 64], 3, stride=[1, 2, 2], global_pool="none", attention_pool_queries=4)
+    nhwc = CNN((54, 96), 4, [16, 32, 64], 3, stride=[1, 2, 2], global_pool="none", attention_pool_queries=4)
+    nhwc.load_state_dict(cnn.state_dict())
+    nhwc.to(memory_format=torch.channels_last)
+    assert nhwc[0].weight.is_contiguous(memory_format=torch.channels_last)
+    x = torch.rand(6, 4, 54, 96)
+    out, out_nhwc = cnn(x), nhwc(x)
+    torch.testing.assert_close(out_nhwc, out, rtol=1e-5, atol=1e-5)
+    out.square().sum().backward()
+    out_nhwc.square().sum().backward()
+    torch.testing.assert_close(nhwc[0].weight.grad, cnn[0].weight.grad, rtol=1e-4, atol=1e-5)
+    plain = CNN((54, 96), 4, [16, 32, 64], 3, stride=[1, 2, 2], global_pool="none", attention_pool_queries=4)
+    plain.load_state_dict(nhwc.state_dict())
+    assert plain[0].weight.is_contiguous()
+    torch.testing.assert_close(plain(x), out_nhwc, rtol=1e-5, atol=1e-5)

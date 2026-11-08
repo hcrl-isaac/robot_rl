@@ -127,6 +127,8 @@ class ReplayBuffer:
             burn_in: int,
             burn_hidden: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
             ages: torch.Tensor | None = None,
+            dones: torch.Tensor | None = None,
+            indices: torch.Tensor | None = None,
         ) -> None:
             """Initialize a sequence batch over contiguous rollout windows."""
             self.observations: TensorDict = observations
@@ -147,6 +149,10 @@ class ReplayBuffer:
             """Stored state before step ``burn_in``: what the rollout actor held where the loss segment starts."""
             self.ages = ages
             """``(B,)`` window age as a fraction of the buffer's per-env capacity (0 = just written)."""
+            self.dones = dones
+            """``(L, B)`` 1 at steps that end an episode (termination or timeout)."""
+            self.indices = indices
+            """``(L, B)`` storage index of each step, on the storage device, for reading more of a step later."""
 
     def __init__(
         self,
@@ -375,6 +381,17 @@ class ReplayBuffer:
         # Sample (start row, env) pairs and build the n consecutive flat indices per sample.
         start_rows = valid_rows[torch.randint(valid_rows.numel(), (batch_size,), device=self.device)]
         envs = torch.randint(self.num_envs, (batch_size,), device=self.device)
+        return self._nstep_batch(start_rows, envs, device, obs_groups)
+
+    def _nstep_batch(
+        self,
+        start_rows: torch.Tensor,
+        envs: torch.Tensor,
+        device: str | None = None,
+        obs_groups: Iterable[str] | None = None,
+    ) -> Batch:
+        """Return the n-step batch from storage rows ``start_rows`` of envs ``envs`` (see :meth:`_sample_nstep`)."""
+        cap_rows = self.capacity_per_env
         start_flat = start_rows * self.num_envs + envs
         offsets = torch.arange(self.n_steps, device=self.device)
         step_rows = (start_rows.unsqueeze(-1) + offsets) % cap_rows  # [B, n]
@@ -420,7 +437,8 @@ class ReplayBuffer:
         priority: float = 1.0,
         episode_start: bool = False,
         oversample: int = 4,
-        next_observations: bool = True,
+        next_observations: bool | Iterable[str] = True,
+        extend: int = 0,
     ) -> SequenceBatch | None:
         """Sample contiguous per-env windows for a recurrent update.
 
@@ -444,16 +462,19 @@ class ReplayBuffer:
                 window's recurrent state is exact instead of re-derived from a stored (stale) state.
             oversample: Candidate windows drawn per kept window when weighting; it caps how far the weight can
                 raise the share of those windows.
-            next_observations: False leaves the batch's ``next_observations`` None, for callers that never read them.
+            next_observations: False leaves the batch's ``next_observations`` None, for callers that never read them;
+                a list of groups reads only those.
+            extend: Steps appended after the loss steps (e.g. an n-step bootstrap's horizon); they leave the
+                default window count unchanged.
 
         Returns:
-            A :class:`SequenceBatch` of ``L = burn_in + seq_len`` steps, or ``None`` while no window of
+            A :class:`SequenceBatch` of ``L = burn_in + seq_len + extend`` steps, or ``None`` while no window of
             that length fits in the stored data.
         """
-        total_len = burn_in + seq_len
-        if total_len < 1:
+        total_len = burn_in + seq_len + extend
+        if burn_in + seq_len < 1:
             raise ValueError("sample_sequences needs burn_in + seq_len >= 1")
-        batch_size = num_windows if num_windows is not None else max(self._indices.shape[0] // total_len, 1)
+        batch_size = num_windows if num_windows is not None else max(self._indices.shape[0] // (total_len - extend), 1)
         cap_rows = self.capacity_per_env
         filled_rows = cap_rows if self._is_full else self._curr_idx // self.num_envs
         write_row = self._curr_idx // self.num_envs
@@ -493,7 +514,7 @@ class ReplayBuffer:
             seen = (self.observations[priority_group][flat_c][..., -1] > 0.5).reshape(draws, total_len)
             done = self.dones[flat_c].reshape(draws, total_len).bool()
             lost = seen[:, :-1] & ~seen[:, 1:] & ~done[:, :-1]
-            has = lost[:, max(burn_in - 1, 0) :].any(dim=1)
+            has = lost[:, max(burn_in - 1, 0) : burn_in + seq_len - 1].any(dim=1)
             keep = torch.multinomial(1.0 + (priority - 1.0) * has.float(), batch_size, replacement=False)
             start_rows, envs = start_rows[keep], envs[keep]
         step_rows = (start_rows.unsqueeze(-1) + offsets) % cap_rows  # [B, L]
@@ -516,8 +537,9 @@ class ReplayBuffer:
 
         obs = self._read(self.observations, step_flat, device).reshape(batch_size, total_len).transpose(0, 1)
         next_obs = None
-        if next_observations:
-            next_obs = self._read(self.next_observations, step_flat, device).reshape(batch_size, total_len)
+        if next_observations is not False:
+            groups = None if next_observations is True else next_observations
+            next_obs = self._read(self.next_observations, step_flat, device, groups).reshape(batch_size, total_len)
             next_obs = next_obs.transpose(0, 1)
         return ReplayBuffer.SequenceBatch(
             obs,
@@ -532,7 +554,15 @@ class ReplayBuffer:
             burn_in,
             burn_hidden,
             ages.to(device),
+            dones.transpose(0, 1).contiguous().to(device),
+            step_flat.reshape(batch_size, total_len).transpose(0, 1),
         )
+
+    def read_next_observations(
+        self, idx: torch.Tensor, device: str | None = None, groups: Iterable[str] | None = None
+    ) -> TensorDict:
+        """Read the stored next observations at storage indices ``idx`` (e.g. a window's ``indices``) on ``device``."""
+        return self._read(self.next_observations, idx, device, groups)
 
     def _gather_hidden(
         self, flat_idx: torch.Tensor, device: str | None

@@ -582,6 +582,68 @@ class TestCriticOnActorWindows:
             flat_target, _ = alg._flat_critic_target(flat)
         torch.testing.assert_close(target, flat_target, rtol=1e-5, atol=1e-5)
 
+    @pytest.mark.parametrize(("n_steps", "seq_len", "burn_in"), [(5, 4, 2), (3, 6, 3), (5, 16, 8)])
+    def test_every_loss_step_gets_its_flat_nstep_target(self, n_steps: int, seq_len: int, burn_in: int) -> None:
+        """After a burn-in, every loss step's target (up to the extension boundary) equals the flat sampler's."""
+        torch.manual_seed(0)
+        alg, env = _build_on_windows(n_steps, seq_len=seq_len, burn_in=burn_in)
+        _collect(alg, env, 48)
+        actor = alg.actor
+
+        def mean_action(latent: torch.Tensor, std_clip: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+            out = actor.mlp(latent)
+            return torch.tanh(out), out.sum(dim=-1)
+
+        actor.act_and_log_prob_from_latent = mean_action
+        buf = alg.replay_buffer
+        batch = buf.sample_sequences(
+            seq_len, burn_in, "cpu", num_windows=64, next_observations=["critic"], extend=n_steps - 1
+        )
+        loss = slice(burn_in, burn_in + seq_len)
+        with torch.no_grad():
+            _, h0 = actor.encode_sequence(batch.observations[:burn_in], batch.init_hidden, batch.resets[:burn_in])
+            latent, state, states = actor.encode_sequence_with_states(batch.observations[loss], h0, batch.resets[loss])
+            _, _, target, _ = alg._window_critic_target(batch, latent, state, states)
+            start = batch.indices[loss].reshape(-1)
+            flat_target, _ = alg._flat_critic_target(buf._nstep_batch(start // buf.num_envs, start % buf.num_envs))
+        torch.testing.assert_close(target, flat_target, rtol=1e-5, atol=1e-5)
+
+    def test_actor_gradient_is_unchanged_by_the_critic_step_between(self) -> None:
+        """The actor's window latents, encoded before the critic step, give the gradient a fresh encoding gives."""
+        from robot_rl.algorithms.sac import _window_head
+
+        torch.manual_seed(0)
+        alg, env = _build_on_windows(5, seq_len=4, burn_in=2)
+        _collect(alg, env, 48)
+        actor = alg.actor
+        batch = alg.replay_buffer.sample_sequences(4, 2, "cpu", num_windows=16, next_observations=["critic"], extend=4)
+        obs, resets = _window_head(batch, 6).observations, batch.resets[:6]
+        with torch.no_grad():
+            _, h0 = actor.encode_sequence(obs[:2], batch.init_hidden, resets[:2])
+
+        def actor_step(latent: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+            torch.manual_seed(7)
+            actions, logp = actor.act_and_log_prob_from_latent(latent.reshape(-1, latent.shape[-1]))
+            for p in alg.critic_parameters:
+                p.requires_grad_(False)
+            q = torch.min(alg.critic_1(obs[2:].reshape(-1), actions), alg.critic_2(obs[2:].reshape(-1), actions))
+            loss = (alg.log_alpha.exp().detach() * logp - q.view(-1)).mean()
+            alg.actor_optimizer.zero_grad()
+            loss.backward()
+            for p in alg.critic_parameters:
+                p.requires_grad_(True)
+            return loss.detach(), [p.grad.clone() for p in actor.parameters() if p.grad is not None]
+
+        latent, h_end, states = actor.encode_sequence_with_states(obs[2:], h0, resets[2:])
+        critic_before = [p.detach().clone() for p in alg.critic_parameters]
+        alg._update_critics_on_actor_windows(batch, latent, h_end, states, lambda key, value: None)
+        assert any(not torch.equal(a, p) for a, p in zip(critic_before, alg.critic_parameters, strict=True))
+        loss, grads = actor_step(latent)
+        fresh_loss, fresh_grads = actor_step(actor.encode_sequence(obs[2:], h0, resets[2:])[0])
+        assert torch.equal(loss, fresh_loss)
+        for g, fresh in zip(grads, fresh_grads, strict=True):
+            torch.testing.assert_close(g, fresh)
+
     def test_update_trains_on_the_actor_windows(self) -> None:
         """The update runs, keeps today's window count, and moves both critics and the actor."""
         torch.manual_seed(0)

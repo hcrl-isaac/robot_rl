@@ -29,12 +29,6 @@ class CriticExpansion:
     credit: torch.Tensor
     """``sum_{i=1}^{k-1} gamma^i B(s_i)`` over the imagined states, detached, ``(B, z_dim)``."""
 
-    imagined: TensorDict
-    """The imagined states ``s_1 .. s_{k-1}``, normalized and detached, ``((k - 1) B, ...)``."""
-
-    credit_weights: torch.Tensor
-    """``gamma^i`` per imagined state (zero past a real termination), ``(k - 1, B, 1)``."""
-
     disc_rewards: torch.Tensor
     """``sum_{i=1}^{k-1} gamma^i r_D(s_{i-1})``, ``(B, 1)``."""
 
@@ -71,10 +65,7 @@ class WorldModelFbCpr(FbCpr):
         tf32: bool = True,
         imagination_compile_mode: str | None = "max-autotune",
         mve_k: int = 1,
-        mve_critics: tuple[str, ...] = ("forward", "disc", "aux"),
-        mve_credit_ridge: float = 0.0,
-        mve_credit_grad: bool = False,
-        mve_imagined_negative_weight: float = 0.0,
+        mve_critics: tuple[str, ...] = ("disc", "aux"),
         mage_beta: float = 0.0,
         mage_q_beta: float | None = None,
         mage_batch_size: int | None = None,
@@ -98,13 +89,8 @@ class WorldModelFbCpr(FbCpr):
             tf32: Allow TF32 matmuls (a process-wide torch setting).
             imagination_compile_mode: ``torch.compile`` mode of the imagined loss; None runs it eagerly.
             mve_k: Steps of the critics' targets: the real next state plus ``k - 1`` imagined ones (1 = FB-CPR's).
-            mve_critics: Which critics take the k-step targets: ``"forward"`` (F and B), ``"disc"``, ``"aux"``.
-            mve_credit_ridge: Shrinks F's imagined credit by ``C (C + r mean_eig(C) I)^-1``, ``C`` the real next
-                states' ``B`` covariance, so directions real states barely span cannot grow F; 0 leaves it as is.
-            mve_credit_grad: Train ``B`` on the imagined credit as on the real next state (the exact k-step FB
-                loss) instead of detaching it; imagined states still never enter the orthonormality loss.
-            mve_imagined_negative_weight: Share of F's off-diagonal FB penalty taken by the other rows' imagined
-                states, so the credit they earn is paid back in the quadratic; 0 keeps the penalty on real states.
+            mve_critics: Which critics take the k-step targets: ``"forward"`` (F and B), ``"disc"``, ``"aux"``; F's
+                expansion is off by default, as the imagined credit grows F along directions real states miss.
             mage_beta: Weight of F's action-gradient (MAGE) loss through the world model (0 = off).
             mage_q_beta: Weight of the discriminator and aux critics' MAGE losses; None uses ``mage_beta``.
             mage_batch_size: Rows of the update's batch MAGE differentiates on; None uses all of them.
@@ -127,11 +113,6 @@ class WorldModelFbCpr(FbCpr):
             raise ValueError(f"mve_critics may name 'forward', 'disc' and 'aux', got {sorted(unknown)}.")
         self.mve_k = mve_k
         self.mve_critics = tuple(mve_critics)
-        self.mve_credit_ridge = mve_credit_ridge
-        self.mve_credit_grad = mve_credit_grad
-        if not 0.0 <= mve_imagined_negative_weight < 1.0:
-            raise ValueError(f"mve_imagined_negative_weight must be in [0, 1), got {mve_imagined_negative_weight}.")
-        self.mve_imagined_negative_weight = mve_imagined_negative_weight
         self.mage_beta = mage_beta
         self.mage_q_beta = mage_beta if mage_q_beta is None else mage_q_beta
         self.mage_batch_size = mage_batch_size
@@ -278,24 +259,7 @@ class WorldModelFbCpr(FbCpr):
         if self.mve_k > 1:
             exp = self._critic_expansion(win.obs[1], batch)
             if "forward" in self.mve_critics:
-                credit = exp.credit
-                if self.mve_credit_grad:
-                    with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        B_imag = self.backward_map(exp.imagined).float().view(*exp.credit_weights.shape[:2], -1)
-                    credit = (exp.credit_weights * B_imag).sum(dim=0)
-                credit, spectrum = self._shrink_credit(credit, batch)
-                fb_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, credit_backward=credit)
-                if self.mve_imagined_negative_weight > 0:
-                    steps, n = exp.credit_weights.shape[:2]
-                    # Column t * n + r is row r's t-th imagined state: skip a row's own rollout (its credit), dead ones
-                    other = 1 - torch.eye(n, device=self.device).repeat(1, steps)
-                    alive = (exp.credit_weights[0, :, 0] > 0).float().repeat(steps)
-                    fb_kwargs.update(
-                        negatives=exp.imagined,
-                        negative_mask=other * alive,
-                        negative_weight=self.mve_imagined_negative_weight,
-                    )
-                extras.update(spectrum)
+                fb_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, credit_backward=exp.credit)
             if "disc" in self.mve_critics:
                 disc_kwargs.update(bootstrap_obs=exp.obs, bootstrap_gammas=exp.gammas, extra_rewards=exp.disc_rewards)
             if "aux" in self.mve_critics:
@@ -307,37 +271,6 @@ class WorldModelFbCpr(FbCpr):
             extras.update(self._mage_backward("forward", win, batch))
             extras["forward"] = torch.ones(())
         return fb_kwargs, disc_kwargs, aux_kwargs, extras
-
-    def _shrink_credit(
-        self, credit: torch.Tensor, batch: ReplayBuffer.Batch
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Shrink the imagined credit along the real ``B`` covariance's weak directions, and log where it lies.
-
-        Args:
-            credit: The expansion's discounted ``B`` at imagined states, ``(B, z_dim)``.
-            batch: The transitions, normalized; their real next states give the covariance.
-
-        Returns:
-            The credit to apply and its spectrum diagnostics (relative to the real next states' own ``B``).
-        """
-        with torch.no_grad():
-            own = self.backward_map(batch.next_observations).float()
-            eig, vec = torch.linalg.eigh(own.T @ own / own.shape[0])
-            eig = eig.clamp_min(0.0)
-            mean = eig.mean()
-            rel = eig / mean
-            extras = {f"mve_cov_eig_p{q}": torch.quantile(rel, q / 100) for q in (1, 10, 50)}
-            for name, x in (("credit", credit.detach().float()), ("own", own)):
-                energy = (x @ vec).pow(2)
-                share = energy / energy.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                for cut in (0.01, 0.1):
-                    extras[f"mve_{name}_weak_share_{cut}"] = share[:, rel < cut].sum(dim=-1).mean()
-                # Norm of C^-1 x: the size of the F that answers x when only real states constrain it
-                extras[f"mve_{name}_inv_cov_norm"] = (energy / (eig + 1e-6 * mean).pow(2)).sum(dim=-1).sqrt().mean()
-        if self.mve_credit_ridge <= 0:
-            return credit, extras
-        gain = eig / (eig + self.mve_credit_ridge * mean)
-        return ((credit.float() @ vec) * gain) @ vec.T, extras
 
     @torch.no_grad()
     def _critic_expansion(self, next_raw: TensorDict, batch: ReplayBuffer.Batch) -> CriticExpansion:
@@ -362,8 +295,7 @@ class WorldModelFbCpr(FbCpr):
             norm = self._normalize(torch.stack(rollout.obs).reshape(-1)).reshape(k, n)
             weights = self.gamma ** torch.arange(1, k, device=self.device, dtype=torch.float32)
             B_imag = self.backward_map(norm[1:].reshape(-1)).float().view(k - 1, n, -1)
-            credit_weights = weights[:, None, None] * alive
-            credit = (credit_weights * B_imag).sum(dim=0)
+            credit = (weights[:, None, None] * B_imag).sum(dim=0) * alive
             eps = self.discriminator_reward_eps
             logits = self.discriminator(norm[: k - 1].reshape(-1), z.repeat(k - 1, 1)).view(k - 1, n)
             logits = logits.clamp(eps, 1 - eps)
@@ -373,8 +305,6 @@ class WorldModelFbCpr(FbCpr):
                 obs=norm[k - 1],
                 gammas=(self.gamma**k) * alive,
                 credit=credit,
-                imagined=norm[1:].reshape(-1),
-                credit_weights=credit_weights,
                 disc_rewards=(weights[:, None] * r_disc).sum(dim=0, keepdim=True).T * alive,
                 aux_rewards=(weights[:, None] * r_aux).sum(dim=0, keepdim=True).T * alive,
             )

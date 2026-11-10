@@ -9,6 +9,7 @@ from robot_rl.adaptation import (
     ReturnRidge,
     candidate_values,
     episode_stats,
+    make_feature_map,
     perturbed_candidates,
     safety_mask,
     select,
@@ -144,3 +145,17 @@ def test_sandwich_members_center_on_the_fit_and_shrink_with_data() -> None:
     few, many = ens.fit(stats[:4]), ens.fit(stats)
     assert (many.members.mean(0) - many.W_full).abs().max() < 0.05
     assert many.members.std(0).mean() < 0.5 * few.members.std(0).mean()
+
+
+def test_latent_interaction_features_layout() -> None:
+    """``pca_x_z`` features are [1, s, u, s kron u] with u spanning the candidates' main directions."""
+    g = torch.Generator().manual_seed(7)
+    forward = torch.randn(200, 6, generator=g)
+    cands = torch.randn(30, 6, generator=g)
+    fm = make_feature_map("pca_x_z", 6, k=3, m=2).fit(forward)
+    fm.fit_latents(cands)
+    z = cands[torch.randint(0, 30, (200,), generator=g)]
+    phi = fm(forward, latent=z)
+    assert phi.shape == (200, 1 + 3 + 2 + 6)
+    s, u = phi[:, 1:4], phi[:, 4:6]
+    assert torch.allclose(phi[:, 6:], (s[:, :, None] * u[:, None, :]).flatten(1), atol=1e-6)

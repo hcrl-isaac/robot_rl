@@ -13,6 +13,7 @@ from .features import (
     FeatureMap,
     ForwardFeatures,
     PCAFeatures,
+    PCALatentFeatures,
     PCAPhysicalFeatures,
     make_feature_map,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "LSTDFit",
     "LSTDStats",
     "PCAFeatures",
+    "PCALatentFeatures",
     "PCAPhysicalFeatures",
     "ReturnRidge",
     "candidate_values",

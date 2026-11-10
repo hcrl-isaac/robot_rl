@@ -22,7 +22,9 @@ class FeatureMap:
         """
         return self
 
-    def __call__(self, forward: torch.Tensor, physical: torch.Tensor | None = None) -> torch.Tensor:
+    def __call__(
+        self, forward: torch.Tensor, physical: torch.Tensor | None = None, latent: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Return ``phi`` ``(..., dim)`` for ``forward`` ``(..., d)``."""
         raise NotImplementedError
 
@@ -32,7 +34,9 @@ class BiasFeatures(FeatureMap):
 
     dim = 1
 
-    def __call__(self, forward: torch.Tensor, physical: torch.Tensor | None = None) -> torch.Tensor:
+    def __call__(
+        self, forward: torch.Tensor, physical: torch.Tensor | None = None, latent: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Return ones ``(..., 1)``."""
         return torch.ones(*forward.shape[:-1], 1, device=forward.device, dtype=forward.dtype)
 
@@ -54,7 +58,9 @@ class ForwardFeatures(FeatureMap):
         self.scale = forward.norm(dim=-1).mean().item() / forward.shape[-1] ** 0.5
         return self
 
-    def __call__(self, forward: torch.Tensor, physical: torch.Tensor | None = None) -> torch.Tensor:
+    def __call__(
+        self, forward: torch.Tensor, physical: torch.Tensor | None = None, latent: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Return ``F / scale``."""
         return forward / self.scale
 
@@ -80,7 +86,9 @@ class PCAFeatures(FeatureMap):
         self.explained = (s[: self.k].pow(2).sum() / s.pow(2).sum()).item()
         return self
 
-    def __call__(self, forward: torch.Tensor, physical: torch.Tensor | None = None) -> torch.Tensor:
+    def __call__(
+        self, forward: torch.Tensor, physical: torch.Tensor | None = None, latent: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Return ``[1, whitened scores]`` ``(..., k + 1)``."""
         scores = (forward - self.mean) @ self.components / self.std
         return torch.cat([torch.ones_like(scores[..., :1]), scores], dim=-1)
@@ -107,13 +115,52 @@ class PCAPhysicalFeatures(PCAFeatures):
         self.p_std = physical.std(dim=0).clamp_min(1e-6)
         return self
 
-    def __call__(self, forward: torch.Tensor, physical: torch.Tensor | None = None) -> torch.Tensor:
+    def __call__(
+        self, forward: torch.Tensor, physical: torch.Tensor | None = None, latent: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Return PCA features concatenated with standardized ``physical``."""
         return torch.cat([super().__call__(forward), (physical - self.p_mean) / self.p_std], dim=-1)
 
 
-def make_feature_map(kind: str, z_dim: int, k: int = 16, physical_dim: int = 0) -> FeatureMap:
-    """Build a feature map by name: ``bias``, ``pca``, ``F`` or ``pca+phys``."""
+class PCALatentFeatures(PCAFeatures):
+    """``[1, s, u, s kron u]``: PCA scores ``s`` of ``F`` interacted with a projection ``u`` of the latent.
+
+    The latent projection ``u = (z - z_mean) P / scale`` spans the main directions of the candidate set, so the
+    correction can differ between candidates (``W`` is still shared).
+    """
+
+    def __init__(self, k: int, m: int) -> None:
+        """Initialize an unfit map.
+
+        Args:
+            k: Number of PCA components of ``F``.
+            m: Dimension of the latent projection.
+        """
+        super().__init__(k)
+        self.m = m
+        self.dim = 1 + k + m + k * m
+
+    def fit_latents(self, latents: torch.Tensor) -> PCALatentFeatures:
+        """Fit the latent projection on the candidate latents ``(N, d)`` (known before any data)."""
+        self.z_mean = latents.mean(dim=0)
+        _, sv, vh = torch.linalg.svd(latents - self.z_mean, full_matrices=False)
+        self.z_basis = vh[: self.m].T
+        self.z_std = (sv[: self.m] / max(latents.shape[0] - 1, 1) ** 0.5).clamp_min(1e-6)
+        return self
+
+    def __call__(
+        self, forward: torch.Tensor, physical: torch.Tensor | None = None, latent: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Return ``[1, s, u, s kron u]`` ``(..., 1 + k + m + k m)``."""
+        base = super().__call__(forward)
+        s = base[..., 1:]
+        u = (latent - self.z_mean) @ self.z_basis / self.z_std
+        inter = (s[..., :, None] * u[..., None, :]).flatten(-2)
+        return torch.cat([base, u, inter], dim=-1)
+
+
+def make_feature_map(kind: str, z_dim: int, k: int = 16, physical_dim: int = 0, m: int = 4) -> FeatureMap:
+    """Build a feature map by name: ``bias``, ``pca``, ``F``, ``pca+phys`` or ``pca_x_z`` (needs ``fit_latents``)."""
     if kind == "bias":
         return BiasFeatures()
     if kind == "pca":
@@ -122,4 +169,6 @@ def make_feature_map(kind: str, z_dim: int, k: int = 16, physical_dim: int = 0) 
         return ForwardFeatures(z_dim)
     if kind == "pca+phys":
         return PCAPhysicalFeatures(k, physical_dim)
+    if kind == "pca_x_z":
+        return PCALatentFeatures(k, m)
     raise ValueError(f"unknown feature map {kind!r}")

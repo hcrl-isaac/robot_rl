@@ -34,6 +34,7 @@ class ForwardBackwardCfg:
     feature_dim: int = 512
     backward_hidden_dim: int = 256
     compile: bool = True
+    q_loss_coef: float = 0.0
 
 
 def _mlp(dims: list[int], first_norm_tanh: bool, final_relu: bool) -> nn.Sequential:
@@ -231,6 +232,17 @@ class ForwardBackward:
         orth_offdiag = (cov.pow(2) * self._off_diag).sum() / self._off_diag_count
         orth_diag = -2 * cov.diag().mean()
         loss = fb_offdiag + fb_diag + self.cfg.ortho_coef * (orth_offdiag + orth_diag)
+        q_loss = torch.zeros((), device=B.device)
+        if self.cfg.q_loss_coef > 0:
+            # Scalar Bellman consistency of Q = F^T z with the reward B^T Sigma_B^-1 z implied by the batch's B.
+            with torch.no_grad():
+                next_q = torch.einsum("nsd,sd->ns", target_F, z).min(dim=0).values
+                sigma = B.T @ B / B.shape[0]
+                implicit_r = (torch.linalg.solve(sigma, B, left=False) * z).sum(dim=-1)
+                target_q = implicit_r + self.cfg.discount * next_q
+            q = torch.einsum("nsd,sd->ns", Fs, z)
+            q_loss = (q - target_q).pow(2).mean(dim=-1).sum()
+            loss = loss + self.cfg.q_loss_coef * q_loss
         with torch.no_grad():
             eye_diff = B.T @ B / B.shape[0] - torch.eye(self.cfg.z_dim, device=B.device)
             stats = {
@@ -242,6 +254,8 @@ class ForwardBackward:
                 "FB/forward_norm": Fs[0].norm(dim=-1).mean().detach(),
                 "FB/orth_linf": eye_diff.abs().max(),
                 "FB/orth_l2": eye_diff.norm() / math.sqrt(self.cfg.z_dim),
+                "FB/measure_mass": (Fs[0] @ B.mean(dim=0)).mean().detach(),
+                "Loss/q": q_loss.detach(),
             }
         return loss, stats
 

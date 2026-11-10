@@ -58,3 +58,12 @@ def test_actions_are_bounded_and_checkpoint_round_trips() -> None:
     clone = ForwardBackward.from_state_dict(agent.state_dict(), device="cpu")
     assert torch.allclose(clone.act(obs, z), a)
     assert clone.num_updates == agent.num_updates
+
+
+def test_q_loss_option_adds_a_finite_term() -> None:
+    """The scalar Q consistency term is finite and reported when enabled."""
+    torch.manual_seed(0)
+    agent = ForwardBackward(5, 2, _small_cfg(q_loss_coef=0.1), device="cpu")
+    stats = agent.update(_batch())
+    assert torch.isfinite(stats["Loss/q"]) and stats["Loss/q"] > 0
+    assert torch.isfinite(stats["FB/measure_mass"])

@@ -219,10 +219,10 @@ class RolloutStorage:
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
         # For distillation
-        if training_type == "distillation":
+        if training_type in ["distillation", "distillation_rl"]:
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         # for reinforcement learning
-        elif training_type in ["meta_rl", "rl"]:
+        if training_type in ["meta_rl", "rl", "distillation_rl"]:
             self.values = torch.zeros(num_transitions_per_env, num_envs, streams, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.distribution_params: tuple[torch.Tensor, ...] | None = None  # Lazily initialized on first transition
@@ -256,10 +256,10 @@ class RolloutStorage:
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # For distillation
-        if self.training_type == "distillation":
+        if self.training_type in ["distillation", "distillation_rl"]:
             self.privileged_actions[self.step].copy_(transition.privileged_actions)  # type: ignore
         # For reinforcement learning
-        elif self.training_type in ["meta_rl", "rl"]:
+        if self.training_type in ["meta_rl", "rl", "distillation_rl"]:
             self.values[self.step].copy_(transition.values)  # type: ignore
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
             if self.distribution_params is None:  # Initialize the distribution parameters
@@ -292,12 +292,19 @@ class RolloutStorage:
     # For distillation
     def generator(self, device: str | None = None) -> Generator[Batch, None, None]:
         """Yield per-timestep batches for distillation training."""
-        if self.training_type != "distillation":
+        if self.training_type not in ["distillation", "distillation_rl"]:
             raise ValueError("This function is only available for distillation training.")
 
+        rl = self.training_type == "distillation_rl"
         for i in range(self.num_transitions_per_env):
             yield RolloutStorage.Batch(
                 observations=self.observations[i],  # type: ignore
+                actions=self.actions[i] if rl else None,
+                values=self.values[i] if rl else None,
+                advantages=self.advantages[i] if rl else None,
+                returns=self.returns[i] if rl else None,
+                old_actions_log_prob=self.actions_log_prob[i] if rl else None,
+                old_distribution_params=tuple(p[i] for p in self.distribution_params) if rl else None,  # type: ignore
                 privileged_actions=self.privileged_actions[i],
                 dones=self.dones[i],
                 device=device,
@@ -308,7 +315,7 @@ class RolloutStorage:
         self, num_mini_batches: int, num_epochs: int = 8, device: str | None = None
     ) -> Generator[Batch, None, None]:
         """Yield shuffled flat mini-batches for feedforward RL updates."""
-        if self.training_type not in ["meta_rl", "rl"]:
+        if self.training_type not in ["meta_rl", "rl", "distillation_rl"]:
             raise ValueError(
                 "This function is only available for reinforcement learning and meta-reinforcement learning training."
             )
@@ -324,6 +331,7 @@ class RolloutStorage:
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
+        privileged = self.privileged_actions.flatten(0, 1) if self.training_type == "distillation_rl" else None
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -341,6 +349,7 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    privileged_actions=privileged[batch_idx] if privileged is not None else None,
                     device=device,
                 )
 
@@ -349,7 +358,7 @@ class RolloutStorage:
         self, num_mini_batches: int, num_epochs: int = 8, device: str | None = None
     ) -> Generator[Batch, None, None]:
         """Yield trajectory mini-batches with masks and recurrent hidden states."""
-        if self.training_type not in ["meta_rl", "rl"]:
+        if self.training_type not in ["meta_rl", "rl", "distillation_rl"]:
             raise ValueError(
                 "This function is only available for reinforcement learning and meta-reinforcement learning training."
             )
@@ -392,6 +401,9 @@ class RolloutStorage:
                     hidden_states=(hidden_state_a_batch, hidden_state_c_batch),
                     memory_hidden_state=hidden_state_m_batch,
                     masks=trajectory_masks[:, first_traj:last_traj],
+                    privileged_actions=(
+                        self.privileged_actions[:, start:stop] if self.training_type == "distillation_rl" else None
+                    ),
                     device=device,
                 )
 

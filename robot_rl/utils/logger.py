@@ -19,20 +19,28 @@ import robot_rl
 from robot_rl.utils.log_writer import LogWriter
 from robot_rl.utils.utils import resolve_callable
 
+# the policy's own statistics keep their W&B section, apart from the training internals
+KEPT_SECTIONS = ("Train", "Policy")
+
 
 def train_key(tag: str) -> str:
     """Move a scalar name under ``Train/``: ``Actor/grad_norm`` becomes ``Train/actor/grad_norm``.
 
     Args:
-        tag: A ``<Section>/<name>`` scalar name; one already under ``Train/`` is kept.
+        tag: A ``<Section>/<name>`` scalar name; one already under ``Train/`` or in ``Policy/`` is kept.
 
     Returns:
         The name W&B groups in its ``Train`` section.
     """
     section, _, name = tag.partition("/")
-    if section == "Train" or not name:
+    if section in KEPT_SECTIONS or not name:
         return tag
     return f"Train/{section.lower()}/{name}"
+
+
+def _repeat(value: float | torch.Tensor, n: int) -> torch.Tensor:
+    """Repeat a scalar episode-log value ``n`` times, so a mean over steps weights each step by its resets."""
+    return torch.as_tensor(value, dtype=torch.float).reshape(-1).repeat(n)
 
 
 class Logger:
@@ -168,8 +176,10 @@ class Logger:
             # Store episode extras
             if "episode" in extras:
                 self.ep_extras.append(extras["episode"])
-            elif "log" in extras:
-                self.ep_extras.append(extras["log"])
+            elif "log" in extras and (num_done := int((dones > 0).sum())) > 0:
+                # the env rewrites "log" only on steps that reset envs, as a mean over them: skip the stale
+                # dict on other steps and weight each step by its resets
+                self.ep_extras.append({k: _repeat(v, num_done) for k, v in extras["log"].items()})
             # Store evaluation extras
             if eval_extras:
                 self.eval_extras.extend(eval_extras)

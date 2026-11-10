@@ -7,5 +7,6 @@
 
 from .url_vec_env import URLVecEnv
 from .vec_env import VecEnv
+from .world_model_spec import ObsTermLayout, WorldModelSpec
 
-__all__ = ["URLVecEnv", "VecEnv"]
+__all__ = ["ObsTermLayout", "URLVecEnv", "VecEnv", "WorldModelSpec"]

@@ -601,6 +601,8 @@ def _vmf_bessel_terms(kappa: torch.Tensor, half: int, cf_extra: int) -> tuple[to
 
 
 _vmf_bessel_terms_fused = torch.compile(_vmf_bessel_terms, fullgraph=True, dynamic=False)
+# per-state concentrations: one fused kernel over a batch whose size varies between rollout and update
+_vmf_bessel_terms_fused_rows = torch.compile(_vmf_bessel_terms, fullgraph=True, dynamic=None)
 
 
 @functools.cache
@@ -659,6 +661,7 @@ class VonMisesFisherDistribution(Distribution):
         learn_std: bool = True,
         kappa_range: tuple[float, float] = (1e-2, 1e5),
         cf_extra_terms: int = 64,
+        state_dependent_kappa: bool = False,
     ) -> None:
         """Initialize the von Mises-Fisher distribution module.
 
@@ -668,20 +671,26 @@ class VonMisesFisherDistribution(Distribution):
             learn_std: Whether the concentration is a learnable parameter. If False, it is fixed at its initial value.
             kappa_range: ``(min, max)`` clamp applied to the concentration for numerical stability.
             cf_extra_terms: Extra terms used to seed the backward Bessel-ratio recurrence (higher = more accurate).
+            state_dependent_kappa: Whether the MLP outputs ``log kappa`` per state as an extra last output, in place
+                of the single learnable concentration.
         """
         super().__init__(output_dim)
         if output_dim % 2 != 0:
             raise ValueError(f"VonMisesFisherDistribution requires an even output_dim, got {output_dim}.")
 
-        # Concentration is a single scalar, stored in log-space for positivity and a well-conditioned parameterization.
+        # Concentration in log-space for positivity: one learnable scalar, or the MLP's extra output per state.
         init_kappa = 1.0 / max(init_std, 1e-6) ** 2
-        self.log_kappa = nn.Parameter(torch.log(torch.tensor([init_kappa])), requires_grad=learn_std)
+        self.state_dependent_kappa = state_dependent_kappa
+        self.init_log_kappa = math.log(init_kappa)
+        if not state_dependent_kappa:
+            self.log_kappa = nn.Parameter(torch.log(torch.tensor([init_kappa])), requires_grad=learn_std)
         self.kappa_range = (float(kappa_range[0]), float(kappa_range[1]))
+        self.log_kappa_range = (math.log(self.kappa_range[0]), math.log(self.kappa_range[1]))
         self._cf_extra = int(cf_extra_terms)
 
         # Current state (populated by update())
         self._mu: torch.Tensor | None = None  # [B, p] unit mean direction
-        self._kappa: torch.Tensor | None = None  # scalar concentration
+        self._kappa: torch.Tensor | None = None  # scalar concentration, or [...] per state
         self._log_norm: torch.Tensor | None = None  # log C_p(kappa)
         self._a_ratio: torch.Tensor | None = None  # A_p(kappa) = I_{p/2}(kappa) / I_{p/2-1}(kappa)
 
@@ -695,8 +704,25 @@ class VonMisesFisherDistribution(Distribution):
         fn = _vmf_bessel_terms_fused if fused else _vmf_bessel_terms
         return fn(kappa, self.output_dim // 2, self._cf_extra)
 
+    def _bessel_terms_rows(self, kappa: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """:meth:`_bessel_terms` for a tensor of per-state concentrations, fused over the batch on CUDA."""
+        fused = not torch.compiler.is_compiling() and kappa.is_cuda and _has_triton()
+        if not fused:
+            return _vmf_bessel_terms(kappa, self.output_dim // 2, self._cf_extra)
+        kappa = kappa.reshape(-1)
+        torch._dynamo.mark_dynamic(kappa, 0)  # only the batch varies; the Bessel order stays a constant
+        log_norm, a_ratio = _vmf_bessel_terms_fused_rows(kappa, self.output_dim // 2, self._cf_extra)
+        return log_norm.reshape(self._kappa_shape), a_ratio.reshape(self._kappa_shape)
+
     def update(self, mlp_output: torch.Tensor) -> None:
-        """Update the distribution: mean direction = normalized MLP output, concentration = kappa param."""
+        """Update the distribution: mean direction = normalized MLP output, concentration = kappa param or output."""
+        if self.state_dependent_kappa:
+            self._mu = torch.nn.functional.normalize(mlp_output[..., : self.output_dim], dim=-1)
+            log_kappa = mlp_output[..., self.output_dim].clamp(*self.log_kappa_range)
+            self._kappa = torch.exp(log_kappa)
+            self._kappa_shape = self._kappa.shape
+            self._log_norm, self._a_ratio = self._bessel_terms_rows(self._kappa)
+            return
         self._mu = torch.nn.functional.normalize(mlp_output, dim=-1)
         self._kappa = torch.exp(self.log_kappa).clamp(self.kappa_range[0], self.kappa_range[1])
         self._log_norm, self._a_ratio = self._bessel_terms(self._kappa)
@@ -734,9 +760,10 @@ class VonMisesFisherDistribution(Distribution):
         n = flat_mu.shape[0]
         device = mu.device
         d = float(p - 1)
-        kappa = self._kappa.squeeze()
+        kappa = self._kappa.reshape(-1) if self.state_dependent_kappa else self._kappa.squeeze()
         with torch.no_grad():
-            z = self._sample_weight_noise(n, p, kappa.detach(), device)  # [N]
+            noise_kappa = kappa.detach().unsqueeze(-1) if self.state_dependent_kappa else kappa.detach()
+            z = self._sample_weight_noise(n, p, noise_kappa, device)  # [N]
         b = _wood_b(kappa, d)
         w = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z)
         # Direction orthogonal to mu, uniform on the (p-2)-subsphere.
@@ -758,16 +785,28 @@ class VonMisesFisherDistribution(Distribution):
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Return the unit mean direction (the deterministic action is the mode of the vMF)."""
-        return torch.nn.functional.normalize(mlp_output, dim=-1)
+        return torch.nn.functional.normalize(mlp_output[..., : self.output_dim], dim=-1)
 
     def as_deterministic_output_module(self) -> nn.Module:
         """Return an export-friendly module that normalizes the MLP output to the unit mean direction."""
-        return _NormalizeDeterministicOutput()
+        return _NormalizeDeterministicOutput(self.output_dim if self.state_dependent_kappa else None)
 
     @property
     def input_dim(self) -> int:
-        """Return the input dimension required by the distribution (the MLP outputs the raw mean direction)."""
-        return self.output_dim
+        """Return the MLP width: the raw mean direction, plus ``log kappa`` when the concentration is per state."""
+        return self.output_dim + int(self.state_dependent_kappa)
+
+    @classmethod
+    def output_dim_for_input_width(cls, width: int) -> int:
+        """Return the even ``output_dim`` of a ``width``-wide MLP output; an odd width carries ``log kappa`` last."""
+        return width - width % 2
+
+    def init_mlp_weights(self, mlp: nn.Module) -> None:
+        """Start a per-state concentration at ``init_std`` in every state."""
+        if self.state_dependent_kappa:
+            head = [m for m in mlp.modules() if isinstance(m, nn.Linear)][-1]
+            torch.nn.init.zeros_(head.weight[self.output_dim :])
+            torch.nn.init.constant_(head.bias[self.output_dim :], self.init_log_kappa)
 
     @property
     def mean(self) -> torch.Tensor:
@@ -777,26 +816,32 @@ class VonMisesFisherDistribution(Distribution):
     @property
     def std(self) -> torch.Tensor:
         """Return the (asymptotic tangent) standard deviation ``1/sqrt(kappa)``, broadcast to the mean's shape."""
-        return torch.ones_like(self._mu) * self._kappa.rsqrt()  # type: ignore
+        kappa = self._kappa.unsqueeze(-1) if self.state_dependent_kappa else self._kappa  # type: ignore
+        return torch.ones_like(self._mu) * kappa.rsqrt()  # type: ignore
 
     @property
     def entropy(self) -> torch.Tensor:
         r"""Return the vMF entropy ``-log C_p(kappa) - kappa * A_p(kappa)``, broadcast over leading dims."""
         ent = -self._log_norm - self._kappa.squeeze() * self._a_ratio
         lead = self._mu.shape[:-1]  # type: ignore
+        if self.state_dependent_kappa:
+            return ent.reshape(lead)
         return ent.reshape((1,) * len(lead)).expand(lead)  # type: ignore
 
     @property
     def params(self) -> tuple[torch.Tensor, ...]:
         """Return ``(mean_direction, kappa)``; kappa broadcast to ``[..., 1]`` over leading dims for KL."""
         lead = self._mu.shape[:-1]  # type: ignore
+        if self.state_dependent_kappa:
+            return (self._mu, self._kappa.unsqueeze(-1))  # type: ignore
         kappa_b = self._kappa.reshape((1,) * len(lead) + (1,)).expand(*lead, 1)  # type: ignore
         return (self._mu, kappa_b)  # type: ignore
 
     def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
         """Compute ``log C_p(kappa) + kappa * (mu . x)`` for unit-vector ``outputs``."""
         dot = (self._mu * outputs).sum(dim=-1)  # type: ignore
-        return self._log_norm + self._kappa.squeeze() * dot
+        kappa = self._kappa if self.state_dependent_kappa else self._kappa.squeeze()  # type: ignore
+        return self._log_norm + kappa * dot
 
     def kl_divergence(self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]) -> torch.Tensor:
         r"""Compute ``KL(old || new)`` between two vMF distributions.
@@ -806,10 +851,16 @@ class VonMisesFisherDistribution(Distribution):
         """
         mu0, kappa0_b = old_params
         mu1, kappa1_b = new_params
-        kappa0 = kappa0_b.reshape(-1)[0]
-        kappa1 = kappa1_b.reshape(-1)[0]
-        log_norm0, a0 = self._bessel_terms(kappa0)
-        log_norm1, _ = self._bessel_terms(kappa1)
+        if self.state_dependent_kappa:
+            kappa0, kappa1 = kappa0_b.squeeze(-1), kappa1_b.squeeze(-1)
+            self._kappa_shape = kappa0.shape
+            log_norm0, a0 = self._bessel_terms_rows(kappa0)
+            log_norm1, _ = self._bessel_terms_rows(kappa1)
+        else:
+            kappa0 = kappa0_b.reshape(-1)[0]
+            kappa1 = kappa1_b.reshape(-1)[0]
+            log_norm0, a0 = self._bessel_terms(kappa0)
+            log_norm1, _ = self._bessel_terms(kappa1)
         dot = (mu0 * mu1).sum(dim=-1)
         return (log_norm0 - log_norm1) + a0 * (kappa0 - kappa1 * dot)
 
@@ -838,6 +889,7 @@ class SquashedTanhGaussianDistribution(Distribution):
         low: float = -1.0,
         high: float = 1.0,
         eps: float = 1e-6,
+        state_dependent_std: bool = False,
     ) -> None:
         """Initialize the squashed-tanh Gaussian distribution module.
 
@@ -850,9 +902,16 @@ class SquashedTanhGaussianDistribution(Distribution):
             low: Lower bound of the squashed action range.
             high: Upper bound of the squashed action range.
             eps: Small tolerance for the ``atanh`` inversion in :meth:`log_prob`.
+            state_dependent_std: Whether the MLP outputs the log-std per state (after the mean) instead of the
+                learnable parameter.
         """
         super().__init__(output_dim)
-        self.log_std_param = nn.Parameter(torch.log(init_noise_std * torch.ones(output_dim)), requires_grad=learn_std)
+        self.state_dependent_std = state_dependent_std
+        self.init_log_std = math.log(init_noise_std)
+        if not state_dependent_std:
+            self.log_std_param = nn.Parameter(
+                torch.log(init_noise_std * torch.ones(output_dim)), requires_grad=learn_std
+            )
         self.log_std_min = float(log_std_min)
         self.log_std_max = float(log_std_max)
         self._eps = eps
@@ -866,10 +925,15 @@ class SquashedTanhGaussianDistribution(Distribution):
         Normal.set_default_validate_args(False)
 
     def update(self, mlp_output: torch.Tensor) -> None:
-        """Update the pre-squash Gaussian from MLP output (mean = output; std = clamped log-std param)."""
-        self._mean_pre = mlp_output
-        log_std = self.log_std_param.clamp(self.log_std_min, self.log_std_max)
-        self._std = torch.exp(log_std).expand_as(mlp_output)
+        """Update the pre-squash Gaussian from MLP output (mean, then the per-state log-std if enabled)."""
+        if self.state_dependent_std:
+            self._mean_pre = mlp_output[..., : self.output_dim]
+            log_std = mlp_output[..., self.output_dim :].clamp(self.log_std_min, self.log_std_max)
+            self._std = torch.exp(log_std)
+        else:
+            self._mean_pre = mlp_output
+            log_std = self.log_std_param.clamp(self.log_std_min, self.log_std_max)
+            self._std = torch.exp(log_std).expand_as(mlp_output)
         self._distribution = Normal(self._mean_pre, self._std)
 
     def _squash(self, pre_tanh: torch.Tensor) -> torch.Tensor:
@@ -903,16 +967,23 @@ class SquashedTanhGaussianDistribution(Distribution):
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Return the squashed mean action (the deterministic policy output)."""
-        return self._squash(mlp_output)
+        return self._squash(mlp_output[..., : self.output_dim])
 
     def as_deterministic_output_module(self) -> nn.Module:
         """Return an export-friendly module that squashes the MLP output into ``[low, high]``."""
-        return _TanhScaledDeterministicOutput(self._scale, self._offset)
+        return _TanhScaledDeterministicOutput(self._scale, self._offset, self.output_dim)
 
     @property
     def input_dim(self) -> int:
-        """Return the input dimension required by the distribution (the MLP outputs the pre-squash mean)."""
-        return self.output_dim
+        """Return the MLP width: the pre-squash mean, plus the log-std when it is per state."""
+        return self.output_dim * (2 if self.state_dependent_std else 1)
+
+    def init_mlp_weights(self, mlp: nn.Module) -> None:
+        """Start a per-state std at ``init_noise_std`` in every state."""
+        if self.state_dependent_std:
+            head = [m for m in mlp.modules() if isinstance(m, nn.Linear)][-1]
+            torch.nn.init.zeros_(head.weight[self.output_dim :])
+            torch.nn.init.constant_(head.bias[self.output_dim :], self.init_log_std)
 
     @property
     def mean(self) -> torch.Tensor:
@@ -945,6 +1016,159 @@ class SquashedTanhGaussianDistribution(Distribution):
         return torch.distributions.kl_divergence(Normal(old_mean, old_std), Normal(new_mean, new_std)).sum(dim=-1)
 
 
+class VonMisesFisherTanhGaussianDistribution(Distribution):
+    """A vMF direction over the leading dimensions joined with a squashed-tanh Gaussian over the last ``tail_dim``.
+
+    For an action that is a latent on the sphere plus a few bounded commands (e.g. a gaze target): the two parts
+    are independent, so log-probabilities and entropies add.
+    """
+
+    def __init__(
+        self,
+        output_dim: int,
+        tail_dim: int = 2,
+        init_std: float = 1.0,
+        learn_std: bool = True,
+        kappa_range: tuple[float, float] = (1e-2, 1e5),
+        tail_init_noise_std: float = 0.5,
+        tail_learn_std: bool = True,
+        tail_low: float = -1.0,
+        tail_high: float = 1.0,
+        state_dependent_kappa: bool = False,
+        tail_state_dependent_std: bool = False,
+    ) -> None:
+        """Initialize both parts.
+
+        Args:
+            output_dim: Total action dimension; the first ``output_dim - tail_dim`` are the vMF direction.
+            tail_dim: Number of trailing bounded dimensions.
+            init_std: The vMF part's initial tangent std (``kappa = 1 / init_std**2``).
+            learn_std: Whether the vMF concentration is learnable.
+            kappa_range: Clamp on the vMF concentration.
+            tail_init_noise_std: The tail's initial pre-squash std.
+            tail_learn_std: Whether the tail's std is learnable.
+            tail_low: Lower bound of the tail actions.
+            tail_high: Upper bound of the tail actions.
+            state_dependent_kappa: Whether the vMF part reads its ``log kappa`` from the network per state.
+            tail_state_dependent_std: Whether the tail reads its log-std from the network per state.
+        """
+        super().__init__(output_dim)
+        self.head_dim = output_dim - tail_dim
+        self.head = VonMisesFisherDistribution(
+            self.head_dim, init_std, learn_std, kappa_range, state_dependent_kappa=state_dependent_kappa
+        )
+        self.tail = SquashedTanhGaussianDistribution(
+            tail_dim,
+            tail_init_noise_std,
+            learn_std=tail_learn_std,
+            low=tail_low,
+            high=tail_high,
+            state_dependent_std=tail_state_dependent_std,
+        )
+
+    def _split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split an action into its vMF and tail parts."""
+        return x[..., : self.head_dim], x[..., self.head_dim :]
+
+    def _split_mlp(self, mlp_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split the network output into the vMF part's inputs (with a per-state ``log kappa``) and the tail's."""
+        width = self.head.input_dim
+        return mlp_output[..., :width], mlp_output[..., width:]
+
+    def update(self, mlp_output: torch.Tensor) -> None:
+        """Update the vMF part from the leading outputs and the squashed Gaussian from the trailing ones."""
+        head, tail = self._split_mlp(mlp_output)
+        self.head.update(head)
+        self.tail.update(tail)
+
+    def sample(self, std_clip: float | None = None) -> torch.Tensor:
+        """Sample both parts and join them."""
+        return torch.cat([self.head.sample(), self.tail.sample()], dim=-1)
+
+    def sample_and_log_prob(self, std_clip: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reparameterized joint sample and its log-prob (the sum of the parts')."""
+        head, head_logp = self.head.sample_and_log_prob()
+        tail, tail_logp = self.tail.sample_and_log_prob()
+        return torch.cat([head, tail], dim=-1), head_logp + tail_logp
+
+    def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        """Return the vMF mean direction joined with the squashed tail mean."""
+        head, tail = self._split_mlp(mlp_output)
+        return torch.cat([self.head.deterministic_output(head), self.tail.deterministic_output(tail)], dim=-1)
+
+    def as_deterministic_output_module(self) -> nn.Module:
+        """Export module applying each part's deterministic output to its slice."""
+        return _SplitDeterministicOutput(
+            self.head.input_dim, self.head.as_deterministic_output_module(), self.tail.as_deterministic_output_module()
+        )
+
+    @property
+    def input_dim(self) -> int:
+        """The MLP outputs the raw vMF direction (and its ``log kappa``) then the tail's pre-squash mean."""
+        return self.head.input_dim + self.tail.input_dim
+
+    @classmethod
+    def output_dim_for_input_width(cls, width: int) -> int:
+        """Return the action dimension for a ``width``-wide output; not inferable when kappa is per state."""
+        return width
+
+    def init_mlp_weights(self, mlp: nn.Module) -> None:
+        """Initialize only the per-state spread rows: the vMF ``log kappa`` after its direction, the tail log-std."""
+        last = [m for m in mlp.modules() if isinstance(m, nn.Linear)][-1]
+        if self.head.state_dependent_kappa:
+            row = slice(self.head_dim, self.head_dim + 1)
+            torch.nn.init.zeros_(last.weight[row])
+            torch.nn.init.constant_(last.bias[row], self.head.init_log_kappa)
+        if self.tail.state_dependent_std:
+            rows = slice(self.head.input_dim + self.tail.output_dim, self.head.input_dim + self.tail.input_dim)
+            torch.nn.init.zeros_(last.weight[rows])
+            torch.nn.init.constant_(last.bias[rows], self.tail.init_log_std)
+
+    @property
+    def mean(self) -> torch.Tensor:
+        """The joined means."""
+        return torch.cat([self.head.mean, self.tail.mean], dim=-1)
+
+    @property
+    def std(self) -> torch.Tensor:
+        """The joined spreads (vMF tangent std, tail pre-squash std)."""
+        return torch.cat([self.head.std, self.tail.std], dim=-1)
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        """The sum of the parts' entropies."""
+        return self.head.entropy + self.tail.entropy
+
+    @property
+    def params(self) -> tuple[torch.Tensor, ...]:
+        """The vMF parameters followed by the tail's."""
+        return (*self.head.params, *self.tail.params)
+
+    def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        """Return the sum of the parts' log-probs."""
+        head, tail = self._split(outputs)
+        return self.head.log_prob(head) + self.tail.log_prob(tail)
+
+    def kl_divergence(self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Return the sum of the parts' KL divergences."""
+        return self.head.kl_divergence(old_params[:2], new_params[:2]) + self.tail.kl_divergence(
+            old_params[2:], new_params[2:]
+        )
+
+
+class _SplitDeterministicOutput(nn.Module):
+    """Exportable module applying one deterministic output to the leading slice and another to the rest."""
+
+    def __init__(self, split: int, head: nn.Module, tail: nn.Module) -> None:
+        super().__init__()
+        self.split = split
+        self.head = head
+        self.tail = tail
+
+    def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        return torch.cat([self.head(mlp_output[..., : self.split]), self.tail(mlp_output[..., self.split :])], dim=-1)
+
+
 class _IdentityDeterministicOutput(nn.Module):
     """Exportable module that returns the MLP output as is."""
 
@@ -953,10 +1177,15 @@ class _IdentityDeterministicOutput(nn.Module):
 
 
 class _NormalizeDeterministicOutput(nn.Module):
-    """Exportable module that L2-normalizes the MLP output to a unit vector (vMF mean direction)."""
+    """Exportable module that L2-normalizes the MLP output (its first ``dim`` entries) to the vMF mean direction."""
+
+    def __init__(self, dim: int | None = None) -> None:
+        super().__init__()
+        self.dim = dim
 
     def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.normalize(mlp_output, dim=-1)
+        out = mlp_output if self.dim is None else mlp_output[..., : self.dim]
+        return torch.nn.functional.normalize(out, dim=-1)
 
 
 class _ClampedDeterministicOutput(nn.Module):
@@ -972,15 +1201,17 @@ class _ClampedDeterministicOutput(nn.Module):
 
 
 class _TanhScaledDeterministicOutput(nn.Module):
-    """Exportable module that returns ``scale * tanh(mlp_output) + offset``, bounded to ``(low, high)``."""
+    """Exportable module that returns ``scale * tanh(mlp_output) + offset`` over the first ``dim`` outputs."""
 
-    def __init__(self, scale: float, offset: float) -> None:
+    def __init__(self, scale: float, offset: float, dim: int | None = None) -> None:
         super().__init__()
         self.scale = scale
         self.offset = offset
+        self.dim = dim
 
     def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
-        return self.scale * torch.tanh(mlp_output) + self.offset
+        out = mlp_output if self.dim is None else mlp_output[..., : self.dim]
+        return self.scale * torch.tanh(out) + self.offset
 
 
 class _FirstSliceDeterministicOutput(nn.Module):

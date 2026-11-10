@@ -15,6 +15,7 @@ from .distribution import (
     SquashedTanhGaussianDistribution,
     TruncatedGaussianDistribution,
     VonMisesFisherDistribution,
+    VonMisesFisherTanhGaussianDistribution,
 )
 from .mlp import MLP
 from .normalization import (
@@ -51,4 +52,5 @@ __all__ = [
     "TransformerXL",
     "TruncatedGaussianDistribution",
     "VonMisesFisherDistribution",
+    "VonMisesFisherTanhGaussianDistribution",
 ]

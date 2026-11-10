@@ -5,6 +5,7 @@ import math
 import os
 import torch
 import torch.nn as nn
+from collections.abc import Callable
 from tensordict import TensorDict
 from typing import Any
 
@@ -135,6 +136,11 @@ class FbCpr:
         compile_mode: str | None = "reduce-overhead",
         clip_actions: float | None = None,
         num_seed_steps_per_env: int = 0,
+        instruction_critic: FuseModel | None = None,
+        instruction_reward_key: str | None = None,
+        instruction_critic_learning_rate: float = 3e-4,
+        instruction_critic_pessimism: float = 0.5,
+        instruction_reg_coef: float = 0.0,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         **kwargs: Any,
@@ -159,6 +165,10 @@ class FbCpr:
         self.aux_critic = aux_critic.to(self.device)
         self.discriminator = discriminator.to(self.device)
         self.obs_normalizer = obs_normalizer.to(self.device)
+        if (instruction_critic is None) != (instruction_reward_key is None):
+            raise ValueError("instruction_critic and instruction_reward_key must be set together.")
+        self.instruction_critic = instruction_critic.to(self.device) if instruction_critic is not None else None
+        self.instruction_reward_key = instruction_reward_key
 
         # Initialize model weights
         for model in self.models:
@@ -169,6 +179,11 @@ class FbCpr:
         self.target_backward_map = TargetNetwork(self.backward_map, tau=fb_tau).to(self.device)
         self.target_disc_critic = TargetNetwork(self.disc_critic, tau=critic_tau).to(self.device)
         self.target_aux_critic = TargetNetwork(self.aux_critic, tau=critic_tau).to(self.device)
+        self.target_instruction_critic = (
+            TargetNetwork(self.instruction_critic, tau=critic_tau).to(self.device)
+            if self.instruction_critic is not None
+            else None
+        )
 
         # Create the optimizers. Adam/AdamW support a fused CUDA kernel that collapses the per-parameter
         # _foreach_add_/_foreach_mul_ ops into a single launch.
@@ -192,6 +207,11 @@ class FbCpr:
         self.discriminator_optimizer = optimizer_cls(
             self.discriminator.parameters(), lr=discriminator_learning_rate, **optimizer_kwargs
         )
+        self.instruction_critic_optimizer = (
+            optimizer_cls(self.instruction_critic.parameters(), lr=instruction_critic_learning_rate, **optimizer_kwargs)
+            if self.instruction_critic is not None
+            else None
+        )
 
         # Add storage
         self.replay_buffer = replay_buffer
@@ -201,6 +221,7 @@ class FbCpr:
 
         # Add normalization for auxiliary rewards
         self.aux_reward_normalizer = ExponentialMovingAverageNormalization(scale=True).to(self.device)
+        self.instruction_reward_normalizer = ExponentialMovingAverageNormalization(scale=True).to(self.device)
 
         # State for expert rollout context
         self.expert_rollout_envs: torch.Tensor | None = None
@@ -231,6 +252,8 @@ class FbCpr:
         self.aux_critic_pessimism = aux_critic_pessimism
         self.discriminator_reg_coef = discriminator_reg_coef
         self.aux_reg_coef = aux_reg_coef
+        self.instruction_critic_pessimism = instruction_critic_pessimism
+        self.instruction_reg_coef = instruction_reg_coef
         self.value_loss_coef = value_loss_coef
         self.ortho_loss_coef = ortho_loss_coef
         self.grad_loss_coef = grad_loss_coef
@@ -255,12 +278,13 @@ class FbCpr:
             self._update_forward_backward = torch.compile(self._update_forward_backward, mode=compile_mode)
             self._update_disc_critic = torch.compile(self._update_disc_critic, mode=compile_mode)
             self._update_aux_critic = torch.compile(self._update_aux_critic, mode=compile_mode)
+            self._update_instruction_critic = torch.compile(self._update_instruction_critic, mode=compile_mode)
             self._update_actor = torch.compile(self._update_actor, mode=compile_mode)
 
     @property
     def models(self) -> list[MLPModel]:
         """Return a list of the algorithm's trainable models."""
-        return [
+        models = [
             self.actor,
             self.forward_map,
             self.backward_map,
@@ -268,6 +292,9 @@ class FbCpr:
             self.aux_critic,
             self.discriminator,
         ]
+        if self.instruction_critic is not None:
+            models.append(self.instruction_critic)
+        return models
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data.
@@ -433,6 +460,12 @@ class FbCpr:
         # Replace some train zs with sampled zs
         relabel_mask = torch.rand(self.batch_size, 1, device=self.device) < self.z_relabel_ratio
         batch.context = torch.where(relabel_mask, z, batch.context)
+        # the instruction reward is part of the env reward: its own critic learns it, the auxiliary critic the rest
+        instruction_rewards = None
+        if self.instruction_reward_key is not None:
+            instruction_rewards = batch.next_observations[self.instruction_reward_key].sum(dim=-1)
+            batch.rewards = batch.rewards - instruction_rewards
+            instruction_rewards = self.instruction_reward_normalizer(instruction_rewards)
         # Normalize aux rewards (TODO: move to reward manager?)
         batch.rewards = self.aux_reward_normalizer(batch.rewards)
 
@@ -440,6 +473,10 @@ class FbCpr:
         fb_loss_dict, fb_extras = self._update_forward_backward(batch)
         disc_critic_loss_dict, disc_critic_extras = self._update_disc_critic(batch)
         aux_critic_loss_dict, aux_critic_extras = self._update_aux_critic(batch)
+        if instruction_rewards is not None:
+            instruction_loss_dict, instruction_extras = self._update_instruction_critic(batch, instruction_rewards)
+            aux_critic_loss_dict.update(instruction_loss_dict)
+            aux_critic_extras.update(instruction_extras)
         actor_loss_dict, actor_extras = self._update_actor(batch)
 
         # Prepare logging dicts
@@ -482,7 +519,13 @@ class FbCpr:
             self.apply_eval_outputs({"motion_priorities": self.motion_priorities(result["emd"])})
         return [{"emd": result["emd"].cpu(), "joint_error": result["joint_error"].cpu()}]
 
-    def eval_motions(self, env: URLVecEnv, max_steps: int | None = None) -> dict[str, torch.Tensor]:
+    def eval_motions(
+        self,
+        env: URLVecEnv,
+        max_steps: int | None = None,
+        emd_joint_ids: list[int] | None = None,
+        on_step: Callable[[torch.Tensor, int], None] | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Track every expert motion from its first frame and score it; the expert buffer is not modified.
 
         Each motion is driven by ``z_t = B(obs_{t+1})`` with no termination guard, in a random env assignment
@@ -491,6 +534,8 @@ class FbCpr:
         Args:
             env: Vectorized environment to replay the expert motions in.
             max_steps: Stop after this many ``env.step`` calls; unscored motions keep NaN.
+            emd_joint_ids: Joints for an extra EMD over only them (``emd_subset``), e.g. the body without the neck.
+            on_step: Called after every step with the motion ids of the batch's first envs and the step index.
 
         Returns:
             emd: Per-motion EMD, shape ``(num_motions,)``.
@@ -502,6 +547,7 @@ class FbCpr:
                 ``(num_motions, bucket_size - 1, 2)``.
             heading_error: Per-step heading change since the clip's start minus the reference's [rad], wrapped,
                 ``(num_motions, bucket_size - 1)``.
+            emd_subset: Per-motion EMD over ``emd_joint_ids`` alone, when given.
         """
         print("[INFO] Evaluating motions...")
         self.eval_mode()
@@ -511,6 +557,7 @@ class FbCpr:
         rollout_steps = buffer.bucket_size - 1
         emd = torch.full((buffer.num_motions,), float("nan"), device=self.device)
         joint_error = torch.full_like(emd, float("nan"))
+        emd_subset = torch.full_like(emd, float("nan"))
         root_error = torch.full((buffer.num_motions, rollout_steps), float("nan"), device=self.device)
         tilt_error = torch.full_like(root_error, float("nan"))
         root_drift = torch.full((buffer.num_motions, rollout_steps, 2), float("nan"), device=self.device)
@@ -551,6 +598,8 @@ class FbCpr:
                     publish_ref(ghost_root[:, t + 1], ref_joint_pos[:, t + 1], ref_joint_vel[:, t + 1])
                 actions = pad_to_size(self.actor(self.obs_normalizer(obs), eval_zs[:, t, :]), env.num_envs, dim=0)
                 obs, _, _, _ = env.step(actions.to(env.device))
+                if on_step is not None:
+                    on_step(ids, t)
                 state = buffer.get_expert_state(obs)
                 qpos[:, t] = state["joint_position"][:batch].to(self.device)
                 root[:, t] = state["root_pose"][:batch, :3].to(self.device)
@@ -575,6 +624,9 @@ class FbCpr:
             tilt_error[ids, :steps] = torch.acos(cos)
             joint_error[ids] = (qpos[:, :steps] - ref_qpos).norm(dim=-1).mean(dim=-1)
             emd[ids] = torch.stack([compute_emd(qpos[i, :steps], ref_qpos[i]) for i in range(batch)])
+            if emd_joint_ids is not None:
+                sub = qpos[:, :steps, emd_joint_ids], ref_qpos[..., emd_joint_ids]
+                emd_subset[ids] = torch.stack([compute_emd(sub[0][i], sub[1][i]) for i in range(batch)])
             if max_steps is not None and steps_done >= max_steps:
                 break
 
@@ -588,6 +640,7 @@ class FbCpr:
             "tilt_error": tilt_error,
             "root_drift": root_drift,
             "heading_error": heading_error,
+            **({"emd_subset": emd_subset} if emd_joint_ids is not None else {}),
         }
 
     @staticmethod
@@ -635,6 +688,10 @@ class FbCpr:
             "z_buffer_state": self.z_buffer.state_dict(),
             "expert_buffer_state": self.expert_buffer.state_dict(),
         }
+        if self.instruction_critic is not None:
+            saved_dict["instruction_critic_state_dict"] = self.instruction_critic.state_dict()
+            saved_dict["instruction_critic_optimizer_state_dict"] = self.instruction_critic_optimizer.state_dict()
+            saved_dict["target_instruction_critic_state_dict"] = self.target_instruction_critic.target.state_dict()
         return saved_dict
 
     @staticmethod
@@ -686,6 +743,8 @@ class FbCpr:
             _load(self.forward_map, "forward_map_state_dict")
             _load(self.disc_critic, "disc_critic_state_dict")
             _load(self.aux_critic, "aux_critic_state_dict")
+            if self.instruction_critic is not None:
+                _load(self.instruction_critic, "instruction_critic_state_dict")
         if load_cfg.get("discriminator"):
             _load(self.discriminator, "discriminator_state_dict")
         if load_cfg.get("target"):
@@ -696,6 +755,11 @@ class FbCpr:
                 (self.aux_critic, self.target_aux_critic, "target_aux_critic_state_dict"),
             ):
                 target.target.load_state_dict(loaded_dict.get(target_key, online.state_dict()), strict=strict)
+            if self.instruction_critic is not None:
+                self.target_instruction_critic.target.load_state_dict(
+                    loaded_dict.get("target_instruction_critic_state_dict", self.instruction_critic.state_dict()),
+                    strict=strict,
+                )
         _load(self.obs_normalizer, "obs_normalizer_state_dict")
         if load_cfg.get("optimizer"):
             for opt, key in (
@@ -708,6 +772,10 @@ class FbCpr:
             ):
                 if key in loaded_dict:
                     opt.load_state_dict(loaded_dict[key])
+            if self.instruction_critic is not None and "instruction_critic_optimizer_state_dict" in loaded_dict:
+                self.instruction_critic_optimizer.load_state_dict(
+                    loaded_dict["instruction_critic_optimizer_state_dict"]
+                )
         if load_cfg.get("buffer"):
             if "z_buffer_state" in loaded_dict:
                 self.z_buffer.load_state_dict(loaded_dict["z_buffer_state"])
@@ -738,6 +806,7 @@ class FbCpr:
         disc_critic_cfg = cfg["algorithm"].pop("disc_critic")
         aux_critic_cfg = cfg["algorithm"].pop("aux_critic")
         discriminator_cfg = cfg["algorithm"].pop("discriminator")
+        instruction_critic_cfg = cfg["algorithm"].pop("instruction_critic", None)
         forward_map_class: type[FuseModel] = resolve_callable(forward_map_cfg.pop("class_name"))  # type: ignore
         backward_map_class: type[MLPModel] = resolve_callable(backward_map_cfg.pop("class_name"))  # type: ignore
         disc_critic_class: type[FuseModel] = resolve_callable(disc_critic_cfg.pop("class_name"))  # type: ignore
@@ -779,6 +848,13 @@ class FbCpr:
             obs, cfg["obs_groups"], "discriminator", 1, other_input_dims=(z_dim,), **discriminator_cfg
         ).to(device)
         print(f"Discriminator Model: {discriminator}")
+        instruction_critic = None
+        if instruction_critic_cfg is not None:
+            instruction_critic_class: type[FuseModel] = resolve_callable(instruction_critic_cfg.pop("class_name"))  # type: ignore
+            instruction_critic = instruction_critic_class(
+                obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **instruction_critic_cfg
+            ).to(device)
+            print(f"Instruction Critic Model: {instruction_critic}")
         # Initialize shared observation normalizer across all obs keys used by any model
         all_obs_keys: list[str] = []
         for obs_set in cfg["obs_groups"].values():
@@ -817,6 +893,7 @@ class FbCpr:
             multi_gpu_cfg=cfg["multi_gpu"],
             clip_actions=cfg.get("clip_actions"),
             num_seed_steps_per_env=cfg.get("num_seed_steps_per_env", 0),
+            instruction_critic=instruction_critic,
         )
 
         return alg
@@ -929,6 +1006,8 @@ class FbCpr:
         self.target_backward_map.update()
         self.target_disc_critic.update()
         self.target_aux_critic.update()
+        if self.target_instruction_critic is not None:
+            self.target_instruction_critic.update()
 
     def _update_discriminator(
         self, batch: ReplayBuffer.Batch, expert_obs: TensorDict, expert_z: torch.Tensor
@@ -1218,6 +1297,37 @@ class FbCpr:
 
         return loss_dict, extras_dict
 
+    def _update_instruction_critic(
+        self, batch: ReplayBuffer.Batch, rewards: torch.Tensor
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        with torch.autocast(device_type=self.device, dtype=self.dtype):
+            with torch.no_grad():
+                next_actions = self.actor(
+                    batch.next_observations, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
+                )
+                next_Qs = self.target_instruction_critic(batch.next_observations, batch.context, next_actions)
+                target_Q = rewards.unsqueeze(1) + batch.gammas * compute_td_targets(
+                    next_Qs, self.instruction_critic_pessimism
+                )
+                target_Q = target_Q.expand(self.instruction_critic.num_parallel, -1, -1)
+            Qs = self.instruction_critic(batch.observations, batch.context, batch.actions)
+            loss = 0.5 * self.instruction_critic.num_parallel * nn.functional.mse_loss(Qs, target_Q)
+
+        self.instruction_critic_optimizer.zero_grad()
+        loss.backward()
+        if self.is_multi_gpu:
+            self.reduce_parameters(self.instruction_critic)
+        self.instruction_critic_optimizer.step()
+
+        with torch.no_grad():
+            loss_dict = {"Critic_Loss/instruction_critic_loss": loss.mean().detach()}
+            extras_dict = {
+                "instruction_target_value": target_Q.mean().detach(),
+                "instruction_value": Qs.mean().detach(),
+                "instruction_reward": rewards.mean().detach(),
+            }
+        return loss_dict, extras_dict
+
     def _update_actor(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             actions = self.actor(
@@ -1240,6 +1350,13 @@ class FbCpr:
             Q_fb = -Q_fb.mean()
             # Compute the actor loss
             actor_loss = Q_fb + Q_discriminator * reg_weight + Q_aux * reg_weight
+            Q_instruction = torch.zeros((), device=self.device)
+            if self.instruction_critic is not None:
+                Qs_instruction = self.instruction_critic(batch.observations, batch.context, actions)
+                Q_instruction = (
+                    -self.instruction_reg_coef * compute_td_targets(Qs_instruction, self.actor_pessimism).mean()
+                )
+                actor_loss = actor_loss + Q_instruction * reg_weight
 
         # Compute the gradients
         self.actor_optimizer.zero_grad()
@@ -1261,6 +1378,7 @@ class FbCpr:
                 "Actor_Loss/total_loss": actor_loss.mean().detach(),
                 "Actor_Loss/discriminator_loss": Q_discriminator.mean().detach(),
                 "Actor_Loss/aux_loss": Q_aux.mean().detach(),
+                "Actor_Loss/instruction_loss": Q_instruction.mean().detach(),
                 "Actor_Loss/fb_loss": Q_fb.mean().detach(),
             }
 

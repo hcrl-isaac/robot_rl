@@ -299,3 +299,18 @@ def test_value_regularizer_takes_the_expanded_target() -> None:
         batch, bootstrap_obs=batch.next_observations, bootstrap_gammas=zero_gammas, credit_backward=credit
     )
     torch.testing.assert_close(losses["Forward_Backward_Loss/value_reg_loss"], expected)
+
+
+def test_replay_updates_skip_transitions_that_end_an_episode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Like FbCpr's replay, the FB, discriminator and critic batch never holds a reset state as a next state."""
+    alg, _ = _build(horizon=2)
+    calls = []
+    sample = alg.learner.replay_buffer.sample_transitions
+
+    def recording(batch_size: int, device: str | None = None, require_next: bool = False) -> object:
+        calls.append(require_next)
+        return sample(batch_size, device=device, require_next=require_next)
+
+    monkeypatch.setattr(alg.learner.replay_buffer, "sample_transitions", recording)
+    alg.update()
+    assert calls == [True]

@@ -208,6 +208,9 @@ def test_replay_windows_stay_inside_one_episode() -> None:
         assert (win.terminated[:-1] == 0).all()
         if require_next:
             assert win.next_valid.all()
+    win = buf.sample_transitions(2000, require_next=True)
+    ep, st = win.obs["t"][..., 0], win.obs["t"][..., 1]
+    assert (ep[1] == ep[0]).all() and (st[1] - st[0] == 1).all() and (win.terminated == 0).all()
     buf.mark_episode_start()
     buf.add(row, torch.zeros(num_envs, 1), torch.zeros(num_envs), torch.zeros(num_envs), torch.zeros(num_envs))
     assert (buf.episode_step[(buf.pos - 1) % capacity] == 0).all()
@@ -297,3 +300,12 @@ def test_learns_to_track_through_the_world_model(tmp_path: Path, critic_mode: st
     idle = _evaluate(None)
     torch.set_num_threads(threads)
     assert after > idle + 0.1 and after > before + 0.1, (before, after, idle)
+
+
+def test_actor_needs_a_horizon() -> None:
+    """With no imagined steps the actor has no return to ascend, so the constructor refuses."""
+    env = _TrackingEnv(provide_goals=False)
+    cfg = _make_cfg()
+    cfg["algorithm"]["imagination_horizon"] = 0
+    with pytest.raises(ValueError, match="imagination_horizon"):
+        WorldModelAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu")

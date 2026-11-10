@@ -181,17 +181,20 @@ class SequenceReplayBuffer:
             extras={k: v[rows, cols].to(device) for k, v in self.extras.items()},
         )
 
-    def sample_transitions(self, batch_size: int, device: str | None = None) -> SequenceReplayBuffer.Window | None:
+    def sample_transitions(
+        self, batch_size: int, device: str | None = None, require_next: bool = False
+    ) -> SequenceReplayBuffer.Window | None:
         """Sample single transitions (one-step windows), e.g. for one-step critic targets.
 
         Args:
             batch_size: Number of transitions.
             device: Device of the returned tensors.
+            require_next: Drop the transitions that end an episode, whose ``obs[1]`` is the next episode's first row.
 
         Returns:
             One-step windows: ``obs[0]`` before and ``obs[1]`` after the step (valid where ``next_valid``), or None.
         """
-        return self.sample_windows(batch_size, 1, device=device)
+        return self.sample_windows(batch_size, 1, device=device, require_next=require_next)
 
     def sample_rows(self, batch_size: int, device: str | None = None) -> tuple[TensorDict, dict[str, torch.Tensor]]:
         """Sample single rows uniformly (imagination starts, a sensor-noise bank).

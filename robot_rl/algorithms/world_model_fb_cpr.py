@@ -170,7 +170,8 @@ class WorldModelFbCpr(FbCpr):
     def update(self) -> tuple[dict[str, torch.Tensor], dict]:
         """Run FB-CPR's replay updates, fit the world model, then update the actor through imagination."""
         with torch.profiler.record_function("wm_fbcpr/sample"):
-            win = self.learner.replay_buffer.sample_transitions(self.batch_size, device=self.device)
+            # FbCpr's replay drops every transition that ends an episode: B must never see a reset state as s'
+            win = self.learner.replay_buffer.sample_transitions(self.batch_size, device=self.device, require_next=True)
         if win is None:
             return {"Actor_Loss/skipped": torch.ones(())}, {}
         starts = win.obs[0]
@@ -293,9 +294,11 @@ class WorldModelFbCpr(FbCpr):
             goals = self.learner.start_goals(next_raw, k - 1)
             rollout = self.learner.imagine(policy, next_raw, goals, self.learner.noise_bank(), horizon=k - 1)
             norm = self._normalize(torch.stack(rollout.obs).reshape(-1)).reshape(k, n)
-            weights = self.gamma ** torch.arange(1, k, device=self.device, dtype=torch.float32)
+            # Discount, and the imagined survival up to each state: a modeled termination stops the expansion
+            weights = self.gamma ** torch.arange(1, k, device=self.device, dtype=torch.float32)[:, None]
+            reach = weights * rollout.survival[1:].float()
             B_imag = self.backward_map(norm[1:].reshape(-1)).float().view(k - 1, n, -1)
-            credit = (weights[:, None, None] * B_imag).sum(dim=0) * alive
+            credit = (reach[..., None] * B_imag).sum(dim=0) * alive
             eps = self.discriminator_reward_eps
             logits = self.discriminator(norm[: k - 1].reshape(-1), z.repeat(k - 1, 1)).view(k - 1, n)
             logits = logits.clamp(eps, 1 - eps)
@@ -303,10 +306,10 @@ class WorldModelFbCpr(FbCpr):
             r_aux = rollout.rewards * self.aux_reward_normalizer.S.sqrt().reciprocal()
             return CriticExpansion(
                 obs=norm[k - 1],
-                gammas=(self.gamma**k) * alive,
+                gammas=(self.gamma**k) * rollout.survival[k - 1].float()[:, None] * alive,
                 credit=credit,
-                disc_rewards=(weights[:, None] * r_disc).sum(dim=0, keepdim=True).T * alive,
-                aux_rewards=(weights[:, None] * r_aux).sum(dim=0, keepdim=True).T * alive,
+                disc_rewards=(weights * rollout.survival[:-1].float() * r_disc).sum(dim=0, keepdim=True).T * alive,
+                aux_rewards=(weights * rollout.survival[:-1].float() * r_aux).sum(dim=0, keepdim=True).T * alive,
             )
 
     def _mage_backward(

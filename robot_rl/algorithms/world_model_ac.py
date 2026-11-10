@@ -122,6 +122,8 @@ class WorldModelAC:
         self.learning_rate = learning_rate
         self.lr_decay_updates = lr_decay_updates
         self.lr_final_ratio = lr_final_ratio
+        if learner.horizon < 1:
+            raise ValueError(f"WorldModelAC's actor needs imagination_horizon >= 1, got {learner.horizon}.")
         self.horizon = learner.horizon
         self.num_imagined = num_imagined
         self.gamma = gamma

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+from collections.abc import Iterable
 from tensordict import TensorDict
 
 
@@ -115,7 +116,7 @@ class ReplayBuffer:
         def __init__(
             self,
             observations: TensorDict,
-            next_observations: TensorDict,
+            next_observations: TensorDict | None,
             actions: torch.Tensor,
             rewards: torch.Tensor,
             gammas: torch.Tensor,
@@ -129,7 +130,8 @@ class ReplayBuffer:
         ) -> None:
             """Initialize a sequence batch over contiguous rollout windows."""
             self.observations: TensorDict = observations
-            self.next_observations: TensorDict = next_observations
+            self.next_observations: TensorDict | None = next_observations
+            """Stored next observations, ``(L, B)``; None when the sampler was asked to skip them."""
             self.actions: torch.Tensor = actions
             self.rewards: torch.Tensor = rewards
             self.gammas: torch.Tensor = gammas
@@ -162,6 +164,7 @@ class ReplayBuffer:
         hidden_layers: int = 1,
         hidden_is_lstm: bool = False,
         obs_dtypes: dict[str, torch.dtype] | None = None,
+        obs_quantize: dict[str, tuple[float, float]] | None = None,
     ) -> None:
         """Initialize the buffer storage.
 
@@ -184,6 +187,8 @@ class ReplayBuffer:
             hidden_is_lstm: Store two slots per step (``h`` and ``c``) instead of one.
             obs_dtypes: Storage dtype of the named observation groups (e.g. ``float16`` for a long history); each is
                 sampled back in the group's own dtype. Groups not named are stored as given.
+            obs_quantize: ``(low, high)`` value range of the named observation groups, stored as ``uint8`` in 256
+                levels over that range and read back in the group's own dtype; values outside it are clamped.
         """
         # store inputs
         self.num_envs = num_envs
@@ -199,7 +204,8 @@ class ReplayBuffer:
         # Core
         # We only take value.shape[1:] to ignore num_envs dimension
         self._obs_dtypes = {key: value.dtype for key, value in obs.items()}
-        stored = obs_dtypes or {}
+        self._quantize = dict(obs_quantize or {})
+        stored = {**(obs_dtypes or {}), **{key: torch.uint8 for key in self._quantize}}
         self.observations = TensorDict(
             {
                 key: torch.zeros(self.capacity, *value.shape[1:], dtype=stored.get(key, value.dtype), device=device)
@@ -286,22 +292,43 @@ class ReplayBuffer:
         """``observations`` on the storage device, each group in its storage dtype."""
         out = observations.to(self.device)
         for key, value in self.observations.items():
-            if out[key].dtype != value.dtype:
+            if key in self._quantize:
+                low, high = self._quantize[key]
+                out[key] = ((out[key] - low) * (255.0 / (high - low))).round().clamp(0, 255).to(torch.uint8)
+            elif out[key].dtype != value.dtype:
                 out[key] = out[key].to(value.dtype)
         return out
 
-    def _read(self, observations: TensorDict, idx: torch.Tensor, device: str | None) -> TensorDict:
-        """``observations[idx]`` on ``device``, each group back in its own dtype."""
+    def _read(
+        self, observations: TensorDict, idx: torch.Tensor, device: str | None, groups: Iterable[str] | None = None
+    ) -> TensorDict:
+        """``observations[idx]`` on ``device``, each group back in its own dtype; ``groups`` limits what is read."""
+        if groups is not None:
+            observations = observations.select(*groups)
         out = observations[idx].to(device)
-        for key, dtype in self._obs_dtypes.items():
-            if out[key].dtype != dtype:
+        for key in out.keys():  # noqa: SIM118 -- TensorDict iterates its batch dim, not keys
+            dtype = self._obs_dtypes[key]
+            if key in self._quantize:
+                low, high = self._quantize[key]
+                # in place: a full-size image batch per op is most of the read
+                out[key] = out[key].to(dtype).mul_((high - low) / 255.0).add_(low)
+            elif out[key].dtype != dtype:
                 out[key] = out[key].to(dtype)
         return out
 
-    def sample_mini_batch(self, device: str | None = None) -> Batch:
-        """Randomly sample a mini-batch from the replay buffer (with n-step aggregation when ``n_steps > 1``)."""
+    def sample_mini_batch(self, device: str | None = None, obs_groups: Iterable[str] | None = None) -> Batch:
+        """Randomly sample a mini-batch from the replay buffer (with n-step aggregation when ``n_steps > 1``).
+
+        Args:
+            device: Device to move the batch to.
+            obs_groups: Groups of ``observations`` to read in an n-step batch, whose bootstrap step comes separately
+                as ``bootstrap_observations``; None reads all. A single-step batch always reads all.
+
+        Returns:
+            The sampled :class:`Batch`.
+        """
         if self.n_steps > 1:
-            nstep = self._sample_nstep(device)
+            nstep = self._sample_nstep(device, obs_groups)
             if nstep is not None:
                 return nstep
             # not enough consecutive data for a full n-step yet -> fall through to single-step sampling
@@ -320,7 +347,7 @@ class ReplayBuffer:
             hidden=self._gather_hidden(self._indices, device) if self.hidden is not None else None,
         )
 
-    def _sample_nstep(self, device: str | None = None) -> Batch | None:
+    def _sample_nstep(self, device: str | None = None, obs_groups: Iterable[str] | None = None) -> Batch | None:
         """Sample a mini-batch with n-step returns over the per-env time sequence (keep_terminal layout).
 
         A stored index is ``row * num_envs + env``, so env ``e``'s consecutive steps are ``num_envs`` apart. Start
@@ -348,6 +375,17 @@ class ReplayBuffer:
         # Sample (start row, env) pairs and build the n consecutive flat indices per sample.
         start_rows = valid_rows[torch.randint(valid_rows.numel(), (batch_size,), device=self.device)]
         envs = torch.randint(self.num_envs, (batch_size,), device=self.device)
+        return self._nstep_batch(start_rows, envs, device, obs_groups)
+
+    def _nstep_batch(
+        self,
+        start_rows: torch.Tensor,
+        envs: torch.Tensor,
+        device: str | None = None,
+        obs_groups: Iterable[str] | None = None,
+    ) -> Batch:
+        """Return the n-step batch from storage rows ``start_rows`` of envs ``envs`` (see :meth:`_sample_nstep`)."""
+        cap_rows = self.capacity_per_env
         start_flat = start_rows * self.num_envs + envs
         offsets = torch.arange(self.n_steps, device=self.device)
         step_rows = (start_rows.unsqueeze(-1) + offsets) % cap_rows  # [B, n]
@@ -370,7 +408,7 @@ class ReplayBuffer:
         final_flat = step_flat.gather(1, first_done.unsqueeze(-1)).squeeze(-1)  # [B]
 
         return ReplayBuffer.Batch(
-            self._read(self.observations, start_flat, device),
+            self._read(self.observations, start_flat, device, obs_groups),
             self._read(self.next_observations, final_flat, device),
             self.actions[start_flat].to(device),
             n_step_rewards.to(device),
@@ -393,6 +431,7 @@ class ReplayBuffer:
         priority: float = 1.0,
         episode_start: bool = False,
         oversample: int = 4,
+        next_observations: bool | Iterable[str] = True,
     ) -> SequenceBatch | None:
         """Sample contiguous per-env windows for a recurrent update.
 
@@ -416,13 +455,15 @@ class ReplayBuffer:
                 window's recurrent state is exact instead of re-derived from a stored (stale) state.
             oversample: Candidate windows drawn per kept window when weighting; it caps how far the weight can
                 raise the share of those windows.
+            next_observations: False leaves the batch's ``next_observations`` None, for callers that never read them;
+                a list of groups reads only those.
 
         Returns:
             A :class:`SequenceBatch` of ``L = burn_in + seq_len`` steps, or ``None`` while no window of
             that length fits in the stored data.
         """
         total_len = burn_in + seq_len
-        if total_len < 1:
+        if burn_in + seq_len < 1:
             raise ValueError("sample_sequences needs burn_in + seq_len >= 1")
         batch_size = num_windows if num_windows is not None else max(self._indices.shape[0] // total_len, 1)
         cap_rows = self.capacity_per_env
@@ -464,7 +505,7 @@ class ReplayBuffer:
             seen = (self.observations[priority_group][flat_c][..., -1] > 0.5).reshape(draws, total_len)
             done = self.dones[flat_c].reshape(draws, total_len).bool()
             lost = seen[:, :-1] & ~seen[:, 1:] & ~done[:, :-1]
-            has = lost[:, max(burn_in - 1, 0) :].any(dim=1)
+            has = lost[:, max(burn_in - 1, 0) : burn_in + seq_len - 1].any(dim=1)
             keep = torch.multinomial(1.0 + (priority - 1.0) * has.float(), batch_size, replacement=False)
             start_rows, envs = start_rows[keep], envs[keep]
         step_rows = (start_rows.unsqueeze(-1) + offsets) % cap_rows  # [B, L]
@@ -486,7 +527,11 @@ class ReplayBuffer:
         ages = ((write_row - start_rows) % cap_rows).float() / cap_rows
 
         obs = self._read(self.observations, step_flat, device).reshape(batch_size, total_len).transpose(0, 1)
-        next_obs = self._read(self.next_observations, step_flat, device).reshape(batch_size, total_len).transpose(0, 1)
+        next_obs = None
+        if next_observations is not False:
+            groups = None if next_observations is True else next_observations
+            next_obs = self._read(self.next_observations, step_flat, device, groups).reshape(batch_size, total_len)
+            next_obs = next_obs.transpose(0, 1)
         return ReplayBuffer.SequenceBatch(
             obs,
             next_obs,

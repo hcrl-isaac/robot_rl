@@ -430,12 +430,29 @@ def test_all_models_says_so_for_a_checkpoint_without_a_single_critic() -> None:
         rebuild_models(train_cfg, ckpt, all_models=True)
 
 
-def test_rebuild_distillation_rejects_a_recurrent_student() -> None:
-    """A recurrent 1D student raises instead of failing on a state-dict size mismatch."""
+def test_a_recurrent_student_exports_to_onnx_with_its_state(tmp_path: Path) -> None:
+    """A recurrent 1D student's ONNX export, fed back its own state each step, acts as the trained student does."""
+    from tensordict import TensorDict
+
+    import onnxruntime as ort
+
     student_cfg = {"class_name": "RNNModel", "hidden_dims": [32, 32], "rnn_hidden_dim": 16, "rnn_type": "gru"}
-    train_cfg, ckpt, _, _ = _distillation_checkpoint(student_cfg)
-    with pytest.raises(NotImplementedError, match="recurrent"):
-        rebuild_models(train_cfg, ckpt)
+    train_cfg, ckpt, _, alg = _distillation_checkpoint(student_cfg)
+    student = alg.student
+    policy = rebuild_models(train_cfg, ckpt)["policy"]
+    session = ort.InferenceSession(save_onnx(policy.as_onnx(), str(tmp_path), "student.onnx"))
+    names = [i.name for i in session.get_inputs()]
+    assert names == ["obs", "h_in"]
+    state = {"h_in": np.zeros((1, 1, 16), dtype=np.float32)}
+    generator = torch.Generator().manual_seed(0)
+    student.reset()
+    with torch.inference_mode():
+        for _ in range(4):
+            obs = torch.randn(1, 8, generator=generator)
+            expected = student(TensorDict({"policy": obs}, batch_size=[1]), stochastic_output=False)
+            outputs = session.run(None, {"obs": obs.numpy(), **state})
+            torch.testing.assert_close(torch.from_numpy(outputs[0]), expected, rtol=1e-4, atol=1e-5)
+            state = {"h_in": outputs[1]}
 
 
 def test_an_image_student_without_a_normalizer_takes_its_1d_shapes() -> None:
@@ -554,3 +571,32 @@ def test_a_reference_student_with_an_aux_readout_rebuilds_with_its_aux_head() ->
     model.reset()
     with torch.inference_mode():
         torch.testing.assert_close(policy(step, stochastic_output=False), model(step, stochastic_output=False))
+
+
+def test_rebuild_an_image_sac_actor_from_its_image_shape() -> None:
+    """A CNN+GRU SAC actor (no distillation student) rebuilds from obs_shapes and matches the trained actor."""
+    from tensordict import TensorDict
+
+    from robot_rl.models import CNNRNNModel
+
+    torch.manual_seed(0)
+    obs = TensorDict({"policy": torch.zeros(1, 10), "image": torch.zeros(1, 4, 54, 96)}, batch_size=[1])
+    actor_cfg = {
+        "class_name": "CNNRNNModel",
+        "hidden_dims": [32],
+        "obs_normalization": True,
+        "rnn_hidden_dim": 16,
+        "cnn_cfg": {"output_channels": [16, 32, 64], "kernel_size": 3, "stride": 2, "attention_pool_queries": 4},
+    }
+    model_cfg = {k: v for k, v in actor_cfg.items() if k != "class_name"}
+    actor = CNNRNNModel(obs, {"actor": ["policy", "image"]}, "actor", 3, **copy.deepcopy(model_cfg)).eval()
+    train_cfg = {"actor": copy.deepcopy(actor_cfg), "obs_groups": {"actor": ["policy", "image"]}, "clip_actions": 1.0}
+    ckpt = {"actor_state_dict": actor.state_dict()}
+    rebuilt = rebuild_models(train_cfg, ckpt, obs_shapes={"image": (4, 54, 96)})["policy"]
+    step = TensorDict({"policy": torch.randn(1, 10), "image": torch.rand(1, 4, 54, 96)}, batch_size=[1])
+    with torch.no_grad():
+        actor.reset()
+        rebuilt.reset()
+        torch.testing.assert_close(rebuilt(step), actor(step))
+    with pytest.raises(ValueError, match="encodes images"):
+        rebuild_models(train_cfg, ckpt)

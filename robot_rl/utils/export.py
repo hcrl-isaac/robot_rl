@@ -18,6 +18,7 @@ from robot_rl.models.cnn_rnn_model import CNNRNNModel
 from robot_rl.models.inference import EncoderInferencePolicy
 from robot_rl.models.rnn_model import RNNModel
 from robot_rl.modules.distribution import Distribution, bound_by_clip_actions
+from robot_rl.utils.retired import drop_retired_options
 from robot_rl.utils.utils import resolve_callable
 
 DEFAULT_ONNX_OPSET = 18
@@ -333,6 +334,7 @@ def rebuild_models(
         obs_shapes: ``(channels, height, width)`` of each image observation group, and optionally ``(dim,)`` of
             each 1D group, for image students.
     """
+    train_cfg = drop_retired_options(train_cfg)
     if "backward_map_state_dict" in ckpt:
         return _rebuild_fbcpr(train_cfg, ckpt, all_models)
     if "student_state_dict" in ckpt:

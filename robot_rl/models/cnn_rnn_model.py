@@ -12,7 +12,6 @@ from tensordict import TensorDict
 from typing import Any
 
 from robot_rl.models.cnn_model import CNNModel
-from robot_rl.models.mlp_model import MLPModel
 from robot_rl.models.rnn_model import RNNModel
 from robot_rl.modules.rnn import HiddenState
 
@@ -24,9 +23,6 @@ class CNNRNNModel(RNNModel, CNNModel):
     :class:`CNNModel`; the joint feature drives the recurrent trunk of :class:`RNNModel`, and the head reads
     ``[feature, rnn_state]``, so the instantaneous observation reaches the head directly and memory is an
     extra input rather than a bottleneck.
-
-    An attention pooling built with ``attention_pool_memory_dim`` reads the GRU state from before each step, so the
-    CNN maps are computed for the whole window at once and only the pooling runs inside the recurrent loop.
     """
 
     def __init__(
@@ -66,13 +62,6 @@ class CNNRNNModel(RNNModel, CNNModel):
             aux_target_dim=aux_target_dim,
             **kwargs,
         )
-        memory_dims = {cnn.memory_dim for cnn in self.cnns.values()}
-        self.memory_pool = memory_dims != {0}
-        if self.memory_pool and (memory_dims != {rnn_hidden_dim} or rnn_type != "gru"):
-            raise ValueError(
-                f"A memory-conditioned pooling needs a GRU and memory_dim {rnn_hidden_dim} on every CNN, "
-                f"got {rnn_type} and {sorted(memory_dims)}."
-            )
 
     def get_latent(
         self, obs: TensorDict, *args: torch.Tensor, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
@@ -80,87 +69,7 @@ class CNNRNNModel(RNNModel, CNNModel):
         """Rollout-mode latent: one step through the RNN, advancing the internal hidden state."""
         if masks is not None:
             raise ValueError("CNNRNNModel batched updates go through encode_sequence, not masks")
-        if not self.memory_pool:
-            return super().get_latent(obs, *args)
-        feats = self._features(obs, memory=self._memory(self.rnn.hidden_state, obs.batch_size[0]))
-        return self._head_input(feats, self.rnn(feats).squeeze(0))
-
-    def _features(self, obs: TensorDict, *args: torch.Tensor, memory: torch.Tensor | None = None) -> torch.Tensor:
-        """Recurrent input for a flat ``(N,)`` batch; ``memory`` ``(N, hidden)`` shifts a memory pooling's queries."""
-        if not self.memory_pool:
-            return super()._features(obs, *args)
-        latents = [self.cnns[g](obs[g], memory) for g in self.obs_groups_2d]
-        if self.obs_groups:
-            latents.insert(0, MLPModel.get_latent(self, obs))
-        return torch.cat(latents, dim=-1)
-
-    def _memory(self, state: HiddenState, batch: int) -> torch.Tensor:
-        """Return the last GRU layer's state ``(N, hidden)`` the pooling reads; zeros before the first step."""
-        if state is None:
-            return torch.zeros(batch, self.rnn_hidden_dim, device=next(self.parameters()).device)
-        return state[-1]  # type: ignore[index]
-
-    def _memory_sequence(
-        self, obs: TensorDict, hidden_state: HiddenState, resets: torch.Tensor | None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Step a ``(L, B)`` window, pooling each step's maps with the state before it.
-
-        Returns:
-            The head input ``(L, B, latent)``, the final state and the state after every step ``(L, layers, B, H)``.
-        """
-        seq_len, batch = obs.batch_size
-        flat = obs.reshape(seq_len * batch)
-        fmaps = [self.cnns[g](flat[g], pool=False) for g in self.obs_groups_2d]
-        fmaps = [f.view(seq_len, batch, *f.shape[1:]) for f in fmaps]
-        lat_1d = MLPModel.get_latent(self, flat).view(seq_len, batch, -1) if self.obs_groups else None
-        state = hidden_state
-        if state is None:
-            state = torch.zeros(self.rnn.rnn.num_layers, batch, self.rnn_hidden_dim, device=fmaps[0].device)
-        feats, outs, states = [], [], []
-        for t in range(seq_len):
-            if resets is not None:
-                state = state * (1.0 - resets[t]).view(1, batch, 1)
-            latents = [
-                self.cnns[g].attention_pool(f[t], state[-1]) for g, f in zip(self.obs_groups_2d, fmaps, strict=True)
-            ]
-            feat = torch.cat(([lat_1d[t]] if lat_1d is not None else []) + latents, dim=-1)
-            out, state = self.rnn.rnn(feat.unsqueeze(0), state)
-            feats.append(feat)
-            outs.append(out)
-            states.append(state)
-        return self._head_input(torch.stack(feats), torch.cat(outs)), state, torch.stack(states)
-
-    def encode_sequence(
-        self, obs: TensorDict, hidden_state: HiddenState, resets: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, HiddenState]:
-        """Run a time-major ``(L, B)`` observation window from an explicit starting state."""
-        if not self.memory_pool:
-            return super().encode_sequence(obs, hidden_state, resets)
-        latent, state, _ = self._memory_sequence(obs, hidden_state, resets)
-        return latent, state
-
-    def encode_sequence_with_states(
-        self, obs: TensorDict, hidden_state: HiddenState, resets: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, HiddenState, HiddenState]:
-        """As :meth:`encode_sequence`, also returning the full state after every step, ``(L, layers, B, hidden)``."""
-        if not self.memory_pool:
-            return super().encode_sequence_with_states(obs, hidden_state, resets)
-        return self._memory_sequence(obs, hidden_state, resets)
-
-    def encode_step(self, obs: TensorDict, hidden_state: HiddenState) -> torch.Tensor:
-        """One recurrent step for a flat ``(N,)`` batch from explicit per-sample states ``(layers, N, hidden)``."""
-        if not self.memory_pool:
-            return super().encode_step(obs, hidden_state)
-        feats = self._features(obs, memory=self._memory(hidden_state, obs.batch_size[0]))
-        out, _ = self.rnn.forward_sequence(feats.unsqueeze(0), hidden_state)
-        return self._head_input(feats, out.squeeze(0))
-
-    def step_state(self, obs: TensorDict, hidden_state: HiddenState) -> HiddenState:
-        """Return the recurrent state after consuming a flat ``(N,)`` batch from explicit per-sample states."""
-        if not self.memory_pool:
-            return super().step_state(obs, hidden_state)
-        feats = self._features(obs, memory=self._memory(hidden_state, obs.batch_size[0]))
-        return self.rnn.forward_sequence(feats.unsqueeze(0), hidden_state)[1]
+        return super().get_latent(obs, *args)
 
     def _head_input(self, feats: torch.Tensor, rnn_out: torch.Tensor) -> torch.Tensor:
         """Combine the current features and the recurrent output into the head input (concatenation)."""
@@ -208,16 +117,13 @@ class _CNNRNNExport(nn.Module):
         self.obs_dims_2d = [tuple(d) for d in model.obs_dims_2d]
         self.obs_channels_2d = list(model.obs_channels_2d)
 
-    def features(self, obs_1d: torch.Tensor, obs_2d: list[torch.Tensor], memory: torch.Tensor) -> torch.Tensor:
-        """Build the recurrent input: normalized 1D observations, then each image group's CNN encoding.
-
-        ``memory`` is the last GRU layer's state before this step, which a memory-conditioned pooling reads.
-        """
+    def features(self, obs_1d: torch.Tensor, obs_2d: list[torch.Tensor]) -> torch.Tensor:
+        """Build the recurrent input: normalized 1D observations, then each image group's CNN encoding."""
         latents: list[torch.Tensor] = []
         if self.has_1d:
             latents.append(self.obs_normalizer(obs_1d))
         for i, cnn in enumerate(self.cnns):
-            latents.append(cnn(obs_2d[i], memory))
+            latents.append(cnn(obs_2d[i]))
         return torch.cat(latents, dim=-1)
 
     def head(self, feats: torch.Tensor, rnn_out: torch.Tensor) -> torch.Tensor:
@@ -243,7 +149,7 @@ class _TorchCNNGRUModel(_CNNRNNExport):
 
     def forward(self, obs_1d: torch.Tensor, obs_2d: list[torch.Tensor]) -> torch.Tensor:
         """One step: act on this observation and carry the updated state to the next call."""
-        feats = self.features(obs_1d, obs_2d, self.hidden_state[-1])
+        feats = self.features(obs_1d, obs_2d)
         out, h = self.rnn(feats.unsqueeze(0), self.hidden_state)
         self.hidden_state[:] = h
         return self.head(feats, out.squeeze(0))
@@ -268,7 +174,7 @@ class _TorchCNNLSTMModel(_CNNRNNExport):
 
     def forward(self, obs_1d: torch.Tensor, obs_2d: list[torch.Tensor]) -> torch.Tensor:
         """One step: act on this observation and carry the updated state to the next call."""
-        feats = self.features(obs_1d, obs_2d, self.hidden_state[-1])
+        feats = self.features(obs_1d, obs_2d)
         out, (h, c) = self.rnn(feats.unsqueeze(0), (self.hidden_state, self.cell_state))
         self.hidden_state[:] = h
         self.cell_state[:] = c
@@ -301,7 +207,7 @@ class _OnnxCNNRNNModel(_CNNRNNExport):
     def forward(self, obs: torch.Tensor, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """One step from the given state; returns the action and the state after it."""
         images = list(inputs[: len(self.cnns)])
-        feats = self.features(obs, images, inputs[len(self.cnns)][-1])
+        feats = self.features(obs, images)
         if self.is_lstm:
             out, (h, c) = self.rnn(feats.unsqueeze(0), (inputs[len(self.cnns)], inputs[len(self.cnns) + 1]))
             return self.head(feats, out.squeeze(0)), h, c

@@ -108,16 +108,6 @@ class TestSAC:
         assert alg.replay_buffer.keep_terminal is True
         assert alg.target_entropy == -1.0 * ACT_DIM
 
-    def test_backup_entropy_switch(self) -> None:
-        """The critic target charges alpha * logp by default and nothing with backup_entropy off; both update."""
-        alg, _ = _build()
-        assert float(alg._backup_alpha()) == float(alg.log_alpha.exp())
-        off, off_env = _build(backup_entropy=False)
-        assert off._backup_alpha() == 0.0
-        _collect(off, off_env, steps=8)
-        losses = off.update()
-        assert all(torch.isfinite(torch.tensor(losses[k])) for k in ("critic_1", "critic_2", "actor", "alpha"))
-
     def test_act_shape_and_bounds(self) -> None:
         """act() returns a bounded [num_envs, num_actions] action."""
         alg, env = _build()

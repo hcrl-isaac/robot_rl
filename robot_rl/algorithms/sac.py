@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import torch
 import torch.nn as nn
@@ -63,6 +64,7 @@ class SAC:
         tau: float = 0.005,
         gamma: float = 0.99,
         target_entropy_scale: float = 1.0,
+        backup_entropy: bool = True,
         max_grad_norm: float = 1.0,
         policy_frequency: int = 1,
         n_steps: int = 1,
@@ -70,6 +72,7 @@ class SAC:
         burn_in: int = 8,
         num_windows: int | None = None,
         critic_sees_hidden: bool = False,
+        critic_on_actor_windows: bool = False,
         window_episode_start: bool = False,
         aux_obs_group: str | None = None,
         aux_loss_weight: float = 1.0,
@@ -83,6 +86,11 @@ class SAC:
         window_priority_anneal_updates: int = 0,
         estimator_learning_rate: float = 1e-3,
         compile_mode: str | None = None,
+        encoder_bf16: bool = False,
+        compile_encoder: bool = False,
+        cudnn_benchmark: bool = True,
+        encoder_channels_last: bool = True,
+        allow_tf32: bool = False,
         device: str = "cpu",
         rnd_cfg: dict | None = None,
         symmetry_cfg: dict | None = None,
@@ -91,6 +99,8 @@ class SAC:
     ) -> None:
         """Initialize the SAC algorithm. See the module docstring for the design."""
         self.device = device
+        # bf16 autocast of the recurrent actor's encoding in the updates (image encoders); heads and log-probs stay fp32
+        self.encoder_bf16 = encoder_bf16 and str(device).startswith("cuda")
         self.is_multi_gpu = multi_gpu_cfg is not None
         if multi_gpu_cfg is not None:
             self.gpu_global_rank = multi_gpu_cfg["global_rank"]
@@ -109,6 +119,22 @@ class SAC:
 
         # Models
         self.actor = actor.to(device)
+        on_cuda = str(device).startswith("cuda")
+        if on_cuda and getattr(self.actor, "cnns", None):
+            # the update's conv shapes are fixed, so cuDNN's per-shape algorithm search pays for itself at once
+            torch.backends.cudnn.benchmark = torch.backends.cudnn.benchmark or cudnn_benchmark
+            if encoder_channels_last:
+                # NHWC weights let cuDNN skip the per-call NCHW<->NHWC transposes around every bf16 conv
+                for cnn in self.actor.cnns.values():
+                    cnn.to(memory_format=torch.channels_last)
+        if allow_tf32 and on_cuda:
+            # process-wide: TF32 matmuls and convs carry ~1e-3 relative error
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        if compile_encoder and on_cuda:
+            # in place, so the state-dict keys and checkpoints are unchanged
+            for cnn in getattr(self.actor, "cnns", {}).values():
+                cnn.compile()
         self.critic_1 = critic_1.to(device)
         self.critic_2 = critic_2.to(device)
         self.critic_1_target = TargetNetwork(self.critic_1, tau).to(device)
@@ -123,6 +149,8 @@ class SAC:
         self.num_mini_batches = num_mini_batches
         self.gamma = gamma
         self.auto_alpha = auto_alpha
+        # with log-probs above zero the entropy term in the backup is a per-step cost, which pays early terminations
+        self.backup_entropy = backup_entropy
         self.alpha = alpha
         self.actor_learning_rate = actor_learning_rate
         self.policy_frequency = policy_frequency
@@ -138,6 +166,12 @@ class SAC:
         # the critics read the actor's (detached) recurrent latent and train on the actor's own windows, so an
         # action is valued given the memory that produced it, at the latents the actor update queries
         self.critic_sees_hidden = bool(critic_sees_hidden) and self.recurrent
+        # the critics train on the actor's loss steps, bootstrapping through its own unroll, instead of on a
+        # separate flat batch: the window encoding is shared, at the cost of correlated critic samples
+        self.critic_on_actor_windows = bool(critic_on_actor_windows) and self.recurrent
+        if self.critic_on_actor_windows and (self.critic_sees_hidden or attn_target_group is not None):
+            # the attention loss reads the last forward, which the window's no-grad extension would overwrite
+            raise ValueError("critic_on_actor_windows excludes critic_sees_hidden and attn_target_group.")
         self.window_episode_start = window_episode_start
         # supervised target for the recurrent actor's aux head (e.g. privileged ball position)
         self.aux_obs_group = aux_obs_group
@@ -350,16 +384,23 @@ class SAC:
 
         The critics are feedforward, so they train on independent transitions exactly as in the plain
         update; their bootstrap action comes from the actor holding the state stepped from the stored
-        one. The actor trains on contiguous windows replayed from their stored starting state: the
-        burn-in prefix under no-grad, then the loss steps, with the state zeroed at every episode start.
+        one; with ``critic_on_actor_windows`` they train on the actor's loss steps instead. The actor trains on
+        contiguous windows replayed from their stored starting state: the burn-in prefix under no-grad, then
+        the loss steps, with the state zeroed at every episode start.
         """
         sums = {"critic_1": 0.0, "critic_2": 0.0, "actor": 0.0, "alpha": 0.0}
         diag: dict[str, float] = {}
         counts: dict[str, int] = {}
 
         def _acc(key: str, value: torch.Tensor | float) -> None:
-            diag[key] = diag.get(key, 0.0) + float(value)
+            # sums stay on the device and are read once at the end: a read per minibatch stalls the host
+            value = value.detach() if isinstance(value, torch.Tensor) else value
+            diag[key] = diag.get(key, 0.0) + value
             counts[key] = counts.get(key, 0) + 1
+
+        def _acc_diag(key: str, value: torch.Tensor | float) -> None:
+            if num_updates == 0:
+                _acc(key, value)
 
         num_updates = 0
         num_actor_updates = 0
@@ -372,10 +413,15 @@ class SAC:
                 priority_group=self.window_priority_group,
                 priority=self._current_window_priority(),
                 episode_start=self.window_episode_start,
+                next_observations=self.critic_1.obs_groups if self.critic_on_actor_windows else self.critic_sees_hidden,
+                extend=self.n_steps - 1 if self.critic_on_actor_windows else 0,
             )
             if batch is None:
                 break
-            if not self.critic_sees_hidden:
+            full_batch = batch
+            if self.critic_on_actor_windows:
+                batch = _window_head(batch, batch.burn_in + self.seq_len)
+            elif not self.critic_sees_hidden:
                 self._update_critics_recurrent(_acc)
             if self.estimator is not None:
                 self._update_estimator(batch, _acc)
@@ -394,14 +440,24 @@ class SAC:
             with torch.no_grad():
                 h0 = batch.init_hidden
                 if burn > 0:
-                    _, h0 = self.actor.encode_sequence(obs[:burn], h0, resets[:burn])
-                self._recurrent_state_diagnostics(batch, h0, _acc)
+                    with self._encoder_autocast():
+                        _, h0 = self.actor.encode_sequence(obs[:burn], h0, resets[:burn])
+                    h0 = _to_float(h0)
+                if num_updates == 0:
+                    # diagnostics only: one window batch per call measures the same quantities
+                    self._recurrent_state_diagnostics(batch, h0, _acc)
             if self.critic_sees_hidden:
                 self._update_critics_on_windows(batch, h0, _acc)
 
             # Alpha and actor on the window; gradients stop at the burn-in boundary.
-            latent, _ = self.actor.encode_sequence(train_obs, h0, train_resets)
-            latent = latent.reshape(flat, -1)
+            with self._encoder_autocast():
+                if self.critic_on_actor_windows:
+                    latent, h_end, states = self.actor.encode_sequence_with_states(train_obs, h0, train_resets)
+                else:
+                    latent, _ = self.actor.encode_sequence(train_obs, h0, train_resets)
+            if self.critic_on_actor_windows:
+                self._update_critics_on_actor_windows(full_batch, latent, h_end, states, _acc)
+            latent = latent.float().reshape(flat, -1)
             new_actions, logp = self.actor.act_and_log_prob_from_latent(latent)
             logp = logp.reshape(-1)
             with torch.no_grad():
@@ -419,8 +475,7 @@ class SAC:
                     torch.distributed.all_reduce(self.log_alpha.grad, op=torch.distributed.ReduceOp.SUM)
                     self.log_alpha.grad /= self.gpu_world_size
                 self.alpha_optimizer.step()
-                self.alpha = self.log_alpha.exp().item()
-                sums["alpha"] += alpha_loss.item()
+                sums["alpha"] += alpha_loss.detach()
             if self.update_step % self.policy_frequency == 0:
                 for p in self.critic_parameters:
                     p.requires_grad_(False)
@@ -452,18 +507,19 @@ class SAC:
                 if self.is_multi_gpu:
                     self.reduce_parameters(self.actor_parameters)
                 _acc("Actor/grad_norm", nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm))
-                _acc("Actor/grad_norm_rnn", _param_grad_norm(self.actor.rnn.parameters()))  # type: ignore[attr-defined]
+                _acc_diag("Actor/grad_norm_rnn", _param_grad_norm(self.actor.rnn.parameters()))  # type: ignore[attr-defined]
                 if hasattr(self.actor, "cnns"):
-                    _acc("Actor/grad_norm_cnn", _param_grad_norm(self.actor.cnns.parameters()))
+                    _acc_diag("Actor/grad_norm_cnn", _param_grad_norm(self.actor.cnns.parameters()))
                 self.actor_optimizer.step()
                 for p in self.critic_parameters:
                     p.requires_grad_(True)
-                with torch.no_grad():
-                    # policy-action Q minus data-action Q: a growing gap is the actor exploiting critic error
-                    data_in = self._critic_input(actions_b, latent)
-                    q_data = torch.min(self.critic_1(flat_obs, data_in), self.critic_2(flat_obs, data_in)).view(-1)
-                    _acc("Critic/q_pi_gap", (min_q_pi - q_data).mean())
-                sums["actor"] += actor_loss.item()
+                if num_updates == 0:
+                    with torch.no_grad():
+                        # policy-action Q minus data-action Q: a growing gap is the actor exploiting critic error
+                        data_in = self._critic_input(actions_b, latent)
+                        q_data = torch.min(self.critic_1(flat_obs, data_in), self.critic_2(flat_obs, data_in)).view(-1)
+                        _acc("Critic/q_pi_gap", (min_q_pi - q_data).mean())
+                sums["actor"] += actor_loss.detach()
                 num_actor_updates += 1
             self.critic_1_target.update()
             self.critic_2_target.update()
@@ -478,9 +534,14 @@ class SAC:
             # the flat and window samplers must agree with the buffer on the mean reward; a gap is a sampling bug
             n = len(self.replay_buffer)
             _acc("Buffer/reward_all", self.replay_buffer.rewards[:n].float().mean())
-            _acc("Buffer/reward_flat_sample", self.replay_buffer.sample_mini_batch(self.device).rewards.float().mean())
+            flat = self.replay_buffer.sample_mini_batch(self.device, obs_groups=())
+            _acc("Buffer/reward_flat_sample", flat.rewards.float().mean())
             win = self.replay_buffer.sample_sequences(
-                self.seq_len, self.burn_in, self.device, episode_start=self.window_episode_start
+                self.seq_len,
+                self.burn_in,
+                self.device,
+                episode_start=self.window_episode_start,
+                next_observations=False,
             )
             if win is not None:
                 _acc("Buffer/reward_window_sample", win.rewards.float().mean())
@@ -488,6 +549,9 @@ class SAC:
             _acc("Recurrent/hidden_abs_rollout", self._rollout_hidden_abs / self._rollout_hidden_steps)
             self._rollout_hidden_abs.zero_()
             self._rollout_hidden_steps = 0
+        if self.auto_alpha:
+            self.alpha = self.log_alpha.exp().item()
+        sums = {k: float(v) for k, v in sums.items()}
         n = max(num_updates, 1)
         losses = {
             "critic_1": sums["critic_1"] / n,
@@ -496,7 +560,7 @@ class SAC:
             "alpha": sums["alpha"] / n if self.auto_alpha else 0.0,
             "alpha_value": self.alpha,
         }
-        return losses, {k: v / counts[k] for k, v in diag.items()}
+        return losses, {k: float(v) / counts[k] for k, v in diag.items()}
 
     def _current_window_priority(self) -> float:
         """Return the window-priority weight for this update, annealed linearly to 1."""
@@ -537,28 +601,17 @@ class SAC:
             next_in = self._critic_input(next_actions, next_latent)
             q1_t = self.critic_1_target(flat_next_obs, next_in).view(-1)
             q2_t = self.critic_2_target(flat_next_obs, next_in).view(-1)
-            min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
+            min_q_t = torch.min(q1_t, q2_t) - self._backup_alpha() * next_logp
             rewards = batch.rewards[burn:].reshape(-1)
             not_terminated = 1.0 - batch.next_terminated[burn:].reshape(-1).float()
             target_q = rewards + self.gamma * not_terminated * min_q_t
         flat_obs = obs.reshape(flat)
         data_in = self._critic_input(batch.actions[burn:].reshape(flat, -1), latent)
-        q1 = self.critic_1(flat_obs, data_in).view(-1)
-        q2 = self.critic_2(flat_obs, data_in).view(-1)
-        critic_1_loss = nn.functional.mse_loss(q1, target_q)
-        critic_2_loss = nn.functional.mse_loss(q2, target_q)
-        self.critic_optimizer.zero_grad()
-        (critic_1_loss + critic_2_loss).backward()
-        if self.is_multi_gpu:
-            self.reduce_parameters(self.critic_parameters)
-        acc("Critic/grad_norm", nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm))
-        self.critic_optimizer.step()
-        self._last_critic_losses = (critic_1_loss.item(), critic_2_loss.item())
-        with torch.no_grad():
-            acc("Critic/q_data", q1.mean())
-            acc("Critic/q_target", target_q.mean())
-            acc("Critic/td_abs", (q1 - target_q).abs().mean())
-            acc("Critic/reward", rewards.mean())
+        self._critic_step(flat_obs, data_in, target_q, rewards, acc)
+
+    def _encoder_autocast(self) -> contextlib.AbstractContextManager:
+        """bf16 autocast for the actor's encoding when ``encoder_bf16`` is on; a no-op otherwise."""
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.encoder_bf16)
 
     def _update_critics_recurrent(self, acc: Callable[[str, torch.Tensor | float], None]) -> None:
         """One twin-critic step on independent transitions, bootstrapping through the recurrent actor.
@@ -567,25 +620,48 @@ class SAC:
         the bootstrap step (the n-th step of an n-step sample) through that step's observation, which is the
         rollout state up to staleness.
         """
-        batch = self.replay_buffer.sample_mini_batch(self.device)
-        obs_b, next_obs_b, actions_b = batch.observations, batch.next_observations, batch.actions
+        # the start step's actor groups are read only when the critics take the actor's latent there
+        groups = set(self.critic_1.obs_groups)
+        if self.critic_sees_hidden:
+            groups |= {*self.actor.obs_groups, *getattr(self.actor, "obs_groups_2d", [])}
+        batch = self.replay_buffer.sample_mini_batch(self.device, obs_groups=groups)
+        target_q, latent_b = self._flat_critic_target(batch)
+        data_in = self._critic_input(batch.actions, latent_b)
+        self._critic_step(batch.observations, data_in, target_q, batch.rewards.view(-1), acc)
+
+    @torch.no_grad()
+    def _flat_critic_target(self, batch: ReplayBuffer.Batch) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return a flat (n-step) batch's targets, and the actor's start-step latent if the critics read it."""
+        obs_b, next_obs_b = batch.observations, batch.next_observations
         rewards_b = batch.rewards.view(-1)
         not_terminated = 1.0 - batch.next_terminated.view(-1).float()
         boot_obs = batch.bootstrap_observations if batch.bootstrap_observations is not None else obs_b
         boot_hidden = batch.bootstrap_hidden if batch.bootstrap_hidden is not None else batch.hidden
-        with torch.no_grad():
+        with self._encoder_autocast():
             h_next = self.actor.step_state(boot_obs, boot_hidden)
             next_latent = self.actor.encode_step(next_obs_b, h_next)
-            next_actions, next_logp = self.actor.act_and_log_prob_from_latent(next_latent)
-            next_in = self._critic_input(next_actions, next_latent)
-            q1_t = self.critic_1_target(next_obs_b, next_in).view(-1)
-            q2_t = self.critic_2_target(next_obs_b, next_in).view(-1)
-            min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
-            target_q = rewards_b + self._bootstrap_discount(batch) * not_terminated * min_q_t
-            latent_b = self.actor.encode_step(obs_b, batch.hidden) if self.critic_sees_hidden else None
-        data_in = self._critic_input(actions_b, latent_b)
-        q1 = self.critic_1(obs_b, data_in).view(-1)
-        q2 = self.critic_2(obs_b, data_in).view(-1)
+        h_next, next_latent = _to_float(h_next), next_latent.float()
+        next_actions, next_logp = self.actor.act_and_log_prob_from_latent(next_latent)
+        next_in = self._critic_input(next_actions, next_latent)
+        q1_t = self.critic_1_target(next_obs_b, next_in).view(-1)
+        q2_t = self.critic_2_target(next_obs_b, next_in).view(-1)
+        min_q_t = torch.min(q1_t, q2_t) - self._backup_alpha() * next_logp
+        target_q = rewards_b + self._bootstrap_discount(batch) * not_terminated * min_q_t
+        with self._encoder_autocast():
+            latent_b = self.actor.encode_step(obs_b, batch.hidden).float() if self.critic_sees_hidden else None
+        return target_q, latent_b
+
+    def _critic_step(
+        self,
+        obs: TensorDict,
+        data_in: torch.Tensor,
+        target_q: torch.Tensor,
+        rewards: torch.Tensor,
+        acc: Callable[[str, torch.Tensor | float], None],
+    ) -> None:
+        """One twin-critic gradient step of ``Q(obs, data_in)`` toward ``target_q``, logging its diagnostics."""
+        q1 = self.critic_1(obs, data_in).view(-1)
+        q2 = self.critic_2(obs, data_in).view(-1)
         critic_1_loss = nn.functional.mse_loss(q1, target_q)
         critic_2_loss = nn.functional.mse_loss(q2, target_q)
         self.critic_optimizer.zero_grad()
@@ -594,12 +670,89 @@ class SAC:
             self.reduce_parameters(self.critic_parameters)
         acc("Critic/grad_norm", nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm))
         self.critic_optimizer.step()
-        self._last_critic_losses = (critic_1_loss.item(), critic_2_loss.item())
+        self._last_critic_losses = (critic_1_loss.detach(), critic_2_loss.detach())
         with torch.no_grad():
             acc("Critic/q_data", q1.mean())
             acc("Critic/q_target", target_q.mean())
             acc("Critic/td_abs", (q1 - target_q).abs().mean())
-            acc("Critic/reward", rewards_b.mean())
+            acc("Critic/reward", rewards.mean())
+
+    def _update_critics_on_actor_windows(
+        self,
+        batch: ReplayBuffer.SequenceBatch,
+        latent: torch.Tensor,
+        state: HiddenState,
+        states: HiddenState,
+        acc: Callable[[str, torch.Tensor | float], None],
+    ) -> None:
+        """One twin-critic step on the actor's loss steps, from the actor's own (detached) unroll of them.
+
+        Args:
+            batch: The window batch, extended by ``n_steps - 1`` steps past the loss steps.
+            latent: The actor's head input over the loss steps, ``(seq_len, B, latent)``.
+            state: The actor's state after the last loss step.
+            states: The state after every loss step, ``(seq_len, layers, B, hidden)``.
+            acc: Diagnostics accumulator.
+        """
+        flat_obs, actions, target_q, rewards = self._window_critic_target(batch, latent, state, states)
+        self._critic_step(flat_obs, actions, target_q, rewards, acc)
+
+    @torch.no_grad()
+    def _window_critic_target(
+        self, batch: ReplayBuffer.SequenceBatch, latent: torch.Tensor, state: HiddenState, states: HiddenState
+    ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the loss steps' n-step targets, bootstrapped through the actor's window unroll.
+
+        Each return stops at its first episode end, as the flat n-step sampler's does. The bootstrap latent is the
+        unroll's next step, except where the next stored observation differs from it (an episode end, or the
+        window's last step): there the stored next observation is encoded once more from the unroll's state.
+
+        Returns:
+            The loss steps' observations and actions (flat), their targets and their n-step returns.
+        """
+        burn, seq_len, n = batch.burn_in, self.seq_len, self.n_steps
+        lat, sts = latent.detach().float(), _to_float(_detach(states))
+        if n > 1:
+            tail = slice(burn + seq_len, None)
+            with self._encoder_autocast():
+                lat_x, _, sts_x = self.actor.encode_sequence_with_states(  # type: ignore[attr-defined]
+                    batch.observations[tail], _to_float(_detach(state)), batch.resets[tail]
+                )
+            lat, sts = torch.cat([lat, lat_x.float()]), _cat_states(sts, _to_float(sts_x))
+        num_windows = lat.shape[1]
+        dones = batch.dones[burn:]
+        returns, horizon, final = _window_nstep_returns(batch.rewards[burn:], dones, seq_len, n, self.gamma)
+
+        next_lat = torch.cat([lat[1:], torch.zeros_like(lat[:1])])
+        fresh = dones > 0
+        fresh[-1] = True
+        k, b = fresh.nonzero(as_tuple=True)
+        count = k.numel()
+        # pad to a multiple of 256 so the encoder sees few distinct batch sizes (each a compile and a cuDNN search)
+        pad = -count % 256
+        k, b = torch.cat([k, k[:1].expand(pad)]), torch.cat([b, b[:1].expand(pad)])
+        actor_groups = [*self.actor.obs_groups, *getattr(self.actor, "obs_groups_2d", [])]
+        storage = batch.indices.device
+        idx = batch.indices[burn:][k.to(storage), b.to(storage)]
+        x_obs = self.replay_buffer.read_next_observations(idx, self.device, actor_groups)
+        with self._encoder_autocast():
+            x_lat = self.actor.encode_step(x_obs, _state_at(sts, k, b))
+        next_lat[k[:count], b[:count]] = x_lat[:count].float()
+
+        cols = torch.arange(num_windows, device=lat.device).expand(seq_len, -1)
+        boot_latent = next_lat[final, cols].reshape(seq_len * num_windows, -1)
+        boot_obs = batch.next_observations[burn:][final, cols].reshape(seq_len * num_windows)
+        next_actions, next_logp = self.actor.act_and_log_prob_from_latent(boot_latent)
+        q1_t = self.critic_1_target(boot_obs, next_actions).view(-1)
+        q2_t = self.critic_2_target(boot_obs, next_actions).view(-1)
+        min_q_t = torch.min(q1_t, q2_t) - self._backup_alpha() * next_logp
+        not_terminated = 1.0 - batch.next_terminated[burn:].squeeze(-1)[final, cols].reshape(-1).float()
+        returns = returns.reshape(-1)
+        target_q = returns + self.gamma ** horizon.reshape(-1).float() * not_terminated * min_q_t
+        loss = slice(burn, burn + seq_len)
+        flat_obs = batch.observations[loss].reshape(seq_len * num_windows)
+        actions = batch.actions[loss].reshape(seq_len * num_windows, -1)
+        return flat_obs, actions, target_q, returns
 
     def _recurrent_state_diagnostics(
         self, batch: ReplayBuffer.SequenceBatch, h0: HiddenState, acc: Callable[[str, torch.Tensor | float], None]
@@ -657,6 +810,10 @@ class SAC:
         self.critic_optimizer.step()
         return critic_1_loss, critic_2_loss
 
+    def _backup_alpha(self) -> torch.Tensor | float:
+        """Entropy weight in the critic target: alpha, or 0 when the backup leaves entropy to the actor loss."""
+        return self.log_alpha.exp() if self.backup_entropy else 0.0
+
     def _bootstrap_discount(self, batch: ReplayBuffer.Batch) -> torch.Tensor | float:
         """Discount on the bootstrap: gamma to the per-sample horizon the batch aggregated (gamma^1 single-step)."""
         if batch.effective_n_steps is not None:
@@ -677,7 +834,7 @@ class SAC:
             next_actions, next_logp = self.actor.act_and_log_prob(next_obs_b)
             q1_t = self.critic_1_target(next_obs_b, next_actions).view(-1)
             q2_t = self.critic_2_target(next_obs_b, next_actions).view(-1)
-            min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
+            min_q_t = torch.min(q1_t, q2_t) - self._backup_alpha() * next_logp
             target_q = rewards_b + self._bootstrap_discount(batch) * not_terminated * min_q_t
 
         q1 = self.critic_1(obs_b, actions_b).view(-1)
@@ -938,6 +1095,7 @@ class SAC:
             keep_terminal=True,
             n_steps=cfg["algorithm"].get("n_steps", 1),
             gamma=cfg["algorithm"].get("gamma", 0.99),
+            obs_quantize=cfg["algorithm"].get("replay_obs_quantize"),
             **hidden_kwargs,
         )
 
@@ -952,3 +1110,87 @@ class SAC:
             **cfg["algorithm"],
             multi_gpu_cfg=cfg.get("multi_gpu"),
         )
+
+
+def _window_nstep_returns(
+    rewards: torch.Tensor, dones: torch.Tensor, seq_len: int, n: int, gamma: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the n-step returns of the first ``seq_len`` steps of ``(seq_len + n - 1, B)`` windows.
+
+    They are summed as the flat n-step sampler sums them.
+
+    Args:
+        rewards: Per-step rewards ``(seq_len + n - 1, B)``.
+        dones: Per-step episode ends (terminations and timeouts), same shape.
+        seq_len: Steps that get a return.
+        n: Return horizon; a return stops at (and includes) its first episode end.
+        gamma: Discount.
+
+    Returns:
+        The returns ``(seq_len, B)``, the steps each one summed, and the window index of its bootstrap step.
+    """
+    all_rewards = rewards.unfold(0, n, 1)[:seq_len]  # (seq_len, B, n)
+    all_dones = dones.unfold(0, n, 1)[:seq_len]
+    offsets = torch.arange(n, device=rewards.device)
+    dones_shifted = torch.cat([torch.zeros_like(all_dones[..., :1]), all_dones[..., :-1]], dim=-1)
+    done_masks = torch.cumprod(1.0 - dones_shifted, dim=-1)
+    discounts = torch.pow(torch.tensor(gamma, device=rewards.device), offsets.float())
+    returns = (all_rewards * done_masks * discounts.view(1, 1, -1)).sum(dim=-1)
+    first_done = torch.argmax((all_dones > 0).float(), dim=-1)
+    first_done = torch.where(all_dones.sum(dim=-1) == 0, torch.full_like(first_done, n - 1), first_done)
+    final = first_done + torch.arange(seq_len, device=rewards.device).unsqueeze(-1)
+    return returns, first_done + 1, final
+
+
+def _window_head(batch: ReplayBuffer.SequenceBatch, steps: int) -> ReplayBuffer.SequenceBatch:
+    """Return the first ``steps`` steps of a window batch (dropping an n-step extension), without next observations."""
+
+    def head(x: Any) -> Any:
+        return None if x is None else x[:steps]
+
+    return ReplayBuffer.SequenceBatch(
+        batch.observations[:steps],
+        None,
+        batch.actions[:steps],
+        batch.rewards[:steps],
+        batch.gammas[:steps],
+        batch.context[:steps],
+        batch.next_terminated[:steps],
+        batch.resets[:steps],
+        batch.init_hidden,
+        batch.burn_in,
+        batch.burn_hidden,
+        batch.ages,
+        head(batch.dones),
+        head(batch.indices),
+    )
+
+
+def _detach(state: HiddenState) -> HiddenState:
+    """Return a recurrent state (a tensor, or an LSTM's ``(h, c)``) detached from the graph."""
+    if isinstance(state, tuple):
+        return tuple(x.detach() for x in state)  # type: ignore[return-value]
+    return state.detach()  # type: ignore[union-attr]
+
+
+def _cat_states(a: HiddenState, b: HiddenState) -> HiddenState:
+    """Concatenate two per-step state stacks ``(L, layers, B, hidden)`` along time."""
+    if isinstance(a, tuple):
+        return tuple(torch.cat([x, y]) for x, y in zip(a, b, strict=True))  # type: ignore[return-value]
+    return torch.cat([a, b])  # type: ignore[list-item]
+
+
+def _state_at(states: HiddenState, k: torch.Tensor, b: torch.Tensor) -> HiddenState:
+    """Gather the post-step states at (step ``k``, window ``b``) pairs as ``(layers, K, hidden)``."""
+    if isinstance(states, tuple):
+        return tuple(s[k, :, b].transpose(0, 1).contiguous() for s in states)  # type: ignore[return-value]
+    return states[k, :, b].transpose(0, 1).contiguous()  # type: ignore[index]
+
+
+def _to_float(state: HiddenState) -> HiddenState:
+    """Return a recurrent state (a tensor, or an LSTM's ``(h, c)``) in fp32."""
+    if state is None:
+        return None
+    if isinstance(state, tuple):
+        return tuple(x.float() for x in state)  # type: ignore[return-value]
+    return state.float()

@@ -11,6 +11,7 @@ from tensordict import TensorDict
 import pytest
 
 from robot_rl.algorithms import SAC
+from robot_rl.storage import ReplayBuffer
 
 OBS_DIM, ACT_DIM, NUM_ENVS = 6, 3, 8
 IMG = (1, 8, 12)
@@ -439,3 +440,177 @@ class TestSequenceEstimator:
         other.load(saved)
         for a, b in zip(alg.estimator.parameters(), other.estimator.parameters(), strict=True):
             assert torch.equal(a, b)
+
+
+class _TimeoutImageVecEnv(_DummyImageVecEnv):
+    """Half of the dones are timeouts, with a true next observation the buffer stores in place of the reset one."""
+
+    def step(self, actions: torch.Tensor) -> tuple:
+        next_obs, rewards, dones, extras = super().step(actions)
+        extras = {"time_outs": dones & (torch.rand(self.num_envs) < 0.5), "time_outs_obs": self._obs()}
+        return next_obs, rewards, dones, extras
+
+
+def _old_reads(buffer: ReplayBuffer) -> None:
+    """Make ``buffer`` read every group of every batch, dequantizing out of place, as before reads were trimmed."""
+    import types
+
+    sample_mini_batch, sample_sequences = buffer.sample_mini_batch, buffer.sample_sequences
+
+    def _read(
+        self: ReplayBuffer, observations: TensorDict, idx: torch.Tensor, device: str | None, groups: object = None
+    ) -> TensorDict:
+        out = observations[idx].to(device)
+        for key, dtype in self._obs_dtypes.items():
+            if key in self._quantize:
+                low, high = self._quantize[key]
+                out[key] = out[key].to(dtype) * ((high - low) / 255.0) + low
+            elif out[key].dtype != dtype:
+                out[key] = out[key].to(dtype)
+        return out
+
+    buffer._read = types.MethodType(_read, buffer)
+    buffer.sample_mini_batch = lambda device=None, obs_groups=None: sample_mini_batch(device)
+    buffer.sample_sequences = lambda *a, next_observations=True, **k: sample_sequences(*a, **k)
+
+
+class TestTrimmedReads:
+    """Skipping the image groups an update never reads leaves every loss and parameter bit-identical."""
+
+    @pytest.mark.parametrize("n_steps", [1, 5])
+    @pytest.mark.parametrize("critic_sees_hidden", [False, True])
+    def test_update_matches_full_reads(self, n_steps: int, critic_sees_hidden: bool) -> None:
+        """Same seed and buffer: the trimmed and the full-read update agree exactly, over timeouts and resets."""
+        import copy
+
+        torch.manual_seed(0)
+        env = _TimeoutImageVecEnv(done_prob=0.3)
+        cfg = _make_cfg(n_steps=n_steps)
+        cfg["algorithm"] |= {"replay_obs_quantize": {"image": [0.0, 1.0]}, "critic_sees_hidden": critic_sees_hidden}
+        cfg["algorithm"] |= {"seq_len": 4, "burn_in": 2, "mini_batch_size": 16, "num_mini_batches": 3}
+        alg = SAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu")
+        dones = _collect(alg, env, 16)
+        assert torch.stack(dones).any()
+        old = copy.deepcopy(alg)
+        _old_reads(old.replay_buffer)
+        torch.manual_seed(1)
+        losses, diag = alg.update()
+        torch.manual_seed(1)
+        old_losses, old_diag = old.update()
+        assert losses == old_losses
+        assert diag == old_diag
+        for a, b in zip(alg.save().values(), old.save().values(), strict=True):
+            if isinstance(a, torch.Tensor):
+                assert torch.equal(a, b)
+        for a, b in zip(alg.actor.parameters(), old.actor.parameters(), strict=True):
+            assert torch.equal(a, b)
+        for a, b in zip(alg.critic_parameters, old.critic_parameters, strict=True):
+            assert torch.equal(a, b)
+        assert torch.equal(alg.log_alpha, old.log_alpha)
+
+
+def _build_on_windows(
+    n_steps: int, seq_len: int, burn_in: int, done_prob: float = 0.3
+) -> tuple[SAC, _DummyImageVecEnv]:
+    env = _TimeoutImageVecEnv(done_prob=done_prob)
+    cfg = _make_cfg(obs_normalization=False, n_steps=n_steps)
+    cfg["algorithm"] |= {"critic_on_actor_windows": True, "seq_len": seq_len, "burn_in": burn_in}
+    cfg["algorithm"] |= {"replay_obs_quantize": {"image": [0.0, 1.0]}, "mini_batch_size": 64, "num_mini_batches": 2}
+    return SAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu"), env
+
+
+class TestCriticOnActorWindows:
+    """The critics train on the actor's loss steps, with n-step targets bootstrapped through its window unroll."""
+
+    def test_nstep_returns_stop_at_the_first_episode_end(self) -> None:
+        """A return sums up to and including its first done, inside the loss steps or in the extension."""
+        from robot_rl.algorithms.sac import _window_nstep_returns
+
+        rewards = torch.tensor([[1.0], [2.0], [4.0], [8.0], [16.0]])  # seq_len 2, n 4: 5 steps
+        dones = torch.tensor([[0.0], [0.0], [1.0], [0.0], [0.0]])
+        returns, horizon, final = _window_nstep_returns(rewards, dones, 2, 4, 0.5)
+        torch.testing.assert_close(returns[:, 0], torch.tensor([1.0 + 1.0 + 1.0, 2.0 + 2.0]))
+        assert horizon[:, 0].tolist() == [3, 2] and final[:, 0].tolist() == [2, 2]
+        returns, horizon, final = _window_nstep_returns(rewards, torch.zeros_like(dones), 2, 4, 0.5)
+        torch.testing.assert_close(returns[:, 0], torch.tensor([1.0 + 1.0 + 1.0 + 1.0, 2.0 + 2.0 + 2.0 + 2.0]))
+        assert horizon[:, 0].tolist() == [4, 4] and final[:, 0].tolist() == [3, 4]
+
+    @pytest.mark.parametrize("n_steps", [1, 3, 5])
+    def test_one_step_windows_give_the_flat_nstep_targets(self, n_steps: int) -> None:
+        """A loss step with its n-1 step extension gets the flat sampler's n-step target, over dones and timeouts.
+
+        Weights and normalization are fixed, so the window's replayed state equals the stored one the flat
+        target steps from; the action head is made deterministic so both sample the same bootstrap action.
+        """
+        torch.manual_seed(0)
+        alg, env = _build_on_windows(n_steps, seq_len=1, burn_in=0)
+        _collect(alg, env, 24)
+        actor = alg.actor
+
+        def mean_action(latent: torch.Tensor, std_clip: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+            out = actor.mlp(latent)
+            return torch.tanh(out), out.sum(dim=-1)
+
+        actor.act_and_log_prob_from_latent = mean_action
+        buf = alg.replay_buffer
+        batch = buf.sample_sequences(1, 0, "cpu", num_windows=256, next_observations=["critic"], extend=n_steps - 1)
+        assert batch.observations.batch_size[0] == n_steps
+        # episode ends that cut a return short: terminations and timeouts, in the loss step and in the extension
+        ends = batch.dones[: max(n_steps - 1, 1)] > 0
+        timeouts = ends & (batch.next_terminated[: ends.shape[0]].squeeze(-1) == 0)
+        assert (ends & ~timeouts).any() and timeouts.any()
+        if n_steps > 2:
+            assert ends[1:].any()
+        with torch.no_grad():
+            latent, state, states = actor.encode_sequence_with_states(
+                batch.observations[:1], batch.init_hidden, batch.resets[:1]
+            )
+            _, _, target, _ = alg._window_critic_target(batch, latent, state, states)
+            start = batch.indices[0]
+            flat = buf._nstep_batch(start // buf.num_envs, start % buf.num_envs, "cpu") if n_steps > 1 else None
+            if flat is None:
+                flat = ReplayBuffer.Batch(
+                    buf._read(buf.observations, start, "cpu"),
+                    buf._read(buf.next_observations, start, "cpu"),
+                    buf.actions[start],
+                    buf.rewards[start],
+                    buf.gammas[start],
+                    buf.context[start],
+                    buf.next_terminated[start],
+                    hidden=buf._gather_hidden(start, "cpu"),
+                )
+            flat_target, _ = alg._flat_critic_target(flat)
+        torch.testing.assert_close(target, flat_target, rtol=1e-5, atol=1e-5)
+
+    def test_update_trains_on_the_actor_windows(self) -> None:
+        """The update runs, keeps today's window count, and moves both critics and the actor."""
+        torch.manual_seed(0)
+        alg, env = _build_on_windows(n_steps=3, seq_len=4, burn_in=2)
+        _collect(alg, env, 16)
+        batch = alg.replay_buffer.sample_sequences(4, 2, "cpu", extend=2)
+        assert batch.observations.batch_size == (8, 64 // 6)
+        critic_before = [p.detach().clone() for p in alg.critic_parameters]
+        actor_before = [p.detach().clone() for p in alg.actor.parameters()]
+        flat_groups = []
+        sample_mini_batch = alg.replay_buffer.sample_mini_batch
+
+        def record(*args: object, obs_groups: object = None) -> ReplayBuffer.Batch:
+            flat_groups.append(obs_groups)
+            return sample_mini_batch(*args, obs_groups=obs_groups)
+
+        alg.replay_buffer.sample_mini_batch = record
+        losses, diag = alg.update()
+        assert flat_groups == [()]  # only the end-of-update reward check; no flat critic batch
+        for key in ("critic_1", "critic_2", "actor", "alpha"):
+            assert torch.isfinite(torch.tensor(losses[key])), key
+        assert "Critic/td_abs" in diag and "Critic/q_pi_gap" in diag
+        assert any(not torch.equal(a, p) for a, p in zip(critic_before, alg.critic_parameters, strict=True))
+        assert any(not torch.equal(a, p) for a, p in zip(actor_before, alg.actor.parameters(), strict=True))
+
+    def test_excludes_critic_sees_hidden(self) -> None:
+        """The critic input stays observation and action, so the latent-reading critic cannot be combined."""
+        env = _TimeoutImageVecEnv()
+        cfg = _make_cfg()
+        cfg["algorithm"] |= {"critic_on_actor_windows": True, "critic_sees_hidden": True}
+        with pytest.raises(ValueError, match="critic_on_actor_windows"):
+            SAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu")

@@ -32,12 +32,12 @@ def episode_stats(phi: torch.Tensor, phi_next: torch.Tensor, delta: torch.Tensor
         gamma: Discount of the successor features.
 
     Returns:
-        The statistics (float64 sums).
+        The statistics (float64 sums, on CPU: the k x k solves are too small for the GPU to help).
     """
     phi, phi_next, delta = phi.double(), phi_next.double(), delta.double()
     return LSTDStats(
-        A=phi.T @ (phi - gamma * phi_next),
-        B=phi.T @ delta,
+        A=(phi.T @ (phi - gamma * phi_next)).cpu(),
+        B=(phi.T @ delta).cpu(),
         count=phi.shape[0],
         delta_sq=delta.pow(2).sum().item(),
     )
@@ -95,18 +95,15 @@ class LSTDEnsemble:
         W_full = solve(A_all, B_all, self.lam)
         n = len(episodes)
         counts = torch.multinomial(torch.ones(n), n * self.num_members, replacement=True, generator=self.generator)
-        weights = torch.nn.functional.one_hot(counts.view(self.num_members, n), n).sum(1).double()
-        members = []
-        for b in range(self.num_members):
-            w = weights[b].to(A.device)
-            prior = None
-            if self.prior_scale > 0:
-                prior = (self.prior_scale * torch.randn(k, d, generator=self.generator, dtype=torch.float64)).to(
-                    A.device
-                )
-            members.append(solve((w[:, None, None] * A).sum(0), (w[:, None, None] * B).sum(0), self.lam, prior))
-        members = torch.stack(members)
-        reg = A_all + self.lam * torch.eye(k, dtype=A_all.dtype, device=A_all.device)
+        weights = torch.nn.functional.one_hot(counts.view(self.num_members, n), n).sum(1).to(A)
+        eye = torch.eye(k, dtype=A.dtype, device=A.device)
+        A_b = torch.einsum("bn,nij->bij", weights, A) + self.lam * eye
+        B_b = torch.einsum("bn,nij->bij", weights, B)
+        if self.prior_scale > 0:
+            prior = self.prior_scale * torch.randn(self.num_members, k, d, generator=self.generator, dtype=A.dtype)
+            B_b = B_b + self.lam * prior.to(A.device)
+        members = torch.linalg.solve(A_b, B_b)
+        reg = A_all + self.lam * eye
         eig = torch.linalg.eigvals(reg)
         return LSTDFit(
             W=members.mean(0),

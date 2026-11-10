@@ -63,20 +63,27 @@ class LSTDFit:
 
 
 class LSTDEnsemble:
-    """Bootstrap-over-episodes ensemble of ridge-regularized LSTD fits with randomized priors."""
+    """Ensemble of ridge-regularized LSTD fits: an episode bootstrap or an episode-clustered sandwich."""
 
-    def __init__(self, num_members: int, lam: float, prior_scale: float = 0.0, seed: int = 0) -> None:
+    def __init__(
+        self, num_members: int, lam: float, prior_scale: float = 0.0, seed: int = 0, uncertainty: str = "bootstrap"
+    ) -> None:
         """Configure the ensemble.
 
         Args:
-            num_members: Bootstrap members ``K``.
+            num_members: Members ``K``.
             lam: Ridge strength toward ``W = 0`` (or toward each member's prior offset).
             prior_scale: Std of each member's random prior offset ``W_0``; keeps early ensembles from collapsing.
             seed: Seed of the bootstrap and prior draws.
+            uncertainty: ``bootstrap`` resamples whole episodes; ``sandwich`` draws members from the
+                episode-clustered covariance ``A^-1 (sum_e g_e g_e^T) A^-T`` (a wild bootstrap of the scores).
         """
+        if uncertainty not in ("bootstrap", "sandwich"):
+            raise ValueError(f"unknown uncertainty {uncertainty!r}")
         self.num_members = num_members
         self.lam = lam
         self.prior_scale = prior_scale
+        self.uncertainty = uncertainty
         self.generator = torch.Generator().manual_seed(seed)
 
     def fit(self, episodes: list[LSTDStats]) -> LSTDFit:
@@ -94,16 +101,22 @@ class LSTDEnsemble:
         A_all, B_all = A.sum(0), B.sum(0)
         W_full = solve(A_all, B_all, self.lam)
         n = len(episodes)
-        counts = torch.multinomial(torch.ones(n), n * self.num_members, replacement=True, generator=self.generator)
-        weights = torch.nn.functional.one_hot(counts.view(self.num_members, n), n).sum(1).to(A)
         eye = torch.eye(k, dtype=A.dtype, device=A.device)
-        A_b = torch.einsum("bn,nij->bij", weights, A) + self.lam * eye
-        B_b = torch.einsum("bn,nij->bij", weights, B)
-        if self.prior_scale > 0:
-            prior = self.prior_scale * torch.randn(self.num_members, k, d, generator=self.generator, dtype=A.dtype)
-            B_b = B_b + self.lam * prior.to(A.device)
-        members = torch.linalg.solve(A_b, B_b)
         reg = A_all + self.lam * eye
+        if self.uncertainty == "sandwich":
+            # Per-episode scores g_e = A_e W - B_e; W_b = W + reg^-1 sum_e u_e g_e with u_e ~ N(0, 1).
+            scores = A @ W_full - B
+            u = torch.randn(self.num_members, n, generator=self.generator, dtype=A.dtype).to(A.device)
+            members = W_full + torch.linalg.solve(reg, torch.einsum("bn,nij->bij", u, scores))
+        else:
+            draws = torch.multinomial(torch.ones(n), n * self.num_members, replacement=True, generator=self.generator)
+            weights = torch.nn.functional.one_hot(draws.view(self.num_members, n), n).sum(1).to(A)
+            A_b = torch.einsum("bn,nij->bij", weights, A) + self.lam * eye
+            B_b = torch.einsum("bn,nij->bij", weights, B)
+            if self.prior_scale > 0:
+                prior = self.prior_scale * torch.randn(self.num_members, k, d, generator=self.generator, dtype=A.dtype)
+                B_b = B_b + self.lam * prior.to(A.device)
+            members = torch.linalg.solve(A_b, B_b)
         eig = torch.linalg.eigvals(reg)
         return LSTDFit(
             W=members.mean(0),

@@ -132,3 +132,15 @@ def test_safety_mask_keeps_reference_and_drops_risky() -> None:
     std = torch.tensor([0.1, 0.1, 1.0, 5.0])
     mask = safety_mask(value, std, beta_s=1.0)
     assert mask.tolist() == [True, True, False, False]
+
+
+def test_sandwich_members_center_on_the_fit_and_shrink_with_data() -> None:
+    """Sandwich members scatter around the ridge fit, less so with more episodes."""
+    gamma = 0.9
+    _, phi, phi_next, delta = _planted(40_000, 4, 3, gamma, noise=1.0, seed=6)
+    chunks = zip(phi.split(500), phi_next.split(500), delta.split(500), strict=True)
+    stats = [episode_stats(p, q, r, gamma) for p, q, r in chunks]
+    ens = LSTDEnsemble(num_members=256, lam=1.0, seed=0, uncertainty="sandwich")
+    few, many = ens.fit(stats[:4]), ens.fit(stats)
+    assert (many.members.mean(0) - many.W_full).abs().max() < 0.05
+    assert many.members.std(0).mean() < 0.5 * few.members.std(0).mean()

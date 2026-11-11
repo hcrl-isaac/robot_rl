@@ -7,15 +7,18 @@ slot, so it exports through the standard ``as_jit()``/``as_onnx()`` API regardle
 from __future__ import annotations
 
 import copy
+import math
 import os
 import re
 import torch
 import torch.nn as nn
 
+from robot_rl.models.cnn_model import CNNModel
 from robot_rl.models.cnn_rnn_model import CNNRNNModel
 from robot_rl.models.inference import EncoderInferencePolicy
 from robot_rl.models.rnn_model import RNNModel
 from robot_rl.modules.distribution import Distribution, bound_by_clip_actions
+from robot_rl.utils.retired import drop_retired_options
 from robot_rl.utils.utils import resolve_callable
 
 DEFAULT_ONNX_OPSET = 18
@@ -65,7 +68,19 @@ def _num_actions(model_cfg: dict, sd: dict[str, torch.Tensor], default_class: st
     """
     width = resolve_callable(model_cfg.get("class_name", default_class)).head_output_width(sd)
     dist_cfg = model_cfg.get("distribution_cfg")
-    return width if dist_cfg is None else _distribution_class(dist_cfg).output_dim_for_input_width(width)
+    if dist_cfg is None:
+        return width
+    dist_class = _distribution_class(dist_cfg)
+    kwargs = {k: v for k, v in dist_cfg.items() if k != "class_name"}
+    # per-state heads (log kappa, tail std) widen the layer by an amount the class alone cannot tell; build to match
+    for output_dim in range(dist_class.output_dim_for_input_width(width), 0, -1):
+        try:
+            input_dim = dist_class(output_dim, **kwargs).input_dim
+        except ValueError:
+            continue
+        if (math.prod(input_dim) if isinstance(input_dim, list) else input_dim) == width:
+            return output_dim
+    raise ValueError(f"No {dist_class.__name__} output_dim gives a {width}-wide head with the logged distribution_cfg.")
 
 
 def _extend_bn_identity(bn: nn.BatchNorm1d, extra_dims: int) -> nn.BatchNorm1d:
@@ -116,7 +131,36 @@ def _first_mlp_input_dim(sd: dict[str, torch.Tensor]) -> int:
     return sd[f"mlp.{first_idx}.weight"].shape[1]
 
 
-def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.Module]:
+def _image_obs(
+    groups: list[str], sd: dict[str, torch.Tensor], obs_shapes: dict[str, tuple[int, ...]] | None, name: str
+) -> dict[str, torch.Tensor]:
+    """Zero observations for a CNN model: each image group at its given (C, H, W), the 1D groups at their dims.
+
+    Args:
+        groups: The model's observation groups.
+        sd: Its state dict, whose baked normalizer sizes the 1D groups when ``obs_shapes`` does not.
+        obs_shapes: ``(C, H, W)`` of each image group, optionally ``(dim,)`` of each 1D group.
+        name: The model's class name, for the error message.
+    """
+    shapes = {g: tuple(obs_shapes[g]) for g in groups if obs_shapes and g in obs_shapes}
+    images = {g: shape for g, shape in shapes.items() if len(shape) == 3}
+    if not images:
+        raise ValueError(f"{name} encodes images: give each image group's (C, H, W) in obs_shapes")
+    flat = [g for g in groups if g not in images]
+    if all(g in shapes for g in flat):
+        dims = {g: shapes[g][0] for g in flat}
+    elif "obs_normalizer._mean" in sd:
+        # only the concatenated 1D dim matters for layer sizes; put it all on the first 1D group
+        dims = {g: sd["obs_normalizer._mean"].shape[-1] if g == flat[0] else 0 for g in flat}
+    else:
+        raise ValueError("this image model records no 1D input size: give each 1D group's (dim,) in obs_shapes")
+    obs = {g: torch.zeros(1, dims[g]) for g in flat}
+    return obs | {g: torch.zeros(1, *shape) for g, shape in images.items()}
+
+
+def _rebuild_ppo(
+    train_cfg: dict, ckpt: dict, all_models: bool, obs_shapes: dict[str, tuple[int, ...]] | None = None
+) -> dict[str, nn.Module]:
     if "memory_state_dict" in ckpt:
         raise NotImplementedError("Export of recurrent (memory-bearing) policies is not supported.")
     cfg = copy.deepcopy(train_cfg)
@@ -131,12 +175,23 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
     ) -> nn.Module:
         model_cfg = dict(model_cfg)
         model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
+        groups = cfg["obs_groups"][obs_set]
+        if issubclass(model_class, CNNModel) and not other_dims:
+            # an image actor (e.g. SAC from depth) is sized from the image shapes, not the first MLP layer
+            model = model_class(
+                _image_obs(groups, sd, obs_shapes, model_class.__name__),
+                {obs_set: groups},
+                obs_set,
+                output_dim,
+                **model_cfg,
+            )
+            model.load_state_dict(sd, strict=True)
+            return model.eval()
         if issubclass(model_class, RNNModel) and not issubclass(model_class, CNNRNNModel):
             # the MLP head reads the recurrent output; the recurrent input is the observation
             obs_dim = sd["rnn.rnn.weight_ih_l0"].shape[-1]
         else:
             obs_dim = _first_mlp_input_dim(sd) - sum(other_dims)
-        groups = cfg["obs_groups"][obs_set]
         # only the concatenated dim matters for layer sizes; put it all on the first group
         obs = {g: torch.zeros(1, obs_dim if i == 0 else 0) for i, g in enumerate(groups)}
         model = model_class(obs, {obs_set: groups}, obs_set, output_dim, other_input_dims=other_dims, **model_cfg)
@@ -192,8 +247,7 @@ def _rebuild_distillation(
         # an auxiliary head only supervises the encoder in training; it is not part of the exported policy
         sd = {k: v for k, v in sd.items() if not k.startswith("aux_head.")}
     model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
-    if issubclass(model_class, RNNModel) and not issubclass(model_class, CNNRNNModel):
-        raise NotImplementedError("Export of recurrent (memory-bearing) students is not supported.")
+    recurrent = issubclass(model_class, RNNModel) and not issubclass(model_class, CNNRNNModel)
     groups = cfg["obs_groups"]["student"]
     shapes = {g: tuple(obs_shapes[g]) for g in groups if obs_shapes and g in obs_shapes}
     images = {g: shape for g, shape in shapes.items() if len(shape) == 3}
@@ -204,7 +258,8 @@ def _rebuild_distillation(
         dims = {g: shapes[g][0] for g in flat}
     else:
         if not images:
-            total = _first_mlp_input_dim(sd)
+            # a recurrent student's MLP head reads the recurrent output; its recurrent input is the observation
+            total = sd["rnn.rnn.weight_ih_l0"].shape[-1] if recurrent else _first_mlp_input_dim(sd)
         elif "obs_normalizer._mean" in sd:
             total = sd["obs_normalizer._mean"].shape[-1]
         else:
@@ -279,11 +334,12 @@ def rebuild_models(
         obs_shapes: ``(channels, height, width)`` of each image observation group, and optionally ``(dim,)`` of
             each 1D group, for image students.
     """
+    train_cfg = drop_retired_options(train_cfg)
     if "backward_map_state_dict" in ckpt:
         return _rebuild_fbcpr(train_cfg, ckpt, all_models)
     if "student_state_dict" in ckpt:
         return _rebuild_distillation(train_cfg, ckpt, obs_shapes)
-    return _rebuild_ppo(train_cfg, ckpt, all_models)
+    return _rebuild_ppo(train_cfg, ckpt, all_models, obs_shapes)
 
 
 def save_jit(module: nn.Module, path: str, filename: str) -> str:

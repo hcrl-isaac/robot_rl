@@ -102,3 +102,64 @@ def test_training_leaves_another_head_the_bounds_its_cfg_gives() -> None:
     alg = FbCpr.construct_algorithm(obs, _Env(), cfg, "cpu", inference=True)
     saturated = alg.actor.distribution.deterministic_output(torch.tensor([-50.0, 50.0]))
     torch.testing.assert_close(saturated, torch.tensor([-1.0, 1.0]))
+
+
+def _instruction_alg(tmp_path: object, instruction: bool) -> tuple[FbCpr, TensorDict]:
+    motions = TensorDict({"policy": torch.randn(3, 6, 8)}, batch_size=[3, 6])
+    motion_path = f"{tmp_path}/motions.pt"
+    torch.save(motions, motion_path)
+    cfg = _train_cfg("GaussianDistribution")
+    cfg["actor"].pop("distribution_cfg")
+    cfg["algorithm"]["motion_path"] = motion_path
+    cfg["algorithm"]["expert_rollout_length"] = 4
+    for critic in ("forward_map", "disc_critic", "aux_critic"):
+        cfg["algorithm"][critic]["num_parallel"] = 2
+    if instruction:
+        cfg["algorithm"]["instruction_critic"] = dict(cfg["algorithm"]["aux_critic"])
+        cfg["algorithm"]["instruction_reward_key"] = "instruction_reward"
+        cfg["algorithm"]["instruction_reg_coef"] = 1.0
+    obs = TensorDict(
+        {"policy": torch.zeros(_Env.num_envs, 8), "instruction_reward": torch.zeros(_Env.num_envs, 1)},
+        batch_size=[_Env.num_envs],
+    )
+    return FbCpr.construct_algorithm(obs, _Env(), cfg, "cpu"), obs
+
+
+def _fill_and_update(alg: FbCpr, obs: TensorDict, instruction_reward: float) -> tuple[dict, dict]:
+    no_dones = torch.zeros(_Env.num_envs, dtype=torch.bool)
+    # the runner collects under inference mode
+    with torch.inference_mode():
+        for _ in range(8):
+            alg.act(obs)
+            next_obs = obs.clone()
+            next_obs["policy"] = torch.randn(_Env.num_envs, 8)
+            next_obs["instruction_reward"] = torch.full((_Env.num_envs, 1), instruction_reward)
+            rewards = torch.full((_Env.num_envs,), 1.0 + instruction_reward)
+            alg.process_env_step(next_obs, rewards, no_dones, {"time_outs": no_dones})
+        alg.compute_gammas()
+    return alg.update()
+
+
+def test_an_instruction_critic_learns_its_reward_and_the_aux_critic_the_rest(tmp_path: object) -> None:
+    """The instruction reward goes to its own critic and actor term; the auxiliary critic sees the remainder."""
+    alg, obs = _instruction_alg(tmp_path, instruction=True)
+    losses, _ = _fill_and_update(alg, obs, instruction_reward=0.5)
+    assert "Critic_Loss/instruction_critic_loss" in losses and "Actor_Loss/instruction_loss" in losses
+    assert alg.instruction_critic in alg.models
+    # the auxiliary normaliser saw the env reward minus the instruction part (1.0), not 1.5
+    torch.testing.assert_close(
+        alg.aux_reward_normalizer.mean / (1 - alg.aux_reward_normalizer.tau), torch.tensor([1.0])
+    )
+    saved = alg.save()
+    assert {"instruction_critic_state_dict", "target_instruction_critic_state_dict"} <= saved.keys()
+
+
+def test_without_an_instruction_critic_the_aux_critic_keeps_the_whole_reward(tmp_path: object) -> None:
+    """No instruction critic: the update is unchanged and nothing instruction-related is saved."""
+    alg, obs = _instruction_alg(tmp_path, instruction=False)
+    losses, _ = _fill_and_update(alg, obs, instruction_reward=0.5)
+    assert "Critic_Loss/instruction_critic_loss" not in losses
+    torch.testing.assert_close(
+        alg.aux_reward_normalizer.mean / (1 - alg.aux_reward_normalizer.tau), torch.tensor([1.5])
+    )
+    assert "instruction_critic_state_dict" not in alg.save()

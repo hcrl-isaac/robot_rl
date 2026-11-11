@@ -177,3 +177,107 @@ def test_a_full_buffer_does_not_read_the_newest_row_as_the_oldest_rows_predecess
     buffer = _make_buffer()
     _fill(buffer, CAPACITY_PER_ENV + 5, done_at={CAPACITY_PER_ENV + 4})  # only the newest step ends an episode
     assert buffer.sample_sequences(seq_len=4, burn_in=2, episode_start=True) is None
+
+
+def test_quantized_group_is_stored_as_uint8_and_read_back_within_a_step() -> None:
+    """A quantized group is stored in 256 levels over its range and sampled back in its own dtype."""
+    obs = TensorDict({"policy": torch.zeros(NUM_ENVS, 3), "image": torch.zeros(NUM_ENVS, 2, 3)}, batch_size=NUM_ENVS)
+    buffer = ReplayBuffer(
+        NUM_ENVS,
+        CAPACITY_PER_ENV,
+        obs,
+        [2],
+        z_dim=0,
+        batch_size=16,
+        device="cpu",
+        keep_terminal=True,
+        hidden_dim=HIDDEN,
+        hidden_layers=LAYERS,
+        obs_quantize={"image": (0.0, 1.0)},
+    )
+    assert buffer.observations["image"].dtype == torch.uint8
+    torch.manual_seed(0)
+    images = []
+    for step in range(CAPACITY_PER_ENV):
+        image = torch.rand(NUM_ENVS, 2, 3) * 1.2 - 0.1  # a little outside the range on both sides
+        images.append(image)
+        transition = ReplayBuffer.Transition()
+        transition.observations = TensorDict(
+            {"policy": torch.full((NUM_ENVS, 3), float(step)), "image": image}, batch_size=NUM_ENVS
+        )
+        transition.next_observations = transition.observations.clone()
+        transition.actions = torch.zeros(NUM_ENVS, 2)
+        transition.rewards = torch.zeros(NUM_ENVS)
+        transition.context = torch.zeros(NUM_ENVS, 0)
+        transition.next_terminated = torch.zeros(NUM_ENVS).byte()
+        transition.dones = torch.zeros(NUM_ENVS)
+        transition.hidden_state = torch.zeros(LAYERS, NUM_ENVS, HIDDEN)
+        buffer.add_transitions(transition)
+    batch = buffer.sample_mini_batch()
+    assert batch.observations["image"].dtype == torch.float32
+    steps = batch.observations["policy"][:, 0].long()
+    stored = torch.stack(images)  # (steps, envs, 2, 3)
+    match = stored[steps].clamp(0.0, 1.0)  # every env shares the step's policy value, so compare over envs
+    err = (batch.observations["image"].unsqueeze(1) - match).abs().amin(dim=1)
+    assert float(err.max()) <= 0.5 / 255 + 1e-6
+
+
+def _image_buffer() -> ReplayBuffer:
+    """Return a buffer with a quantized image group beside a vector group, filled with random steps."""
+    obs = TensorDict({"policy": torch.zeros(NUM_ENVS, 3), "image": torch.zeros(NUM_ENVS, 1, 4, 5)}, batch_size=NUM_ENVS)
+    buffer = ReplayBuffer(
+        NUM_ENVS, CAPACITY_PER_ENV, obs, [2], z_dim=0, batch_size=8, device="cpu", keep_terminal=True, n_steps=3,
+        obs_quantize={"image": (0.0, 1.0)},
+    )  # fmt: skip
+    for _ in range(12):
+        transition = ReplayBuffer.Transition()
+        step = lambda: TensorDict(  # noqa: E731
+            {"policy": torch.randn(NUM_ENVS, 3), "image": torch.rand(NUM_ENVS, 1, 4, 5)}, batch_size=NUM_ENVS
+        )
+        transition.observations, transition.next_observations = step(), step()
+        transition.actions = torch.randn(NUM_ENVS, 2)
+        transition.rewards = torch.randn(NUM_ENVS)
+        transition.context = torch.zeros(NUM_ENVS, 0)
+        transition.dones = torch.rand(NUM_ENVS) < 0.2
+        transition.next_terminated = transition.dones.byte()
+        buffer.add_transitions(transition)
+    return buffer
+
+
+class TestTrimmedReads:
+    """Reading fewer groups returns the same values for the groups kept and draws the same samples."""
+
+    def test_nstep_batch_reads_only_the_named_start_groups(self) -> None:
+        """The start observation keeps only ``obs_groups``; the next and bootstrap observations stay whole."""
+        buffer = _image_buffer()
+        torch.manual_seed(0)
+        full = buffer.sample_mini_batch()
+        after_full = torch.rand(3)
+        torch.manual_seed(0)
+        trimmed = buffer.sample_mini_batch(obs_groups=["policy"])
+        assert torch.equal(torch.rand(3), after_full)
+        assert set(trimmed.observations.keys()) == {"policy"}
+        assert torch.equal(trimmed.observations["policy"], full.observations["policy"])
+        for key in ("policy", "image"):
+            assert torch.equal(trimmed.next_observations[key], full.next_observations[key])
+            assert torch.equal(trimmed.bootstrap_observations[key], full.bootstrap_observations[key])
+        assert torch.equal(trimmed.rewards, full.rewards)
+
+    def test_windows_can_skip_next_observations(self) -> None:
+        """``next_observations=False`` leaves them None and changes nothing else in the batch."""
+        buffer = _image_buffer()
+        torch.manual_seed(0)
+        full = buffer.sample_sequences(4, 2)
+        torch.manual_seed(0)
+        trimmed = buffer.sample_sequences(4, 2, next_observations=False)
+        assert trimmed.next_observations is None
+        for key in ("policy", "image"):
+            assert torch.equal(trimmed.observations[key], full.observations[key])
+        assert torch.equal(trimmed.resets, full.resets) and torch.equal(trimmed.actions, full.actions)
+
+    def test_in_place_dequantization_matches_the_out_of_place_formula(self) -> None:
+        """The read image equals ``uint8 * scale + low`` bit for bit."""
+        buffer = _image_buffer()
+        idx = torch.arange(8)
+        raw = buffer.observations["image"][idx]
+        assert torch.equal(buffer._read(buffer.observations, idx, None)["image"], raw.float() * (1.0 / 255.0) + 0.0)

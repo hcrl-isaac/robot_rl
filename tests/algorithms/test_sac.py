@@ -80,10 +80,12 @@ def _make_cfg(auto_alpha: bool = True) -> dict:
     }
 
 
-def _build() -> tuple[SAC, _DummyVecEnv]:
+def _build(**algorithm: object) -> tuple[SAC, _DummyVecEnv]:
     env = _DummyVecEnv()
     obs = env.get_observations()
-    alg = SAC.construct_algorithm(obs, env, _make_cfg(), device="cpu")
+    cfg = _make_cfg()
+    cfg["algorithm"].update(algorithm)
+    alg = SAC.construct_algorithm(obs, env, cfg, device="cpu")
     return alg, env
 
 

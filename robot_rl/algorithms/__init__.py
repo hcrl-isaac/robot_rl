@@ -12,5 +12,17 @@ from .fb_cpr import FbCpr
 from .interactive_fb_cpr import InteractiveFbCpr
 from .ppo import PPO
 from .sac import SAC
+from .world_model_ac import WorldModelAC
+from .world_model_fb_cpr import WorldModelFbCpr
 
-__all__ = ["PPO", "SAC", "CvaeDistillation", "Distillation", "DistillationPPO", "FbCpr", "InteractiveFbCpr"]
+__all__ = [
+    "PPO",
+    "SAC",
+    "CvaeDistillation",
+    "Distillation",
+    "DistillationPPO",
+    "FbCpr",
+    "InteractiveFbCpr",
+    "WorldModelAC",
+    "WorldModelFbCpr",
+]

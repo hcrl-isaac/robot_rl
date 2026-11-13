@@ -1376,10 +1376,10 @@ class FbCpr:
         with torch.no_grad():
             loss_dict = {
                 "Loss/actor": actor_loss.mean().detach(),
-                "Train/actor/q_discriminator": Q_discriminator.mean().detach(),
-                "Train/actor/q_aux": Q_aux.mean().detach(),
-                "Train/actor/q_instruction": Q_instruction.mean().detach(),
-                "Train/actor/q_fb": Q_fb.mean().detach(),
+                "Loss/actor_discriminator": Q_discriminator.mean().detach(),
+                "Loss/actor_aux": Q_aux.mean().detach(),
+                "Loss/actor_instruction": Q_instruction.mean().detach(),
+                "Loss/actor_fb": Q_fb.mean().detach(),
             }
 
             extras_dict = {

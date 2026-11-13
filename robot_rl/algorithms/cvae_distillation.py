@@ -99,6 +99,7 @@ class CvaeDistillation(Distillation):
                     loss = 0
 
         self.storage.clear()
-        loss_dict = {f"Loss/{key}": value / cnt for key, value in totals.items()}
+        # the prior-mean imitation error is measured under no_grad, so it is a diagnostic, not a loss
+        loss_dict = {f"Train/{k}" if k == "prior_behavior" else f"Loss/{k}": v / cnt for k, v in totals.items()}
         loss_dict["Train/kl_weight"] = self.kl_weight
         return loss_dict

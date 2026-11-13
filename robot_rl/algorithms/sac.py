@@ -359,14 +359,14 @@ class SAC:
         if self.auto_alpha:
             self.alpha = self.log_alpha.exp().item()
         loss_dict = {
-            "critic_1": mean_critic_1_loss.item() / n_updates,
-            "critic_2": mean_critic_2_loss.item() / n_updates,
-            "actor": mean_actor_loss.item() / max(num_actor_updates, 1),
-            "alpha": mean_alpha_loss.item() / n_updates if self.auto_alpha else 0.0,
-            "alpha_value": self.alpha,
+            "Loss/critic_1": mean_critic_1_loss.item() / n_updates,
+            "Loss/critic_2": mean_critic_2_loss.item() / n_updates,
+            "Loss/actor": mean_actor_loss.item() / max(num_actor_updates, 1),
+            "Loss/alpha": mean_alpha_loss.item() / n_updates if self.auto_alpha else 0.0,
+            "Train/alpha": self.alpha,
         }
         if self.rnd:
-            loss_dict["rnd"] = mean_rnd_loss.item() / n_updates
+            loss_dict["Loss/rnd"] = mean_rnd_loss.item() / n_updates
         return loss_dict
 
     def _update_recurrent(self) -> tuple[dict, dict]:
@@ -470,7 +470,7 @@ class SAC:
                     pred = self.actor.aux_prediction(latent)  # type: ignore[attr-defined]
                     aux_loss = nn.functional.mse_loss(pred, target)
                     actor_loss = actor_loss + self.aux_loss_weight * aux_loss
-                    _acc("Actor/aux_loss", aux_loss.detach())
+                    _acc("Loss/actor_aux", aux_loss.detach())
                     _acc("Actor/aux_abs_err", (pred - target).detach().abs().mean())
                 if self.attn_target_group is not None:
                     uvv = train_obs[self.attn_target_group].reshape(flat, -1)
@@ -478,7 +478,7 @@ class SAC:
                     log_p = self.actor.attention_target_log_prob(uvv[:, :2])  # type: ignore[attr-defined]
                     attn_loss = -(log_p * visible).sum() / visible.sum().clamp(min=1.0)
                     actor_loss = actor_loss + self.attn_loss_weight * attn_loss
-                    _acc("Actor/attn_loss", attn_loss.detach())
+                    _acc("Loss/actor_attn", attn_loss.detach())
                     _acc(
                         "Actor/attn_target_prob", (log_p.detach().exp() * visible).sum() / visible.sum().clamp(min=1.0)
                     )
@@ -534,11 +534,11 @@ class SAC:
         sums = {k: float(v) for k, v in sums.items()}
         n = max(num_updates, 1)
         losses = {
-            "critic_1": sums["critic_1"] / n,
-            "critic_2": sums["critic_2"] / n,
-            "actor": sums["actor"] / max(num_actor_updates, 1),
-            "alpha": sums["alpha"] / n if self.auto_alpha else 0.0,
-            "alpha_value": self.alpha,
+            "Loss/critic_1": sums["critic_1"] / n,
+            "Loss/critic_2": sums["critic_2"] / n,
+            "Loss/actor": sums["actor"] / max(num_actor_updates, 1),
+            "Loss/alpha": sums["alpha"] / n if self.auto_alpha else 0.0,
+            "Train/alpha": self.alpha,
         }
         return losses, {k: float(v) / counts[k] for k, v in diag.items()}
 
@@ -849,7 +849,7 @@ class SAC:
         self.estimator_optimizer.step()  # type: ignore[union-attr]
         with torch.no_grad():
             err = (pred - target).abs().mean(-1)
-            acc("Estimator/loss", loss.detach())
+            acc("Loss/estimator", loss.detach())
             acc("Estimator/abs_err", err.mean())
             # what predicting the window's mean target would score, as a no-information floor
             acc("Estimator/abs_err_mean_guess", (target - target.mean(dim=(0, 1))).abs().mean())

@@ -65,10 +65,10 @@ def test_losses_decrease_and_kl_anneals() -> None:
     for _ in range(6):
         _rollout(alg, obs)
         losses.append(alg.update())
-    assert set(losses[0]) == {"behavior", "kl", "prior_behavior", "kl_weight"}
-    assert losses[-1]["behavior"] < losses[0]["behavior"]
-    assert losses[0]["kl_weight"] > losses[-1]["kl_weight"]
-    assert abs(losses[-1]["kl_weight"] - 0.01) < 1e-9
+    assert set(losses[0]) == {"Loss/behavior", "Loss/kl", "Loss/prior_behavior", "Train/kl_weight"}
+    assert losses[-1]["Loss/behavior"] < losses[0]["Loss/behavior"]
+    assert losses[0]["Train/kl_weight"] > losses[-1]["Train/kl_weight"]
+    assert abs(losses[-1]["Train/kl_weight"] - 0.01) < 1e-9
 
 
 def test_save_load_round_trip() -> None:

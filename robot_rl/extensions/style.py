@@ -205,7 +205,7 @@ class StyleDiscriminators(nn.Module):
         return rewards
 
     def update(self, policy_states: torch.Tensor, gates: list[torch.Tensor | None] | None = None) -> dict[str, float]:
-        """Train every discriminator to score expert states +1 and the rollout's states -1; returns mean losses.
+        """Train each discriminator to score expert states +1 and the rollout's states -1; returns mean losses, scores.
 
         Args:
             policy_states: ``(N, style_dim)`` style states of the rollout.
@@ -224,7 +224,7 @@ class StyleDiscriminators(nn.Module):
                 continue
             batch = min(self.batch_size, num)
             num_batches = max(1, num // batch)
-            sums = {"expert": 0.0, "policy": 0.0, "grad_penalty": 0.0}
+            sums = {"loss": 0.0, "expert": 0.0, "policy": 0.0, "grad_penalty": 0.0}
             count = 0
             for _ in range(self.num_learning_epochs):
                 perm = torch.randperm(num, device=self.device)
@@ -247,12 +247,16 @@ class StyleDiscriminators(nn.Module):
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
+                    sums["loss"] += loss.item()
                     sums["expert"] += expert_score.item()
                     sums["policy"] += policy_score.item()
                     sums["grad_penalty"] += penalty.item()
                     count += 1
-            for key, value in sums.items():
-                losses[f"Style/{self.names[k]}_{key}"] = value / max(count, 1)
+            name, count = self.names[k], max(count, 1)
+            losses[f"Loss/style_{name}"] = sums["loss"] / count
+            losses[f"Loss/style_{name}_grad_penalty"] = sums["grad_penalty"] / count
+            losses[f"Style/{name}_expert"] = sums["expert"] / count
+            losses[f"Style/{name}_policy"] = sums["policy"] / count
         return losses
 
     def state_dict(self, *args: Any, **kwargs: Any) -> dict:

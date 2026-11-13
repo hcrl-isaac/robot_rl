@@ -69,7 +69,7 @@ class TestDistillationLoss:
         for _ in range(5):
             _fill_distillation_storage(alg, obs)
             loss_dict = alg.update()
-            losses.append(loss_dict["behavior"])
+            losses.append(loss_dict["Loss/behavior"])
 
         # Loss should generally decrease; allow some noise — check first vs last
         assert losses[-1] < losses[0], f"Loss should decrease over updates, got {losses[0]:.4f} -> {losses[-1]:.4f}"
@@ -204,7 +204,7 @@ class TestTeacherDrivenRollouts:
         _fill_distillation_storage(alg, obs)
         loss = alg.update()
         assert alg.teacher_action_prob == pytest.approx(0.0)
-        assert loss["teacher_action_prob"] == pytest.approx(0.0)
+        assert loss["Train/teacher_action_prob"] == pytest.approx(0.0)
         # envs keep their draw until they reset, then redraw at the current (zero) fraction
         assert alg._teacher_driven.all()
         alg.act(obs)

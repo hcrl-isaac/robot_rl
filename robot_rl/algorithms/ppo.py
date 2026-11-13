@@ -587,11 +587,10 @@ class PPO:
             mean_encoder_l2_loss /= num_updates
 
         # Construct the loss dictionary
-        # Slash-prefixed keys are logged under that scalar group as-is (Train/...); bare keys go under Loss/.
         loss_dict = {
-            "value": mean_value_loss,
-            "surrogate": mean_surrogate_loss,
-            "entropy": mean_entropy,
+            "Loss/value": mean_value_loss,
+            "Loss/surrogate": mean_surrogate_loss,
+            "Train/entropy": mean_entropy,
             "Train/log_prob": mean_log_prob,
             "Train/clip_fraction": mean_clip_fraction,
         }
@@ -600,11 +599,11 @@ class PPO:
         if kl_first_minibatch is not None:
             loss_dict["Train/kl_first_minibatch"] = kl_first_minibatch
         if self.rnd:
-            loss_dict["rnd"] = mean_rnd_loss
+            loss_dict["Loss/rnd"] = mean_rnd_loss
         if self.symmetry:
-            loss_dict["symmetry"] = mean_symmetry_loss
+            loss_dict["Loss/symmetry"] = mean_symmetry_loss
         if mean_encoder_l2_loss is not None:
-            loss_dict["encoder_l2"] = mean_encoder_l2_loss
+            loss_dict["Loss/encoder_l2"] = mean_encoder_l2_loss
 
         # Train the style discriminators on this rollout's policy states before the storage is cleared
         if self.style is not None:

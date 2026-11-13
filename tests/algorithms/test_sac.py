@@ -126,7 +126,7 @@ class TestSAC:
         alg, env = _build()
         _collect(alg, env, steps=8)
         losses = alg.update()
-        for key in ("critic_1", "critic_2", "actor", "alpha", "alpha_value"):
+        for key in ("Loss/critic_1", "Loss/critic_2", "Loss/actor", "Loss/alpha", "Train/alpha"):
             assert key in losses
             assert torch.isfinite(torch.tensor(losses[key]))
 
@@ -167,7 +167,7 @@ class TestSAC:
         assert alg.replay_buffer.n_steps == 3
         _collect(alg, env, steps=12)
         losses = alg.update()
-        for key in ("critic_1", "critic_2", "actor", "alpha_value"):
+        for key in ("Loss/critic_1", "Loss/critic_2", "Loss/actor", "Train/alpha"):
             assert torch.isfinite(torch.tensor(losses[key]))
 
     def test_fixed_alpha(self) -> None:
@@ -177,5 +177,5 @@ class TestSAC:
         assert alg.alpha_optimizer is None
         _collect(alg, env, steps=8)
         losses = alg.update()
-        assert losses["alpha"] == 0.0
+        assert losses["Loss/alpha"] == 0.0
         assert abs(alg.alpha - 0.1) < 1e-6  # unchanged

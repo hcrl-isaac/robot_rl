@@ -252,7 +252,8 @@ def test_update_runs_and_logs(critic_mode: str, provide_goals: bool, critic_obs:
     assert ("goal" in alg.replay_buffer.groups) != provide_goals
     obs = _collect(alg, env, 40)
     logs = alg.update()
-    for key in ("world_model/state", "world_model/k_step_error", "actor/imagined_return", "critic/loss"):
+    losses = ("Loss/world_model_state", "Loss/actor", "Loss/critic")
+    for key in (*losses, "Train/world_model/k_step_error", "Train/actor/imagined_return"):
         assert key in logs and torch.isfinite(torch.tensor(logs[key])), (key, logs)
     restored = WorldModelAC.construct_algorithm(obs, env, cfg, device="cpu")
     assert restored.load(copy.deepcopy(alg.save()))
@@ -264,7 +265,8 @@ def test_updates_skip_until_windows_exist() -> None:
     alg = WorldModelAC.construct_algorithm(env.get_observations(), env, _make_cfg("replay"), device="cpu")
     _collect(alg, env, 3)
     logs = alg.update()
-    assert logs["world_model/skipped"] == 1.0 and logs["actor/skipped"] == 1.0 and logs["critic/skipped"] == 1.0
+    for key in ("Train/world_model/skipped", "Train/actor/skipped", "Train/critic/skipped"):
+        assert logs[key] == 1.0, key
 
 
 def test_eval_rolls_out_and_restores_training_mode() -> None:

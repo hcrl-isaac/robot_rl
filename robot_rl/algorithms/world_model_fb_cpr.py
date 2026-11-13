@@ -173,7 +173,7 @@ class WorldModelFbCpr(FbCpr):
             # FbCpr's replay drops every transition that ends an episode: B must never see a reset state as s'
             win = self.learner.replay_buffer.sample_transitions(self.batch_size, device=self.device, require_next=True)
         if win is None:
-            return {"Actor_Loss/skipped": torch.ones(())}, {}
+            return {"Train/actor/skipped": torch.ones(())}, {}
         starts = win.obs[0]
         batch = self._as_batch(win)
         expert_obs, expert_next_obs = self.expert_buffer.sample(
@@ -497,7 +497,7 @@ class WorldModelFbCpr(FbCpr):
         self.actor_optimizer.step()
         for net in frozen:
             net.requires_grad_(True)
-        loss_dict = {"Actor_Loss/total_loss": actor_loss.detach().clone(), "Actor_Loss/horizon": torch.tensor(horizon)}
+        loss_dict = {"Loss/actor": actor_loss.detach().clone(), "Train/actor/horizon": torch.tensor(horizon)}
         return loss_dict, {k: v.clone() for k, v in extras.items()}
 
     def _imagined_loss(

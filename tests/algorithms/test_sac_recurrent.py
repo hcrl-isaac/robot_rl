@@ -158,9 +158,9 @@ class TestRecurrentSAC:
         alg, env = _build()
         _collect(alg, env, 12)
         losses, diag = alg.update()
-        for key in ("critic_1", "critic_2", "actor", "alpha"):
+        for key in ("Loss/critic_1", "Loss/critic_2", "Loss/actor", "Loss/alpha"):
             assert torch.isfinite(torch.tensor(losses[key])), key
-        assert losses["critic_1"] > 0
+        assert losses["Loss/critic_1"] > 0
         for key in (
             "Recurrent/state_staleness",
             "Recurrent/init_carryover",
@@ -204,7 +204,7 @@ class TestRecurrentSAC:
         step_before = alg.update_step
         losses, _ = alg.update()
         assert alg.update_step == step_before
-        assert losses["critic_1"] == 0.0
+        assert losses["Loss/critic_1"] == 0.0
 
     def test_sequence_act_matches_stepwise_rollout(self) -> None:
         """Encoding a window in one call equals stepping the rollout RNN through it one step at a time."""
@@ -286,7 +286,7 @@ class TestRecurrentSAC:
         assert torch.all(k >= 1) and torch.all(k <= 5) and k.max() > 1
         assert torch.allclose(alg._bootstrap_discount(batch), alg.gamma**k)
         losses, diag = alg.update()
-        assert torch.isfinite(torch.tensor(losses["critic_1"])) and torch.isfinite(
+        assert torch.isfinite(torch.tensor(losses["Loss/critic_1"])) and torch.isfinite(
             torch.tensor(diag["Critic/q_target"])
         )
 
@@ -329,7 +329,7 @@ class TestRecurrentSAC:
         assert alg.actor.aux_head is not None and alg.actor.aux_head.out_features == 3
         _collect(alg, env, 12)
         _, diag = alg.update()
-        assert "Actor/aux_loss" in diag and diag["Actor/aux_loss"] > 0
+        assert "Loss/actor_aux" in diag and diag["Loss/actor_aux"] > 0
         assert torch.isfinite(torch.tensor(diag["Actor/aux_abs_err"]))
 
     def test_no_aux_head_by_default(self) -> None:
@@ -338,7 +338,7 @@ class TestRecurrentSAC:
         assert alg.actor.aux_head is None
         _collect(alg, env, 12)
         _, diag = alg.update()
-        assert "Actor/aux_loss" not in diag
+        assert "Loss/actor_aux" not in diag
 
 
 def _build_state_only(
@@ -384,7 +384,7 @@ class TestStateOnlyRecurrentSAC:
         alg, env = _build_state_only()
         _collect(alg, env, 12)
         losses, _ = alg.update()
-        for key in ("critic_1", "critic_2", "actor", "alpha"):
+        for key in ("Loss/critic_1", "Loss/critic_2", "Loss/actor", "Loss/alpha"):
             assert torch.isfinite(torch.tensor(losses[key])), key
 
     def test_aux_head_estimates_a_privileged_target(self) -> None:
@@ -395,7 +395,7 @@ class TestStateOnlyRecurrentSAC:
         assert alg.actor.aux_head.out_features == 3
         _collect(alg, env, 12)
         _, diag = alg.update()
-        assert "Actor/aux_loss" in diag and diag["Actor/aux_loss"] > 0
+        assert "Loss/actor_aux" in diag and diag["Loss/actor_aux"] > 0
 
 
 def _build_with_estimator(image_actor: bool) -> tuple[SAC, _DummyImageVecEnv]:
@@ -423,7 +423,7 @@ class TestSequenceEstimator:
         before = [p.detach().clone() for p in alg.estimator.parameters()]
         _collect(alg, env, 12)
         _, diag = alg.update()
-        for key in ("Estimator/loss", "Estimator/abs_err", "Estimator/abs_err_mean_guess", "Estimator/masked_frac"):
+        for key in ("Loss/estimator", "Estimator/abs_err", "Estimator/abs_err_mean_guess", "Estimator/masked_frac"):
             assert key in diag and torch.isfinite(torch.tensor(diag[key])), key
         assert "Estimator/abs_err_masked" in diag and "Estimator/abs_err_visible" in diag
         assert any(not torch.equal(b, p) for b, p in zip(before, alg.estimator.parameters(), strict=True))

@@ -401,7 +401,7 @@ class TestSharedEncoder:
         """``l2_coef`` adds a logged, non-negative term; leaving it at 0 keeps the loss dict unchanged."""
         ppo, obs = _build_ppo_with_encoder(l2_coef=1e-3)
         loss_dict = _run_update(ppo, obs)
-        assert loss_dict["encoder_l2"] >= 0.0
+        assert loss_dict["Loss/encoder_l2"] >= 0.0
 
         ppo_off, obs_off = _build_ppo_with_encoder()
         assert "encoder_l2" not in _run_update(ppo_off, obs_off)

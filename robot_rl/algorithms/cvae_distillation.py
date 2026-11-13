@@ -99,6 +99,6 @@ class CvaeDistillation(Distillation):
                     loss = 0
 
         self.storage.clear()
-        loss_dict = {key: value / cnt for key, value in totals.items()}
-        loss_dict["kl_weight"] = self.kl_weight
+        loss_dict = {f"Loss/{key}": value / cnt for key, value in totals.items()}
+        loss_dict["Train/kl_weight"] = self.kl_weight
         return loss_dict

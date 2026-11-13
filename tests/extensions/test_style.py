@@ -68,7 +68,9 @@ class TestDiscriminators:
         policy_states = torch.randn(512, STYLE_DIM)  # far from both experts
         for _ in range(30):
             losses = style.update(policy_states)
-        assert set(losses) == {f"Style/{n}_{k}" for n in ("a", "b") for k in ("expert", "policy", "grad_penalty")}
+        scores = {f"Style/{n}_{k}" for n in ("a", "b") for k in ("expert", "policy")}
+        disc_losses = {f"Loss/style_{n}{k}" for n in ("a", "b") for k in ("", "_grad_penalty")}
+        assert set(losses) == scores | disc_losses
         with torch.no_grad():
             a_on_a = style.discriminators[0](style.expert_states[0]).mean()
             a_on_b = style.discriminators[0](style.expert_states[1]).mean()
@@ -209,7 +211,7 @@ class TestMultiStreamPPO:
         assert st.returns.shape == (NUM_STEPS, NUM_ENVS, 3)
         assert st.advantages.shape == (NUM_STEPS, NUM_ENVS, 1)
         loss_dict = ppo.update()
-        assert "Style/a_expert" in loss_dict and "Style/b_reward" in loss_dict
+        assert "Loss/style_a" in loss_dict and "Style/a_expert" in loss_dict and "Style/b_reward" in loss_dict
         saved = ppo.save()
         assert "style_state_dict" in saved
         ppo2, _ = _build_style_ppo(tmp_path)
@@ -284,7 +286,7 @@ class TestGating:
         before = style.discriminators[0][0].weight.clone()
         closed = [torch.zeros(64, dtype=torch.bool), None]
         losses = style.update(torch.randn(64, STYLE_DIM), closed)
-        assert not any(k.startswith("Style/a_") for k in losses)
+        assert not any(k.startswith(("Style/a_", "Loss/style_a")) for k in losses)
         assert torch.equal(style.discriminators[0][0].weight, before)
 
     def test_schedule_clock_survives_a_round_trip(self, tmp_path: Path) -> None:

@@ -182,7 +182,7 @@ class WorldModelAC:
             if self.update_step >= self.actor_start_update:
                 rollout = self._imagine_from_replay()
                 if rollout is None:
-                    out["actor/skipped"] = 1.0
+                    out["Train/actor/skipped"] = 1.0
                 else:
                     out.update(self._update_actor(rollout))
                     if self.critic_mode == "imagination":
@@ -209,15 +209,17 @@ class WorldModelAC:
         ret = (discounts[:, None] * rollout.survival[:H] * rollout.rewards).sum(0)
         value_h = self.critic(rollout.obs[H].select(*self.critic_groups)).squeeze(-1)
         ret = ret + (self.gamma**H) * rollout.survival[H] * value_h
+        loss = -ret.mean() / H
         self.actor_optimizer.zero_grad()
-        (-ret.mean() / H).backward()
+        loss.backward()
         self._reduce_and_clip(self.actor.parameters(), clip_value=self.actor_grad_clip_value)
         self.actor_optimizer.step()
         self.critic_optimizer.zero_grad()  # the bootstrap value left gradients on the critic
         return {
-            "actor/imagined_return": ret.mean().item(),
-            "actor/imagined_reward": rollout.rewards.mean().item(),
-            "actor/survival": rollout.survival[H].mean().item(),
+            "Loss/actor": loss.item(),
+            "Train/actor/imagined_return": ret.mean().item(),
+            "Train/actor/imagined_reward": rollout.rewards.mean().item(),
+            "Train/actor/survival": rollout.survival[H].mean().item(),
         }
 
     def _update_imagined_critic(self, rollout: Rollout) -> dict[str, float]:
@@ -235,7 +237,7 @@ class WorldModelAC:
         L = self.critic_window
         win = self.replay_buffer.sample_windows(self.critic_batch_size, L, device=self.device)
         if win is None:
-            return {"critic/skipped": 1.0}
+            return {"Train/critic/skipped": 1.0}
         critic_obs = self.learner.with_goals(win.obs, self.learner.window_goals(win)).select(*self.critic_groups)
         with torch.no_grad():
             values = self.critic_target(critic_obs.reshape(-1)).view(L + 1, -1)  # type: ignore[misc]
@@ -264,8 +266,8 @@ class WorldModelAC:
                 self.critic_optimizer.step()
                 total += loss.item()
         return {
-            "critic/loss": total / (self.critic_epochs * self.critic_mini_batches),
-            "critic/target": targets.mean().item(),
+            "Loss/critic": total / (self.critic_epochs * self.critic_mini_batches),
+            "Train/critic/target": targets.mean().item(),
         }
 
     def _lambda_returns(self, rewards: torch.Tensor, dones: torch.Tensor, values: torch.Tensor) -> torch.Tensor:

@@ -121,9 +121,9 @@ def test_update_trains_every_part_and_round_trips(horizon: int) -> None:
     alg, env = _build(horizon)
     before = copy.deepcopy(alg.actor.state_dict())
     loss_dict, extras = alg.update()
-    for key in ("Forward_Backward_Loss/fb_loss", "Actor_Loss/total_loss", "world_model/state"):
+    for key in ("Loss/fb_measure", "Loss/actor", "Loss/world_model_state"):
         assert key in loss_dict and torch.isfinite(loss_dict[key]).all(), (key, loss_dict)
-    assert int(loss_dict["Actor_Loss/horizon"]) == horizon
+    assert int(loss_dict["Train/actor/horizon"]) == horizon
     assert ("imagined_fb_reward" in extras) == (horizon > 0)
     assert any((before[k] != v).any() for k, v in alg.actor.state_dict().items())
     restored = WorldModelFbCpr.construct_algorithm(env.get_observations(), env, _cfg(horizon), "cpu")
@@ -136,7 +136,7 @@ def test_actor_imagines_from_the_start_update_at_its_interval() -> None:
     """The actor takes FB-CPR's one-step loss before ``actor_start_update`` and between imagined updates."""
     alg, _ = _build(horizon=4, actor_start_update=2)
     alg.imagined_actor_interval, alg.num_imagined = 2, 16
-    horizons = [int(alg.update()[0]["Actor_Loss/horizon"]) for _ in range(5)]
+    horizons = [int(alg.update()[0]["Train/actor/horizon"]) for _ in range(5)]
     assert horizons == [0, 0, 4, 0, 4]
 
 
@@ -156,7 +156,7 @@ def test_horizon_zero_is_fb_cpr_actor_loss() -> None:
     imagined, _ = alg._update_imagined_actor(win.obs[0], z, batch.next_observations, horizon=0)
     torch.manual_seed(0)
     one_step, _ = FbCpr._update_actor(reference, batch)
-    torch.testing.assert_close(imagined["Actor_Loss/total_loss"], one_step["Actor_Loss/total_loss"])
+    torch.testing.assert_close(imagined["Loss/actor"], one_step["Loss/actor"])
 
 
 def _model_cfg_alg(**algorithm: object) -> WorldModelFbCpr:
@@ -211,7 +211,7 @@ def test_mve_and_mage_update_and_log(mage_action: str) -> None:
         mve_k=3, mage_beta=0.1, mage_q_beta=1.0, mage_batch_size=16, mage_action=mage_action, value_loss_coef=0.1
     )
     loss_dict, extras = alg.update()
-    for key in ("Forward_Backward_Loss/fb_loss", "Critic_Loss/discriminator_critic_loss", "Actor_Loss/total_loss"):
+    for key in ("Loss/fb_measure", "Loss/critic_discriminator", "Loss/actor"):
         assert torch.isfinite(loss_dict[key]).all(), key
     for key in ("mve_fb_credit_norm", "mve_disc_reward", "mage_forward_action_grad", "mage_aux_action_grad"):
         assert key in extras and torch.isfinite(extras[key]), (key, extras)
@@ -298,7 +298,7 @@ def test_value_regularizer_takes_the_expanded_target() -> None:
     losses, _ = alg._update_forward_backward(
         batch, bootstrap_obs=batch.next_observations, bootstrap_gammas=zero_gammas, credit_backward=credit
     )
-    torch.testing.assert_close(losses["Forward_Backward_Loss/value_reg_loss"], expected)
+    torch.testing.assert_close(losses["Loss/fb_value_reg"], expected)
 
 
 def test_replay_updates_skip_transitions_that_end_an_episode(monkeypatch: pytest.MonkeyPatch) -> None:

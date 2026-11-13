@@ -1039,10 +1039,10 @@ class FbCpr:
 
         with torch.no_grad():
             loss_dict = {
-                "Discriminator_Loss/total_loss": loss.mean().detach(),
-                "Discriminator_Loss/train_loss": unlabeled_loss.mean().detach(),
-                "Discriminator_Loss/expert_loss": expert_loss.mean().detach(),
-                "Discriminator_Loss/gradient_loss": grad_loss.mean().detach(),
+                "Loss/discriminator": loss.mean().detach(),
+                "Loss/discriminator_unlabeled": unlabeled_loss.mean().detach(),
+                "Loss/discriminator_expert": expert_loss.mean().detach(),
+                "Loss/discriminator_grad_penalty": grad_loss.mean().detach(),
             }
             extras = {
                 "disc_logit_expert": expert_logits.mean().detach(),
@@ -1150,10 +1150,10 @@ class FbCpr:
 
         with torch.no_grad():
             loss_dict = {
-                "Forward_Backward_Loss/total_loss": loss.mean().detach(),
-                "Forward_Backward_Loss/fb_loss": fb_loss.mean().detach(),
-                "Forward_Backward_Loss/ortho_loss": orth_loss.mean().detach(),
-                "Forward_Backward_Loss/value_reg_loss": q_loss.mean().detach(),
+                "Loss/fb": loss.mean().detach(),
+                "Loss/fb_measure": fb_loss.mean().detach(),
+                "Loss/fb_orthonormality": orth_loss.mean().detach(),
+                "Loss/fb_value_reg": q_loss.mean().detach(),
             }
 
             extras = {
@@ -1224,7 +1224,7 @@ class FbCpr:
 
         with torch.no_grad():
             loss_dict = {
-                "Critic_Loss/discriminator_critic_loss": loss.mean().detach(),
+                "Loss/critic_discriminator": loss.mean().detach(),
             }
 
             extras_dict = {
@@ -1287,7 +1287,7 @@ class FbCpr:
 
         with torch.no_grad():
             loss_dict = {
-                "Critic_Loss/auxiliary_critic_loss": loss.mean().detach(),
+                "Loss/critic_aux": loss.mean().detach(),
             }
 
             extras_dict = {
@@ -1320,7 +1320,7 @@ class FbCpr:
         self.instruction_critic_optimizer.step()
 
         with torch.no_grad():
-            loss_dict = {"Critic_Loss/instruction_critic_loss": loss.mean().detach()}
+            loss_dict = {"Loss/critic_instruction": loss.mean().detach()}
             extras_dict = {
                 "instruction_target_value": target_Q.mean().detach(),
                 "instruction_value": Qs.mean().detach(),
@@ -1375,11 +1375,11 @@ class FbCpr:
 
         with torch.no_grad():
             loss_dict = {
-                "Actor_Loss/total_loss": actor_loss.mean().detach(),
-                "Actor_Loss/discriminator_loss": Q_discriminator.mean().detach(),
-                "Actor_Loss/aux_loss": Q_aux.mean().detach(),
-                "Actor_Loss/instruction_loss": Q_instruction.mean().detach(),
-                "Actor_Loss/fb_loss": Q_fb.mean().detach(),
+                "Loss/actor": actor_loss.mean().detach(),
+                "Loss/actor_discriminator": Q_discriminator.mean().detach(),
+                "Loss/actor_aux": Q_aux.mean().detach(),
+                "Loss/actor_instruction": Q_instruction.mean().detach(),
+                "Loss/actor_fb": Q_fb.mean().detach(),
             }
 
             extras_dict = {

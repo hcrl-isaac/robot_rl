@@ -144,7 +144,7 @@ def test_an_instruction_critic_learns_its_reward_and_the_aux_critic_the_rest(tmp
     """The instruction reward goes to its own critic and actor term; the auxiliary critic sees the remainder."""
     alg, obs = _instruction_alg(tmp_path, instruction=True)
     losses, _ = _fill_and_update(alg, obs, instruction_reward=0.5)
-    assert "Critic_Loss/instruction_critic_loss" in losses and "Actor_Loss/instruction_loss" in losses
+    assert "Loss/critic_instruction" in losses and "Loss/actor_instruction" in losses
     assert alg.instruction_critic in alg.models
     # the auxiliary normaliser saw the env reward minus the instruction part (1.0), not 1.5
     torch.testing.assert_close(
@@ -158,7 +158,7 @@ def test_without_an_instruction_critic_the_aux_critic_keeps_the_whole_reward(tmp
     """No instruction critic: the update is unchanged and nothing instruction-related is saved."""
     alg, obs = _instruction_alg(tmp_path, instruction=False)
     losses, _ = _fill_and_update(alg, obs, instruction_reward=0.5)
-    assert "Critic_Loss/instruction_critic_loss" not in losses
+    assert "Loss/critic_instruction" not in losses
     torch.testing.assert_close(
         alg.aux_reward_normalizer.mean / (1 - alg.aux_reward_normalizer.tau), torch.tensor([1.5])
     )

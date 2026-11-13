@@ -72,10 +72,10 @@ class TestCrefModel:
         alg, env = _build(aux_obs_group="target")
         _collect(alg, env, 12)
         losses, diag = alg.update()
-        for key in ("critic_1", "actor", "alpha"):
+        for key in ("Loss/critic_1", "Loss/actor", "Loss/alpha"):
             assert torch.isfinite(torch.tensor(losses[key])), key
         assert 0.0 < diag["Actor/attn_entropy"] <= 1.0
-        assert diag["Actor/aux_loss"] > 0 and diag["Actor/grad_norm_rnn"] > 0
+        assert diag["Loss/actor_aux"] > 0 and diag["Actor/grad_norm_rnn"] > 0
 
     def test_attention_target_log_prob_indexes_the_grid(self) -> None:
         """The target cell's log attention mass matches a direct lookup on the (rows, cols) token grid."""
@@ -127,7 +127,7 @@ class TestCrefModel:
         assert torch.allclose(latent[:, -3:], alg.actor.aux_prediction(latent), atol=1e-6)
         _collect(alg, env, 12)
         losses, diag = alg.update()
-        assert torch.isfinite(torch.tensor(losses["actor"])) and diag["Actor/aux_loss"] > 0
+        assert torch.isfinite(torch.tensor(losses["Loss/actor"])) and diag["Loss/actor_aux"] > 0
 
     def test_token_positions_tell_cells_apart(self) -> None:
         """Identical cell features give identical keys without positions and distinct keys with them."""

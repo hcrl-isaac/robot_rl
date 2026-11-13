@@ -145,8 +145,8 @@ class WorldModelLearner:
             reduce: Gradient averaging and clipping applied before each step.
 
         Returns:
-            Mean losses under ``world_model/`` as detached tensors (no host sync), or ``world_model/skipped`` when no
-            window fits yet.
+            Mean losses as ``Loss/world_model_<term>`` and the k-step error as detached tensors (no host sync), or
+            ``Train/world_model/skipped`` when no window fits yet.
         """
         zero = torch.zeros((), device=self.device)
         sums = {"state": zero, "reward": zero, "obs": zero, "termination": zero, "k_step_error": zero}
@@ -197,8 +197,10 @@ class WorldModelLearner:
             )
             done += 1
         if done == 0:
-            return {"world_model/skipped": torch.ones((), device=self.device)}
-        return {f"world_model/{key}": v / done for key, v in sums.items()}
+            return {"Train/world_model/skipped": torch.ones((), device=self.device)}
+        logs = {f"Loss/world_model_{key}": v / done for key, v in sums.items() if key != "k_step_error"}
+        logs["Train/world_model/k_step_error"] = sums["k_step_error"] / done
+        return logs
 
     """
     Imagination.

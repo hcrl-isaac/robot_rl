@@ -114,11 +114,11 @@ class TestDistillationPPO:
         before_c = [p.detach().clone() for p in alg.critic.parameters()]
         _rollout(alg, env)
         losses = alg.update()
-        for key in ("behavior", "surrogate", "value", "entropy", "clip_fraction", "kl", "bc_weight", "learning_rate"):
+        for key in ("Loss/behavior", "Loss/surrogate", "Loss/value", "Train/entropy", "Train/clip_fraction"):
             assert key in losses and torch.isfinite(torch.tensor(losses[key])), key
-        for key in ("bc_learning_rate",):
+        for key in ("Train/kl", "Train/bc_weight", "Train/bc_learning_rate"):
             assert key in losses and torch.isfinite(torch.tensor(losses[key])), key
-        assert abs(losses["bc_weight"] - 1.0) < 1e-9
+        assert abs(losses["Train/bc_weight"] - 1.0) < 1e-9
         assert any(not torch.equal(b, p) for b, p in zip(before_s, alg.student.parameters(), strict=True))
         assert any(not torch.equal(b, p) for b, p in zip(before_c, alg.critic.parameters(), strict=True))
 
@@ -136,7 +136,7 @@ class TestDistillationPPO:
         for _ in range(6):
             _rollout(alg, env)
             losses = alg.update()
-            assert torch.isfinite(torch.tensor(losses["behavior"]))
+            assert torch.isfinite(torch.tensor(losses["Loss/behavior"]))
         with torch.no_grad():
             alg.student.reset()
             alg.student(obs, stochastic_output=True)
@@ -150,7 +150,7 @@ class TestDistillationPPO:
         weights = []
         for _ in range(6):
             _rollout(alg, env)
-            weights.append(alg.update()["bc_weight"])
+            weights.append(alg.update()["Train/bc_weight"])
         assert torch.allclose(torch.tensor(weights), torch.tensor([1.0, 0.775, 0.55, 0.325, 0.1, 0.1]))
 
     def test_adaptive_schedule_moves_only_the_rl_rate(self) -> None:
@@ -169,15 +169,16 @@ class TestDistillationPPO:
         for _ in range(3):
             _rollout(alg, env)
             losses = alg.update()
-        assert losses["kl"] > 0.0
-        assert losses["learning_rate"] < 1e-3
+        assert losses["Train/kl"] > 0.0
+        assert alg.learning_rate < 1e-3
         # the cloning replays run last, at the scaled cloning rate
-        assert abs(losses["bc_learning_rate"] - 2e-3 * losses["bc_weight"]) < 1e-12
-        assert alg.optimizer.param_groups[0]["lr"] == pytest.approx(losses["bc_learning_rate"])
+        assert abs(losses["Train/bc_learning_rate"] - 2e-3 * losses["Train/bc_weight"]) < 1e-12
+        assert alg.optimizer.param_groups[0]["lr"] == pytest.approx(losses["Train/bc_learning_rate"])
         assert alg.optimizer.param_groups[1]["lr"] == pytest.approx(5e-3)
         fixed, env = _build(learning_rate=1e-3)
         _rollout(fixed, env)
-        assert fixed.update()["learning_rate"] == pytest.approx(1e-3)
+        fixed.update()
+        assert fixed.learning_rate == pytest.approx(1e-3)
 
     def test_critic_warmup_keeps_the_surrogate_out_of_the_loss(self) -> None:
         """During warm-up the student's parameters only move by the cloning and entropy-free losses."""

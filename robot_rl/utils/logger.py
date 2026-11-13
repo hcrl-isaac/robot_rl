@@ -19,18 +19,18 @@ import robot_rl
 from robot_rl.utils.log_writer import LogWriter
 from robot_rl.utils.utils import resolve_callable
 
-# the policy's own statistics keep their W&B section, apart from the training internals
-KEPT_SECTIONS = ("Train", "Policy")
+# losses and the policy's own statistics keep their W&B sections, apart from the other training internals
+KEPT_SECTIONS = ("Train", "Policy", "Loss")
 
 
 def train_key(tag: str) -> str:
     """Move a scalar name under ``Train/``: ``Actor/grad_norm`` becomes ``Train/actor/grad_norm``.
 
     Args:
-        tag: A ``<Section>/<name>`` scalar name; one already under ``Train/`` or in ``Policy/`` is kept.
+        tag: A ``<Section>/<name>`` scalar name; one under ``Train/``, ``Loss/`` or ``Policy/`` is kept.
 
     Returns:
-        The name W&B groups in its ``Train`` section.
+        The name W&B groups in its ``Train`` section (or its own kept section).
     """
     section, _, name = tag.partition("/")
     if section in KEPT_SECTIONS or not name:
@@ -277,18 +277,20 @@ class Logger:
                 # Use loss dict directly for on-policy (one update per log)
                 loss_string = ""
                 for key, value in loss_dict.items():
-                    # A slash in the key picks its own scalar group (e.g. Train/kl_mean); bare keys -> Loss/.
-                    scalar_key = key if "/" in key else f"Loss/{key}"
-                    label = key.rsplit("/", 1)[-1]
-                    self.writer.add_scalar(train_key(scalar_key), value, it)
-                    loss_string += f"""{f"Mean {label} loss:":>{pad}} {value:.4f}\n"""
-                if learning_rate is not None:
-                    self.writer.add_scalar(train_key("Loss/learning_rate"), learning_rate, it)
+                    # A slash in the key picks its own scalar group (Loss/value, Train/kl_mean); bare keys -> Loss/.
+                    scalar_key = train_key(key if "/" in key else f"Loss/{key}")
+                    section, _, label = scalar_key.partition("/")
+                    self.writer.add_scalar(scalar_key, value, it)
+                    label = f"Mean {label} loss:" if section == "Loss" else f"{scalar_key}:"
+                    loss_string += f"""{label:>{pad}} {value:.4f}\n"""
             else:
                 # Use loss extras buffer for off-policy (multiple updates per log)
                 loss_string = self._log_extras(
                     self.loss_extras, it, pad, "Loss", "Mean {}", override_console_format=False, train=True
                 )
+
+            if learning_rate is not None:
+                self.writer.add_scalar("Train/learning_rate", learning_rate, it)
 
             # Log std
             if action_std is not None:
@@ -442,10 +444,10 @@ class Logger:
             extras: Per-step dicts of scalars or tensors, averaged per key.
             it: Training iteration the scalars are logged at.
             pad: Console label width.
-            scalar_prefix: Section a key without a slash is written under.
+            scalar_prefix: Section a bare key, or a ``<scalar_prefix>/<name>`` one, is written under.
             console_format: Console label pattern for a key.
             override_console_format: Whether a key with a slash is printed as is.
-            train: Whether the extras are training internals, written under ``Train/`` (:func:`train_key`).
+            train: Whether the extras are training internals, grouped by :func:`train_key`.
 
         Returns:
             The console lines.
@@ -466,6 +468,8 @@ class Logger:
                         info[key] = info[key].unsqueeze(0)
                     infotensor = torch.cat((infotensor, info[key].to(self.device)))
                 value = torch.nan_to_num(torch.mean(infotensor), nan=0.0)
+                name = key.removeprefix(f"{scalar_prefix}/")
+                key = key if "/" in name else name
                 if "/" in key:
                     self.writer.add_scalar(train_key(key) if train else key, value, it)  # type: ignore
                     if override_console_format:

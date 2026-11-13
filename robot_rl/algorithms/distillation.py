@@ -205,11 +205,11 @@ class Distillation:
         self.student.detach_hidden_state()
 
         # Construct the loss dictionary
-        loss_dict = {"behavior": mean_behavior_loss}
+        loss_dict = {"Loss/behavior": mean_behavior_loss}
         if self.aux_obs_group is not None:
-            loss_dict["aux"] = mean_aux_loss
+            loss_dict["Loss/aux"] = mean_aux_loss
         if self.teacher_action_prob_init > 0.0:
-            loss_dict["teacher_action_prob"] = self.teacher_action_prob
+            loss_dict["Train/teacher_action_prob"] = self.teacher_action_prob
 
         return loss_dict
 

@@ -219,18 +219,20 @@ class DistillationPPO(Distillation):
         self.last_student_hidden_state = self.student.get_hidden_state()
         self.student.detach_hidden_state()
 
-        rl_keys = ("surrogate", "entropy", "clip_fraction", "kl")
+        rl, bc = max(counts["rl"], 1), max(counts["bc"], 1)
+        # the runner logs the PPO learning rate itself
         loss_dict = {
-            key: value / max(counts["rl"] if key in rl_keys else counts["bc"] + counts["rl"], 1)
-            for key, value in sums.items()
+            "Loss/surrogate": sums["surrogate"] / rl,
+            "Loss/value": sums["value"] / max(counts["bc"] + counts["rl"], 1),
+            "Loss/behavior": sums["behavior"] / bc,
+            "Train/entropy": sums["entropy"] / rl,
+            "Train/clip_fraction": sums["clip_fraction"] / rl,
+            "Train/kl": sums["kl"] / rl,
+            "Train/bc_weight": bc_weight,
+            "Train/bc_learning_rate": self.bc_learning_rate * bc_weight,
         }
-        loss_dict["behavior"] = sums["behavior"] / max(counts["bc"], 1)
-        loss_dict["aux"] = sums["aux"] / max(counts["bc"], 1)
-        loss_dict["bc_weight"] = bc_weight
-        loss_dict["learning_rate"] = self.learning_rate
-        loss_dict["bc_learning_rate"] = self.bc_learning_rate * bc_weight
-        if self.aux_obs_group is None:
-            loss_dict.pop("aux")
+        if self.aux_obs_group is not None:
+            loss_dict["Loss/aux"] = sums["aux"] / bc
         return loss_dict
 
     def _replay(self, phase: str, bc_weight: float, sums: dict[str, float]) -> int:

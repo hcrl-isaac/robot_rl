@@ -159,3 +159,34 @@ def test_latent_interaction_features_layout() -> None:
     assert phi.shape == (200, 1 + 3 + 2 + 6)
     s, u = phi[:, 1:4], phi[:, 4:6]
     assert torch.allclose(phi[:, 6:], (s[:, :, None] * u[:, None, :]).flatten(1), atol=1e-6)
+
+
+def test_anchor_solve_reduces_to_lstd_and_fits_anchor_rows() -> None:
+    """With zero weight the anchored solve is plain LSTD; with a large weight it satisfies the anchor rows."""
+    from robot_rl.adaptation import solve_with_anchor
+
+    g = torch.Generator().manual_seed(8)
+    k, d = 3, 4
+    a_mat = torch.randn(k, k, generator=g, dtype=torch.float64) + 5 * torch.eye(k, dtype=torch.float64)
+    b_mat = torch.randn(k, d, generator=g, dtype=torch.float64)
+    x = torch.randn(20, k * d, generator=g, dtype=torch.float64)
+    w_true = torch.randn(k * d, generator=g, dtype=torch.float64)
+    y = x @ w_true
+    plain = solve(a_mat, b_mat, 0.1)
+    assert torch.allclose(solve_with_anchor(a_mat, b_mat, 0.1, x.T @ x, x.T @ y, 0.0), plain)
+    heavy = solve_with_anchor(a_mat, b_mat, 1e-9, x.T @ x, x.T @ y, 1e6)
+    assert (x @ heavy.reshape(-1) - y).abs().max() < 1e-2
+
+
+def test_gaussian_arms_flat_prior_is_the_sample_mean() -> None:
+    """A flat prior leaves each arm's posterior mean at its sample mean; a tight prior pulls toward it."""
+    from robot_rl.adaptation import GaussianArms
+
+    arms = GaussianArms(3, sigma=2.0)
+    for arm, value in [(0, 10.0), (0, 12.0), (1, 5.0)]:
+        arms.add(arm, value)
+    flat = torch.full((3,), float("inf"))
+    mean, _ = arms.posterior(torch.zeros(3), flat)
+    assert torch.allclose(mean[:2], torch.tensor([11.0, 5.0], dtype=torch.float64))
+    mean_tight, _ = arms.posterior(torch.tensor([0.0, 9.0, 0.0]), torch.full((3,), 0.1))
+    assert abs(mean_tight[1].item() - 9.0) < 0.1

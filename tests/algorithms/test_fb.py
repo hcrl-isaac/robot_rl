@@ -67,3 +67,13 @@ def test_q_loss_option_adds_a_finite_term() -> None:
     stats = agent.update(_batch())
     assert torch.isfinite(stats["Loss/q"]) and stats["Loss/q"] > 0
     assert torch.isfinite(stats["FB/measure_mass"])
+
+
+def test_mass_penalty_pulls_measure_mass_toward_its_target() -> None:
+    """With only the mass term weighted heavily, the measure mass moves toward 1 / (1 - gamma)."""
+    torch.manual_seed(0)
+    agent = ForwardBackward(5, 2, _small_cfg(mass_coef=10.0, discount=0.5), device="cpu")
+    first = agent.update(_batch())["FB/measure_mass"]
+    for _ in range(200):
+        last = agent.update(_batch())["FB/measure_mass"]
+    assert abs(last - 2.0) < abs(first - 2.0)

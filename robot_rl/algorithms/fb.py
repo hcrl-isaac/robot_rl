@@ -35,6 +35,7 @@ class ForwardBackwardCfg:
     backward_hidden_dim: int = 256
     compile: bool = True
     q_loss_coef: float = 0.0
+    mass_coef: float = 0.0
 
 
 def _mlp(dims: list[int], first_norm_tanh: bool, final_relu: bool) -> nn.Sequential:
@@ -243,6 +244,11 @@ class ForwardBackward:
             q = torch.einsum("nsd,sd->ns", Fs, z)
             q_loss = (q - target_q).pow(2).mean(dim=-1).sum()
             loss = loss + self.cfg.q_loss_coef * q_loss
+        mass = torch.einsum("nsd,d->ns", Fs, B.detach().mean(dim=0))
+        mass_loss = (mass - 1.0 / (1.0 - self.cfg.discount)).pow(2).mean(dim=-1).sum()
+        if self.cfg.mass_coef > 0:
+            # The successor measure's total mass is sum_t gamma^t = 1 / (1 - gamma); the TD loss alone leaves it free.
+            loss = loss + self.cfg.mass_coef * mass_loss
         with torch.no_grad():
             eye_diff = B.T @ B / B.shape[0] - torch.eye(self.cfg.z_dim, device=B.device)
             stats = {
@@ -254,7 +260,8 @@ class ForwardBackward:
                 "FB/forward_norm": Fs[0].norm(dim=-1).mean().detach(),
                 "FB/orth_linf": eye_diff.abs().max(),
                 "FB/orth_l2": eye_diff.norm() / math.sqrt(self.cfg.z_dim),
-                "FB/measure_mass": (Fs[0] @ B.mean(dim=0)).mean().detach(),
+                "FB/measure_mass": mass[0].mean().detach(),
+                "Loss/mass": mass_loss.detach(),
                 "Loss/q": q_loss.detach(),
             }
         return loss, stats

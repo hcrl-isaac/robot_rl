@@ -50,6 +50,40 @@ def solve(A: torch.Tensor, B: torch.Tensor, lam: float, prior: torch.Tensor | No
     return torch.linalg.solve(A + lam * torch.eye(k, dtype=A.dtype, device=A.device), rhs)
 
 
+def solve_with_anchor(
+    A: torch.Tensor,  # noqa: N803
+    B: torch.Tensor,  # noqa: N803
+    lam: float,
+    gram: torch.Tensor,
+    target: torch.Tensor,
+    weight: float,
+) -> torch.Tensor:
+    """Solve LSTD jointly with Monte-Carlo anchor rows ``x^T vec(W) = y`` (``vec`` row-major).
+
+    The TD equations ``A W = B`` become ``(A kron I) vec(W) = vec(B)``; the anchor adds its normal equations
+    ``gram vec(W) = target``, scaled so both blocks carry ``weight`` times equal trace.
+
+    Args:
+        A: Summed LSTD ``A`` ``(k, k)``.
+        B: Summed LSTD ``B`` ``(k, d)``.
+        lam: Ridge strength toward ``W = 0``.
+        gram: Summed ``x x^T`` of the anchor rows ``(k d, k d)``.
+        target: Summed ``x y`` of the anchor rows ``(k d,)``.
+        weight: Relative weight of the anchor block; 0 gives plain LSTD.
+
+    Returns:
+        ``W`` ``(k, d)``.
+    """
+    k, d = B.shape
+    td = torch.kron(A, torch.eye(d, dtype=A.dtype))
+    scale = 0.0
+    if weight > 0 and float(torch.trace(gram)) > 0:
+        scale = weight * float(torch.trace(td).abs()) / float(torch.trace(gram))
+    lhs = td + scale * gram + lam * torch.eye(k * d, dtype=A.dtype)
+    rhs = B.reshape(-1) + scale * target
+    return torch.linalg.solve(lhs, rhs).reshape(k, d)
+
+
 @dataclasses.dataclass
 class LSTDFit:
     """An ensemble fit: the point estimate, the members and conditioning diagnostics."""

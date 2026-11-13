@@ -147,3 +147,45 @@ class ReturnRidge:
         x = x.double().cpu()
         width = noise_std * torch.einsum("ni,ij,nj->n", x, V_inv, x).clamp_min(0).sqrt()
         return j0.double().cpu() + x @ theta, width
+
+
+class GaussianArms:
+    """Independent Gaussian beliefs over each candidate's mean return, with a prior per candidate.
+
+    Arm ``i`` has prior ``N(m_i, tau^2)`` and observations with noise ``sigma``; its posterior uses only its own
+    returns, so a wrong prior costs extra plays of the arms it overrates but cannot bias an arm that is played.
+    """
+
+    def __init__(self, num_arms: int, sigma: float) -> None:
+        """Create the beliefs.
+
+        Args:
+            num_arms: Number of candidates ``K``.
+            sigma: Per-episode return noise.
+        """
+        self.sigma = sigma
+        self.sums = torch.zeros(num_arms, dtype=torch.float64)
+        self.counts = torch.zeros(num_arms, dtype=torch.float64)
+
+    def add(self, arm: int, value: float) -> None:
+        """Record one observed return of ``arm``."""
+        self.sums[arm] += value
+        self.counts[arm] += 1
+
+    def posterior(self, prior_mean: torch.Tensor, prior_std: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return posterior means and stds given per-arm priors ``(K,)`` (an infinite std is a flat prior)."""
+        prior_prec = 1.0 / prior_std.double().pow(2)
+        prec = prior_prec + self.counts / self.sigma**2
+        mean = (prior_mean.double() * prior_prec + self.sums / self.sigma**2) / prec
+        return mean, prec.rsqrt()
+
+    def ucb(self, prior_mean: torch.Tensor, prior_std: torch.Tensor, beta: float) -> int:
+        """Return the arm with the highest ``mean + beta * std``."""
+        mean, std = self.posterior(prior_mean, prior_std)
+        return int((mean + beta * std).argmax().item())
+
+    def thompson(self, prior_mean: torch.Tensor, prior_std: torch.Tensor, generator: torch.Generator) -> int:
+        """Return the arm with the highest sample from its posterior."""
+        mean, std = self.posterior(prior_mean, prior_std)
+        noise = torch.randn(mean.shape, generator=generator, dtype=torch.float64)
+        return int((mean + std * noise).argmax().item())

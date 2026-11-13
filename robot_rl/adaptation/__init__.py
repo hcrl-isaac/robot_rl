@@ -1,6 +1,7 @@
 """Few-shot dynamics adaptation of frozen forward-backward models (LSTD correction + linear-bandit latent choice)."""
 
 from .bandit import (
+    GaussianArms,
     ReturnRidge,
     candidate_values,
     perturbed_candidates,
@@ -17,12 +18,22 @@ from .features import (
     PCAPhysicalFeatures,
     make_feature_map,
 )
-from .lstd import LSTDEnsemble, LSTDFit, LSTDStats, episode_stats, relative_residual, solve, td_fraction_explained
+from .lstd import (
+    LSTDEnsemble,
+    LSTDFit,
+    LSTDStats,
+    episode_stats,
+    relative_residual,
+    solve,
+    solve_with_anchor,
+    td_fraction_explained,
+)
 
 __all__ = [
     "BiasFeatures",
     "FeatureMap",
     "ForwardFeatures",
+    "GaussianArms",
     "LSTDEnsemble",
     "LSTDFit",
     "LSTDStats",
@@ -38,6 +49,7 @@ __all__ = [
     "safety_mask",
     "select",
     "solve",
+    "solve_with_anchor",
     "td_fraction_explained",
     "vec_features",
 ]

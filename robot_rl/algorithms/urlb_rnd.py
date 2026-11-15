@@ -85,8 +85,10 @@ class Critic(nn.Module):
 class RndNet(nn.Module):
     def __init__(self, n: int, obs_dim: int, hidden: int, rep: int) -> None:
         super().__init__()
-        self.l1, self.l2, self.l3 = BatchedLinear(n, obs_dim, hidden), BatchedLinear(n, hidden, hidden), BatchedLinear(
-            n, hidden, rep
+        self.l1, self.l2, self.l3 = (
+            BatchedLinear(n, obs_dim, hidden),
+            BatchedLinear(n, hidden, hidden),
+            BatchedLinear(n, hidden, rep),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -142,10 +144,18 @@ class UrlbRnd:
         return _sample_action(mu, self.cfg.stddev, None, generator)
 
     def _rnd_error(self, obs: torch.Tensor) -> torch.Tensor:
-        # BatchNorm1d(affine=False) in train mode: each agent's own batch statistics, then clamp
-        mean, var = obs.mean(1, keepdim=True), obs.var(1, unbiased=False, keepdim=True)
-        x = ((obs - mean) / torch.sqrt(var + 1e-5)).clamp(-self.cfg.obs_clip, self.cfg.obs_clip)
-        return (self.target(x) - self.predictor(x)).square().mean(-1)  # (agents, batch)
+        # Always fp32: the novelty signal is a small difference of O(1) outputs that reduced precision erases.
+        tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            with torch.autocast(obs.device.type, enabled=False):
+                obs = obs.float()
+                # BatchNorm1d(affine=False) in train mode: each agent's own batch statistics, then clamp
+                mean, var = obs.mean(1, keepdim=True), obs.var(1, unbiased=False, keepdim=True)
+                x = ((obs - mean) / torch.sqrt(var + 1e-5)).clamp(-self.cfg.obs_clip, self.cfg.obs_clip)
+                return (self.target(x) - self.predictor(x)).square().mean(-1)  # (agents, batch)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = tf32
 
     @torch.no_grad()
     def _intrinsic_reward(self, obs: torch.Tensor) -> torch.Tensor:
@@ -160,8 +170,9 @@ class UrlbRnd:
         self.rms_count = total
         return self.cfg.rnd_scale * err / (torch.sqrt(self.rms_var) + 1e-8)
 
-    def update(self, obs: torch.Tensor, action: torch.Tensor, discount: torch.Tensor, next_obs: torch.Tensor,
-               generator=None) -> dict[str, torch.Tensor]:
+    def update(
+        self, obs: torch.Tensor, action: torch.Tensor, discount: torch.Tensor, next_obs: torch.Tensor, generator=None
+    ) -> dict[str, torch.Tensor]:
         """One URLB update per agent: RND predictor, critic on the intrinsic reward, actor, target averaging.
 
         Args:
@@ -186,9 +197,9 @@ class UrlbRnd:
             tq1, tq2 = self.critic_target(next_obs, next_action)
             target = reward[..., None] + discount[..., None] * torch.min(tq1, tq2)
         q1, q2 = self.critic(obs, action)
-        critic_loss = (F.mse_loss(q1, target, reduction="none") + F.mse_loss(q2, target, reduction="none")).mean(
-            (1, 2)
-        ).sum()  # per-agent mean, summed so each agent's gradient equals its own loss's
+        critic_loss = (
+            (F.mse_loss(q1, target, reduction="none") + F.mse_loss(q2, target, reduction="none")).mean((1, 2)).sum()
+        )  # per-agent mean, summed so each agent's gradient equals its own loss's
         self.critic_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_opt.step()
@@ -204,8 +215,12 @@ class UrlbRnd:
             for p, tp in zip(self.critic.parameters(), self.critic_target.parameters(), strict=True):
                 tp.lerp_(p, cfg.critic_target_tau)
         n = self.n
-        return {"Loss/rnd": rnd_loss.detach() / n, "Loss/critic": critic_loss.detach() / n,
-                "Loss/actor": actor_loss.detach() / n, "Train/intrinsic_reward": reward.mean()}
+        return {
+            "Loss/rnd": rnd_loss.detach() / n,
+            "Loss/critic": critic_loss.detach() / n,
+            "Loss/actor": actor_loss.detach() / n,
+            "Train/intrinsic_reward": reward.mean(),
+        }
 
     @staticmethod
     def nstep_discount(cfg: UrlbRndCfg) -> float:

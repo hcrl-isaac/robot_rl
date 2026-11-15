@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 
@@ -36,14 +34,22 @@ class BatchedLinear(nn.Module):
     """``num_agents`` independent linear layers applied to ``(agents, batch, in)`` inputs."""
 
     def __init__(self, num_agents: int, in_dim: int, out_dim: int) -> None:
+        """Initialize orthogonal weights and zero biases (URLB's ``weight_init``).
+
+        Args:
+            num_agents: Independent layers.
+            in_dim: Input size.
+            out_dim: Output size.
+        """
         super().__init__()
         w = torch.empty(num_agents, out_dim, in_dim)
         for a in range(num_agents):
-            nn.init.orthogonal_(w[a])  # URLB's weight_init: orthogonal weights, zero bias
+            nn.init.orthogonal_(w[a])
         self.weight = nn.Parameter(w.transpose(1, 2).contiguous())
         self.bias = nn.Parameter(torch.zeros(num_agents, 1, out_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply each agent's layer to its own batch."""
         return torch.baddbmm(self.bias, x, self.weight)
 
 
@@ -51,51 +57,91 @@ class BatchedLayerNorm(nn.Module):
     """Layer norm over the feature dimension with a per-agent affine map."""
 
     def __init__(self, num_agents: int, dim: int) -> None:
+        """Initialize unit scales and zero shifts.
+
+        Args:
+            num_agents: Independent norms.
+            dim: Feature size.
+        """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(num_agents, 1, dim))
         self.bias = nn.Parameter(torch.zeros(num_agents, 1, dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.layer_norm(x, x.shape[-1:]) * self.weight + self.bias
+        """Normalize each row, then apply the agent's affine map."""
+        return nn.functional.layer_norm(x, x.shape[-1:]) * self.weight + self.bias
 
 
 class Actor(nn.Module):
+    """URLB's state actor: a layer-normed tanh trunk, one hidden layer, tanh mean action."""
+
     def __init__(self, n: int, obs_dim: int, act_dim: int, hidden: int) -> None:
+        """Build the layers for ``n`` agents.
+
+        Args:
+            n: Agents.
+            obs_dim: Observation size.
+            act_dim: Action size.
+            hidden: Hidden width.
+        """
         super().__init__()
         self.l1, self.ln = BatchedLinear(n, obs_dim, hidden), BatchedLayerNorm(n, hidden)
         self.l2, self.l3 = BatchedLinear(n, hidden, hidden), BatchedLinear(n, hidden, act_dim)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Return the mean action in ``[-1, 1]``."""
         h = torch.tanh(self.ln(self.l1(obs)))
-        return torch.tanh(self.l3(F.relu(self.l2(h))))
+        return torch.tanh(self.l3(nn.functional.relu(self.l2(h))))
 
 
 class Critic(nn.Module):
+    """URLB's state critic: a shared layer-normed tanh trunk on (obs, action) and two Q heads."""
+
     def __init__(self, n: int, obs_dim: int, act_dim: int, hidden: int) -> None:
+        """Build the layers for ``n`` agents.
+
+        Args:
+            n: Agents.
+            obs_dim: Observation size.
+            act_dim: Action size.
+            hidden: Hidden width.
+        """
         super().__init__()
         self.trunk, self.ln = BatchedLinear(n, obs_dim + act_dim, hidden), BatchedLayerNorm(n, hidden)
         self.q1a, self.q1b = BatchedLinear(n, hidden, hidden), BatchedLinear(n, hidden, 1)
         self.q2a, self.q2b = BatchedLinear(n, hidden, hidden), BatchedLinear(n, hidden, 1)
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return both Q estimates."""
         h = torch.tanh(self.ln(self.trunk(torch.cat([obs, action], dim=-1))))
-        return self.q1b(F.relu(self.q1a(h))), self.q2b(F.relu(self.q2a(h)))
+        return self.q1b(nn.functional.relu(self.q1a(h))), self.q2b(nn.functional.relu(self.q2a(h)))
 
 
 class RndNet(nn.Module):
+    """RND predictor or target: a three-layer ReLU MLP to the representation."""
+
     def __init__(self, n: int, obs_dim: int, hidden: int, rep: int) -> None:
+        """Build the layers for ``n`` agents.
+
+        Args:
+            n: Agents.
+            obs_dim: Observation size.
+            hidden: Hidden width.
+            rep: Representation size.
+        """
         super().__init__()
-        self.l1, self.l2, self.l3 = (
-            BatchedLinear(n, obs_dim, hidden),
-            BatchedLinear(n, hidden, hidden),
-            BatchedLinear(n, hidden, rep),
-        )
+        self.l1 = BatchedLinear(n, obs_dim, hidden)
+        self.l2 = BatchedLinear(n, hidden, hidden)
+        self.l3 = BatchedLinear(n, hidden, rep)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.l3(F.relu(self.l2(F.relu(self.l1(x)))))
+        """Return the representation of normalized observations."""
+        return self.l3(nn.functional.relu(self.l2(nn.functional.relu(self.l1(x)))))
 
 
-def _sample_action(mu: torch.Tensor, std: float, clip: float | None, generator=None) -> torch.Tensor:
+def _sample_action(
+    mu: torch.Tensor, std: float, clip: float | None, generator: torch.Generator | None = None
+) -> torch.Tensor:
     """URLB's TruncatedNormal.sample: Gaussian noise (optionally clipped), then a straight-through clamp to (-1, 1)."""
     eps = torch.randn(mu.shape, device=mu.device, generator=generator) * std
     if clip is not None:
@@ -106,17 +152,20 @@ def _sample_action(mu: torch.Tensor, std: float, clip: float | None, generator=N
 
 
 class UrlbRnd:
-    """``num_agents`` independent reward-free DDPG + RND agents updated in one step.
+    """``num_agents`` independent reward-free DDPG + RND agents updated in one step."""
 
-    Args:
-        num_agents: Independent agents (each has its own networks, optimizer state and intrinsic-reward scale).
-        obs_dim: Observation size.
-        act_dim: Action size (actions in ``[-1, 1]``).
-        cfg: Hyperparameters.
-        device: Torch device.
-    """
+    def __init__(
+        self, num_agents: int, obs_dim: int, act_dim: int, cfg: UrlbRndCfg | None = None, device: str = "cuda"
+    ) -> None:
+        """Build networks, optimizers and per-agent intrinsic-reward statistics.
 
-    def __init__(self, num_agents: int, obs_dim: int, act_dim: int, cfg: UrlbRndCfg | None = None, device="cuda"):
+        Args:
+            num_agents: Independent agents (each has its own networks, optimizer state and intrinsic-reward scale).
+            obs_dim: Observation size.
+            act_dim: Action size (actions in ``[-1, 1]``).
+            cfg: Hyperparameters.
+            device: Torch device.
+        """
         self.cfg = cfg = cfg or UrlbRndCfg()
         self.n, self.device = num_agents, device
         h = cfg.hidden_dim
@@ -126,18 +175,17 @@ class UrlbRnd:
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.predictor = RndNet(num_agents, obs_dim, h, cfg.rnd_rep_dim).to(device)
         self.target = RndNet(num_agents, obs_dim, h, cfg.rnd_rep_dim).to(device).requires_grad_(False)
-        opt = {"lr": cfg.lr}
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), **opt)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), **opt)
-        self.rnd_opt = torch.optim.Adam(self.predictor.parameters(), **opt)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
+        self.rnd_opt = torch.optim.Adam(self.predictor.parameters(), lr=cfg.lr)
         # utils.RMS per agent: mean 0, variance 1, count 1e-4
         self.rms_mean = torch.zeros(num_agents, 1, device=device)
         self.rms_var = torch.ones(num_agents, 1, device=device)
         self.rms_count = torch.full((num_agents, 1), 1e-4, device=device)
 
     @torch.no_grad()
-    def act(self, obs: torch.Tensor, uniform: bool, generator=None) -> torch.Tensor:
-        """One exploration action per agent for ``obs`` ``(agents, obs_dim)``; uniform random while seeding."""
+    def act(self, obs: torch.Tensor, uniform: bool, generator: torch.Generator | None = None) -> torch.Tensor:
+        """Return one exploration action per agent for ``obs`` ``(agents, obs_dim)``; uniform while seeding."""
         mu = self.actor(obs[:, None])[:, 0]
         if uniform:
             return torch.rand(mu.shape, device=mu.device, generator=generator) * 2 - 1
@@ -171,9 +219,14 @@ class UrlbRnd:
         return self.cfg.rnd_scale * err / (torch.sqrt(self.rms_var) + 1e-8)
 
     def update(
-        self, obs: torch.Tensor, action: torch.Tensor, discount: torch.Tensor, next_obs: torch.Tensor, generator=None
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        discount: torch.Tensor,
+        next_obs: torch.Tensor,
+        generator: torch.Generator | None = None,
     ) -> dict[str, torch.Tensor]:
-        """One URLB update per agent: RND predictor, critic on the intrinsic reward, actor, target averaging.
+        """Run one URLB update per agent: RND predictor, critic on the intrinsic reward, actor, target averaging.
 
         Args:
             obs: ``(agents, batch, obs_dim)`` states s_t.
@@ -197,9 +250,9 @@ class UrlbRnd:
             tq1, tq2 = self.critic_target(next_obs, next_action)
             target = reward[..., None] + discount[..., None] * torch.min(tq1, tq2)
         q1, q2 = self.critic(obs, action)
-        critic_loss = (
-            (F.mse_loss(q1, target, reduction="none") + F.mse_loss(q2, target, reduction="none")).mean((1, 2)).sum()
-        )  # per-agent mean, summed so each agent's gradient equals its own loss's
+        mse = nn.functional.mse_loss
+        # per-agent mean, summed so each agent's gradient equals its own loss's
+        critic_loss = (mse(q1, target, reduction="none") + mse(q2, target, reduction="none")).mean((1, 2)).sum()
         self.critic_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_opt.step()
@@ -224,5 +277,5 @@ class UrlbRnd:
 
     @staticmethod
     def nstep_discount(cfg: UrlbRndCfg) -> float:
-        """The n-step discount with no terminals: gamma^n."""
+        """Return the n-step discount with no terminals, gamma^n."""
         return math.pow(cfg.discount, cfg.nstep)

@@ -36,6 +36,8 @@ class ForwardBackwardCfg:
     compile: bool = True
     q_loss_coef: float = 0.0
     mass_coef: float = 0.0
+    # min is the clipped double-Q target; it lowers the measure's level by about half the twins' gap per backup.
+    twin_target: str = "min"
 
 
 def _mlp(dims: list[int], first_norm_tanh: bool, final_relu: bool) -> nn.Sequential:
@@ -221,7 +223,8 @@ class ForwardBackward:
             next_action = self._noisy(self.actor(next_obs, z))
             target_F = self.target_forward_map(next_obs, z, next_action)
             target_B = self.target_backward_map(next_obs)
-            target_M = torch.einsum("nsd,td->nst", target_F, target_B).min(dim=0).values
+            target_Ms = torch.einsum("nsd,td->nst", target_F, target_B)
+            target_M = target_Ms.min(dim=0).values if self.cfg.twin_target == "min" else target_Ms.mean(dim=0)
 
         Fs = self.forward_map(obs, z, action)
         B = self.backward_map(next_obs)

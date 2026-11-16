@@ -77,3 +77,18 @@ def test_mass_penalty_pulls_measure_mass_toward_its_target() -> None:
     for _ in range(200):
         last = agent.update(_batch())["FB/measure_mass"]
     assert abs(last - 2.0) < abs(first - 2.0)
+
+
+def test_twin_target_mean_sits_above_min() -> None:
+    """The mean-of-twins target is never below the clipped double-Q (min) target, and it trains."""
+    torch.manual_seed(0)
+    agent = ForwardBackward(5, 2, _small_cfg(twin_target="mean"), device="cpu")
+    batch = _batch()
+    nxt = batch["next_obs"]
+    z = agent.sample_z(32, nxt)
+    with torch.no_grad():
+        f = agent.target_forward_map(nxt, z, agent.actor(nxt, z))
+        m = torch.einsum("nsd,td->nst", f, agent.target_backward_map(nxt))
+    assert (m.mean(dim=0) >= m.min(dim=0).values).all()
+    stats = agent.update(batch)
+    assert torch.isfinite(stats["Loss/fb"])

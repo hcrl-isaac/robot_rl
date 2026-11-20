@@ -271,7 +271,7 @@ class Logger:
             # Log episode extras
             extras_string = self._log_extras(self.ep_extras, it, pad, "Episode", "Mean episode {}")
             extras_string += self._log_extras(self.algo_extras, it, pad, "Train", "Train/{}", train=True)
-            eval_string = self._log_extras(self.eval_extras, it, pad, "Evaluation", "Mean evaluation {}")
+            eval_string = self._log_extras(self.eval_extras, it, pad, "Eval", "Mean evaluation {}")
             # Log losses
             if loss_dict:
                 # Use loss dict directly for on-policy (one update per log)

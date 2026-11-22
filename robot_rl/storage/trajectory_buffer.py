@@ -51,6 +51,8 @@ class TrajectoryBuffer(ExpertBuffer):
         else:
             self.lengths = torch.full((self.num_motions,), self.bucket_size, device=device, dtype=torch.long)
         self.priorities = torch.ones((self.num_motions,), device=device)
+        # a bundle's per-row `source` id fixes each source's share of the samples, whatever its priorities
+        self.sources = self.motions["source"][:, 0].long() if "source" in self.motions else None
         self._eval_order = torch.arange(0, self.num_motions, device=self.device)
 
         # mode="default" (no CUDA graphs): this samples under the inference_mode rollout, so a
@@ -124,10 +126,17 @@ class TrajectoryBuffer(ExpertBuffer):
         return self._eval_order
 
     def set_priorities(self, priorities: torch.Tensor) -> None:
-        """Replace every motion's sampling weight (buffer order) and normalize them to sum to one."""
+        """Replace every motion's sampling weight (buffer order) and normalize them to sum to one.
+
+        With per-row sources, the weights are normalized within each source to its share of the rows.
+        """
         if priorities.shape != self.priorities.shape:
             raise ValueError(f"expected {tuple(self.priorities.shape)} priorities, got {tuple(priorities.shape)}")
         priorities = priorities.to(self.device, torch.float32)
+        if self.sources is not None:
+            total = torch.zeros(int(self.sources.max()) + 1, device=self.device).index_add_(0, self.sources, priorities)
+            rows = torch.bincount(self.sources, minlength=total.numel()).to(priorities)
+            priorities = priorities / total[self.sources] * rows[self.sources]
         self.priorities = priorities / priorities.sum()
 
     def state_dict(self) -> dict:

@@ -52,7 +52,7 @@ class TrajectoryBuffer(ExpertBuffer):
             self.lengths = torch.full((self.num_motions,), self.bucket_size, device=device, dtype=torch.long)
         self.priorities = torch.ones((self.num_motions,), device=device)
         # a bundle's per-row `source` id fixes each source's share of the samples, whatever its priorities
-        self.sources = self.motions["source"][:, 0].long() if "source" in self.motions else None
+        self.sources = self.motions["source"][:, 0].reshape(-1).long() if "source" in self.motions else None
         self._eval_order = torch.arange(0, self.num_motions, device=self.device)
 
         # mode="default" (no CUDA graphs): this samples under the inference_mode rollout, so a

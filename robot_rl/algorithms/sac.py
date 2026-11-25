@@ -427,7 +427,11 @@ class SAC:
                 priority_group=self.window_priority_group,
                 priority=self._current_window_priority(),
                 episode_start=self.window_episode_start,
-                next_observations=self.critic_1.obs_groups if self.critic_on_actor_windows else self.critic_sees_hidden,
+                next_observations=(
+                    [*self.critic_1.obs_groups, *getattr(self.critic_1, "obs_groups_2d", [])]
+                    if self.critic_on_actor_windows
+                    else self.critic_sees_hidden
+                ),
                 extend=self.n_steps - 1 if self.critic_on_actor_windows else 0,
             )
             if batch is None:
@@ -635,7 +639,7 @@ class SAC:
         rollout state up to staleness.
         """
         # the start step's actor groups are read only when the critics take the actor's latent there
-        groups = set(self.critic_1.obs_groups)
+        groups = set(self.critic_1.obs_groups) | set(getattr(self.critic_1, "obs_groups_2d", []))
         if self.critic_sees_hidden:
             groups |= {*self.actor.obs_groups, *getattr(self.actor, "obs_groups_2d", [])}
         batch = self.replay_buffer.sample_mini_batch(self.device, obs_groups=groups)

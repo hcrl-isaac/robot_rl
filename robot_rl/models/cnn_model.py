@@ -10,6 +10,7 @@ import copy
 import math
 import torch
 import torch.nn as nn
+from collections.abc import Sequence
 from tensordict import TensorDict
 from typing import Any
 
@@ -41,6 +42,7 @@ class CNNModel(MLPModel):
         distribution_cfg: dict | None = None,
         cnn_cfg: dict[str, dict] | dict[str, Any] | None = None,
         encoder_grad_scale: float = 1.0,
+        input_dims: Sequence[int] = (),
         cnns: nn.ModuleDict | dict[str, nn.Module] | None = None,
     ) -> None:
         """Initialize the CNN-based model.
@@ -60,6 +62,7 @@ class CNNModel(MLPModel):
             encoder_grad_scale: Fraction of this model's gradient that reaches the CNN encoders, for an encoder
                 shared with another model: 1.0 trains it fully, 0.0 detaches it, 0.1 sends a tenth.
             cnn_cfg: Configuration of the CNN encoder(s).
+            input_dims: Dimensions of extra inputs concatenated with the latent, e.g. a critic's actions.
             cnns: CNN modules to use, e.g., for sharing CNNs between actor and critic. If None, new CNNs are created.
         """
         # Resolve observation groups and dimensions
@@ -103,6 +106,7 @@ class CNNModel(MLPModel):
             obs_groups,
             obs_set,
             output_dim,
+            other_input_dims=input_dims,
             hidden_dims=hidden_dims,
             activation=activation,
             first_activation=first_activation,

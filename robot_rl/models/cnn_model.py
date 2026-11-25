@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
@@ -39,6 +40,7 @@ class CNNModel(MLPModel):
         normalize_first_layer: bool = False,
         distribution_cfg: dict | None = None,
         cnn_cfg: dict[str, dict] | dict[str, Any] | None = None,
+        encoder_grad_scale: float = 1.0,
         cnns: nn.ModuleDict | dict[str, nn.Module] | None = None,
     ) -> None:
         """Initialize the CNN-based model.
@@ -55,6 +57,8 @@ class CNNModel(MLPModel):
             normalize_first_layer: Whether to normalize the MLP's first layer.
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
             distribution_cfg: Configuration dictionary for the output distribution.
+            encoder_grad_scale: Fraction of this model's gradient that reaches the CNN encoders, for an encoder
+                shared with another model: 1.0 trains it fully, 0.0 detaches it, 0.1 sends a tenth.
             cnn_cfg: Configuration of the CNN encoder(s).
             cnns: CNN modules to use, e.g., for sharing CNNs between actor and critic. If None, new CNNs are created.
         """
@@ -113,11 +117,21 @@ class CNNModel(MLPModel):
             self.cnns = cnns
         else:
             self.cnns = nn.ModuleDict(cnns)
+        self.encoder_grad_scale = encoder_grad_scale
+
+    def _encode(self, obs_group: str, image: torch.Tensor) -> torch.Tensor:
+        """Encode one 2D group, scaling the gradient this model sends into the shared encoder."""
+        feats = self.cnns[obs_group](image)
+        if math.isclose(self.encoder_grad_scale, 1.0):
+            return feats
+        if math.isclose(self.encoder_grad_scale, 0.0):
+            return feats.detach()
+        return self.encoder_grad_scale * feats + (1.0 - self.encoder_grad_scale) * feats.detach()
 
     def get_latent(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Build the model latent by combining (optional) normalized 1D and CNN-encoded 2D observation groups."""
         # Process 2D observation groups with CNNs
-        latent_cnn = torch.cat([self.cnns[obs_group](obs[obs_group]) for obs_group in self.obs_groups_2d], dim=-1)
+        latent_cnn = torch.cat([self._encode(obs_group, obs[obs_group]) for obs_group in self.obs_groups_2d], dim=-1)
         # If there are no 1D observations, return the CNN latent directly
         if not self.obs_groups:
             return latent_cnn

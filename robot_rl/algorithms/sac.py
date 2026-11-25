@@ -71,6 +71,8 @@ class SAC:
         burn_in: int = 8,
         num_windows: int | None = None,
         critic_sees_hidden: bool = False,
+        share_image_encoder: bool = False,
+        image_shift_pad: int = 0,
         window_episode_start: bool = False,
         aux_obs_group: str | None = None,
         aux_loss_weight: float = 1.0,
@@ -135,6 +137,18 @@ class SAC:
                 cnn.compile()
         self.critic_1 = critic_1.to(device)
         self.critic_2 = critic_2.to(device)
+        self.image_shift_pad = image_shift_pad
+        # one encoder for both losses: the critics hold the actor's CNN modules, so TD gradients train them too
+        if share_image_encoder:
+            shared = getattr(self.actor, "cnns", None)
+            if shared is None:
+                raise ValueError("share_image_encoder needs an actor with CNN encoders")
+            for critic in (self.critic_1, self.critic_2):
+                groups = getattr(critic, "obs_groups_2d", [])
+                if not groups:
+                    raise ValueError("share_image_encoder needs critics that read a 2D observation group")
+                for group in groups:
+                    critic.cnns[group] = shared[group]
         self.critic_1_target = TargetNetwork(self.critic_1, tau).to(device)
         self.critic_2_target = TargetNetwork(self.critic_2, tau).to(device)
 
@@ -605,9 +619,34 @@ class SAC:
         if self.critic_sees_hidden:
             groups |= {*self.actor.obs_groups, *getattr(self.actor, "obs_groups_2d", [])}
         batch = self.replay_buffer.sample_mini_batch(self.device, obs_groups=groups)
+        self._shift_images(batch)
         target_q, latent_b = self._flat_critic_target(batch)
         data_in = self._critic_input(batch.actions, latent_b)
         self._critic_step(batch.observations, data_in, target_q, batch.rewards.view(-1), acc)
+
+    def _shift_images(self, batch: ReplayBuffer.Batch) -> None:
+        """Shift each 2D observation group by up to ``image_shift_pad`` pixels, the same shift for a whole frame.
+
+        Args:
+            batch: A sampled batch; its 2D observations are replaced in place.
+        """
+        pad = self.image_shift_pad
+        if pad <= 0:
+            return
+        for group in getattr(self.actor, "obs_groups_2d", []):
+            for obs in (batch.observations, batch.next_observations):
+                if obs is None or group not in obs:
+                    continue
+                image = obs[group]
+                padded = torch.nn.functional.pad(image, (pad, pad, pad, pad), mode="replicate")
+                n, h, w = image.shape[0], image.shape[-2], image.shape[-1]
+                dx = torch.randint(0, 2 * pad + 1, (n,), device=image.device)
+                dy = torch.randint(0, 2 * pad + 1, (n,), device=image.device)
+                rows = (torch.arange(h, device=image.device).view(1, h, 1) + dy.view(n, 1, 1)).expand(n, h, w)
+                cols = (torch.arange(w, device=image.device).view(1, 1, w) + dx.view(n, 1, 1)).expand(n, h, w)
+                flat = padded.reshape(n, -1, padded.shape[-2], padded.shape[-1])
+                idx = (rows * padded.shape[-1] + cols).unsqueeze(1).expand(-1, flat.shape[1], -1, -1)
+                obs[group] = flat.flatten(-2).gather(-1, idx.flatten(-2)).view_as(image)
 
     @torch.no_grad()
     def _flat_critic_target(self, batch: ReplayBuffer.Batch) -> tuple[torch.Tensor, torch.Tensor | None]:

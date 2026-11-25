@@ -917,7 +917,7 @@ class SAC:
 
     def reduce_parameters(self, parameters: list) -> None:
         """Average gradients across GPUs for the given parameters (in place)."""
-        grads = [p.grad.view(-1) for p in parameters if p.grad is not None]
+        grads = [p.grad.reshape(-1) for p in parameters if p.grad is not None]
         if not grads:
             return
         all_grads = torch.cat(grads)

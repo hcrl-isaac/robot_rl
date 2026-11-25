@@ -951,7 +951,7 @@ class PPO:
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
         all_params = list(all_params)
-        grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
+        grads = [param.grad.reshape(-1) for param in all_params if param.grad is not None]
         all_grads = torch.cat(grads)
         # Average the gradients across all GPUs
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)

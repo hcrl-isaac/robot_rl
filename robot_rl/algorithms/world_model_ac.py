@@ -297,7 +297,7 @@ class WorldModelAC:
         """Average gradients across ranks, clip the global norm, then optionally clip element-wise."""
         params = [p for p in params if p.grad is not None]
         if self.is_multi_gpu:
-            grads = torch.cat([p.grad.view(-1) for p in params])
+            grads = torch.cat([p.grad.reshape(-1) for p in params])
             torch.distributed.all_reduce(grads, op=torch.distributed.ReduceOp.SUM)
             grads /= self.gpu_world_size
             offset = 0

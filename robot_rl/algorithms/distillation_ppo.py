@@ -411,7 +411,7 @@ class DistillationPPO(Distillation):
     def reduce_parameters(self) -> None:
         """Average the student's and critic's gradients across GPUs in place."""
         params = [p for p in list(self.student.parameters()) + list(self.critic.parameters()) if p.grad is not None]
-        all_grads = torch.cat([p.grad.view(-1) for p in params])
+        all_grads = torch.cat([p.grad.reshape(-1) for p in params])
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
         all_grads /= self.gpu_world_size
         offset = 0

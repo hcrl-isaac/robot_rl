@@ -952,7 +952,7 @@ class FbCpr:
         params = [param for param in m.parameters() if param.grad is not None]
         if not params:
             return
-        all_grads = torch.cat([param.grad.view(-1) for param in params])
+        all_grads = torch.cat([param.grad.reshape(-1) for param in params])
         # Sum across ranks, then average.
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
         all_grads /= self.gpu_world_size

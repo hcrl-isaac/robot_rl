@@ -99,3 +99,17 @@ def test_a_cnn_critic_uses_the_action_it_is_given() -> None:
     q_a = critic(obs, torch.randn(8, 3)).view(-1)
     q_b = critic(obs, torch.randn(8, 3)).view(-1)
     assert (q_a - q_b).abs().max() > 1e-6, "Q is identical for different actions: the critic cannot shape a policy"
+
+
+def test_critic_trainability_has_one_writer() -> None:
+    """The second fault: a recurrent-path actor update froze the critics directly, bypassing the shared-encoder skip."""
+    import inspect
+
+    from robot_rl.algorithms import sac
+
+    source = inspect.getsource(sac)
+    helper = source.split("def _set_critics_trainable")[1]
+    outside = source.replace(helper, "")
+    assert "requires_grad_" not in outside.split("critic_parameters:")[-1][:200], (
+        "critic trainability is set outside _set_critics_trainable: a shared encoder would be frozen there"
+    )

@@ -499,8 +499,7 @@ class SAC:
                 self.alpha_optimizer.step()
                 sums["alpha"] += alpha_loss.detach()
             if self.update_step % self.policy_frequency == 0:
-                for p in self.critic_parameters:
-                    p.requires_grad_(False)
+                self._set_critics_trainable(False)
                 pi_in = self._critic_input(new_actions, latent)
                 q1_pi = self.critic_1(flat_obs, pi_in).view(-1)
                 q2_pi = self.critic_2(flat_obs, pi_in).view(-1)
@@ -533,8 +532,7 @@ class SAC:
                 if hasattr(self.actor, "cnns"):
                     _acc_diag("Actor/grad_norm_cnn", _param_grad_norm(self.actor.cnns.parameters()))
                 self.actor_optimizer.step()
-                for p in self.critic_parameters:
-                    p.requires_grad_(True)
+                self._set_critics_trainable(True)
                 if num_updates == 0:
                     with torch.no_grad():
                         # policy-action Q minus data-action Q: a growing gap is the actor exploiting critic error

@@ -83,3 +83,19 @@ def test_without_sharing_every_critic_parameter_freezes() -> None:
     sac._shared_encoder_param_ids = set()
     sac._set_critics_trainable(False)
     assert not own.requires_grad
+
+
+def test_a_cnn_critic_uses_the_action_it_is_given() -> None:
+    """The fault that voided every shared-encoder arm: the CNN critic's Q ignored its action input."""
+    import torch
+    from tensordict import TensorDict
+
+    from robot_rl.models.cnn_model import CNNModel
+
+    torch.manual_seed(0)
+    obs = TensorDict({"critic": torch.randn(8, 6), "image": torch.rand(8, 1, 16, 16)}, batch_size=[8])
+    cnn_cfg = {"output_channels": [4], "kernel_size": 3, "stride": 2, "activation": "elu", "global_pool": "avg"}
+    critic = CNNModel(obs, {"critic": ["critic", "image"]}, "critic", output_dim=1, input_dims=[3], cnn_cfg=cnn_cfg)
+    q_a = critic(obs, torch.randn(8, 3)).view(-1)
+    q_b = critic(obs, torch.randn(8, 3)).view(-1)
+    assert (q_a - q_b).abs().max() > 1e-6, "Q is identical for different actions: the critic cannot shape a policy"

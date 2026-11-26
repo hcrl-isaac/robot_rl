@@ -139,8 +139,8 @@ class CNNModel(MLPModel):
         # If there are no 1D observations, return the CNN latent directly
         if not self.obs_groups:
             return latent_cnn
-        # Select 1D observation groups and normalize
-        latent_1d = super().get_latent(obs)
+        # Select 1D observation groups and normalize; args (a critic's action input) must reach the latent
+        latent_1d = super().get_latent(obs, *args, **kwargs)
         # Concatenate 1D and CNN latents
         return torch.cat([latent_1d, latent_cnn], dim=-1)
 
@@ -185,7 +185,8 @@ class CNNModel(MLPModel):
 
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""
-        return self.obs_dim + self.cnn_latent_dim
+        # other_input_dim is a critic's action input: omitting it sized the head for a latent without the action
+        return self.obs_dim + self.other_input_dim + self.cnn_latent_dim
 
 
 class _TorchCNNModel(nn.Module):

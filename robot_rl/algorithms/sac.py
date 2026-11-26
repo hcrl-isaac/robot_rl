@@ -151,6 +151,12 @@ class SAC:
                     raise ValueError("share_image_encoder needs critics that read a 2D observation group")
                 for group in groups:
                     critic.cnns[group] = shared[group]
+        # the actor update freezes the critics; a shared encoder must stay trainable there or only TD reaches it
+        self._shared_encoder_param_ids = (
+            {id(p) for cnn in getattr(self.actor, "cnns", {}).values() for p in cnn.parameters()}
+            if share_image_encoder
+            else set()
+        )
         self.critic_1_target = TargetNetwork(self.critic_1, tau).to(device)
         self.critic_2_target = TargetNetwork(self.critic_2, tau).to(device)
 
@@ -354,11 +360,9 @@ class SAC:
                 mean_alpha_loss += alpha_loss.detach()
 
             if self.update_step % self.policy_frequency == 0:
-                for p in self.critic_parameters:
-                    p.requires_grad_(False)
+                self._set_critics_trainable(False)
                 actor_loss = self._update_actor(obs_b, new_actions, logp)
-                for p in self.critic_parameters:
-                    p.requires_grad_(True)
+                self._set_critics_trainable(True)
                 mean_actor_loss += actor_loss
                 num_actor_updates += 1
 
@@ -647,6 +651,17 @@ class SAC:
         target_q, latent_b = self._flat_critic_target(batch)
         data_in = self._critic_input(batch.actions, latent_b)
         self._critic_step(batch.observations, data_in, target_q, batch.rewards.view(-1), acc)
+
+    def _set_critics_trainable(self, trainable: bool) -> None:
+        """Freeze or unfreeze the critics around the actor update, leaving a shared encoder trainable throughout.
+
+        Args:
+            trainable: Whether the critics' own parameters take gradients.
+        """
+        for p in self.critic_parameters:
+            if id(p) in self._shared_encoder_param_ids:
+                continue  # shared with the actor: freezing it here would leave the actor loss unable to train it
+            p.requires_grad_(trainable)
 
     def _shift_images(self, batch: ReplayBuffer.Batch) -> None:
         """Shift each 2D observation group by up to ``image_shift_pad`` pixels, the same shift for a whole frame.

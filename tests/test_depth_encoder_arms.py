@@ -59,7 +59,7 @@ def test_random_shift_keeps_shape_and_moves_content() -> None:
     assert torch.allclose(batch.observations["image"], image), "pad 0 is a no-op"
 
 
-def test_a_shared_encoder_stays_trainable_while_the_critics_are_frozen():
+def test_a_shared_encoder_stays_trainable_while_the_critics_are_frozen() -> None:
     """The bug that voided the first encoder arms: freezing the critics froze the encoder they share."""
     enc = _Tiny()
     critic_only = nn.Parameter(torch.ones(1))
@@ -75,7 +75,8 @@ def test_a_shared_encoder_stays_trainable_while_the_critics_are_frozen():
     assert critic_only.requires_grad
 
 
-def test_without_sharing_every_critic_parameter_freezes():
+def test_without_sharing_every_critic_parameter_freezes() -> None:
+    """Without a shared encoder the freeze covers every critic parameter, as plain SAC expects."""
     own = nn.Parameter(torch.ones(1))
     sac = SAC.__new__(SAC)
     sac.critic_parameters = [own]
